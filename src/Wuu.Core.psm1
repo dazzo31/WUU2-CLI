@@ -173,7 +173,7 @@ $global:LogLock = New-Object System.Object
 
 # Initialize debug log
 if ($global:EnableDebugLogging) {
-    Write-DebugLog "Windows Update Utility v1.3.1-beta.4 Debug Log Started" -Level 'SUCCESS' -ToConsole
+    Write-DebugLog "Windows Update Utility v1.3.4 Debug Log Started" -Level 'SUCCESS' -ToConsole
     Write-DebugLog "Log file: $global:LogPath" -Level 'INFO' -ToConsole
 }
 

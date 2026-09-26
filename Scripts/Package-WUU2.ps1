@@ -49,6 +49,12 @@ if (Test-Path $scriptsSrc) {
     # Don’t include the packager itself inside the zip (optional, avoids nesting tooling)
     $selfInZip = Join-Path $scriptsDst "Package-WUU2.ps1"
     if (Test-Path $selfInZip) { Remove-Item $selfInZip -Force }
+
+    # Exclude dev-only scratch/tooling (_*.ps1, e.g. _syntax-check, _pack-*). Nothing the
+    # app runs at runtime references them - ConfigPaths only uses Download-Patches.ps1 and
+    # Install-Patches.ps1 - so they must not ship in a release zip.
+    Get-ChildItem -Path $scriptsDst -Filter "_*.ps1" -File -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Force }
 }
 
 # Include markdown docs (optional but useful)
