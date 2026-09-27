@@ -16,9 +16,56 @@
 | `tests/Test-StateStore.ps1` (headless + isolated-worker proof) | **DONE, 19/19 PASS** |
 | `Wuu.WindowsUpdate.psm1` dispatcher actions → store | **DONE** |
 | `stateStore` injected into worker + jobCleanup runspaces + context | **DONE** |
-| `Wuu.Core.psm1` payloads → store | **MOSTLY DONE, 12 GUI-chrome refs left** |
-| Headless payload harness (`Start-WuuApplication` stub) | NOT STARTED |
-| Delete `ui/` + XAML load path | NOT STARTED (removes the last 12 refs) |
+| `Wuu.Core.psm1` payloads → store | **DONE - no payload path touches WPF** |
+| Headless payload harness (`Test-HeadlessEngine.ps1`) | **DONE, 11/11 PASS** |
+| Delete `ui/` + XAML load path | NOT STARTED (removes the remaining GUI-chrome refs) |
+
+## Increment 4 - the decisive gate: the engine runs with NO WPF
+
+`tests/Test-HeadlessEngine.ps1` - **11/11 PASS**. This is the Phase 1 acceptance test, and it
+tests the *shipping code* rather than a copy: it extracts the real injected helper
+scriptblocks out of `New-ComputerRunspace`'s source, parse-checks them, and executes them in a
+real isolated runspace while asserting a WPF assembly is never loaded.
+
+```
+PASS: baseline: no WPF assembly loaded in a fresh -NoProfile process
+PASS: Import-WuuModules loads the engine with NO WPF assembly
+PASS: Wuu.State exports the store factory
+PASS: extracted real injected helpers from source via tokenizer (9 total)
+PASS: no injected helper references Dispatcher/Brushes/ListView (comments excluded)
+PASS: all 3 real injected helpers executed in an isolated runspace
+PASS: SetComputerTimeoutScript set Color='Timeout' (was [Brushes]::LightYellow)
+PASS: timeout state applied to the live row
+PASS: timeout status text correct
+PASS: helpers bumped Revision to 4 (redraw signal works)
+PASS: NO WPF assembly loaded after running the full helper set
+```
+
+**Scope note:** this covers the *engine and payload layer* - what worker runspaces execute.
+The GUI *shell* (`Start-WuuApplication`) still loads XAML; that goes when `ui/` is deleted.
+
+Also in this increment: the encrypted-config-load path (the **third** row-creation site from
+SUGGESTIONS S2) now uses `New-WuuComputerRow`; the `clientObservable` clear/`ItemsSource`
+setup is gone; `Show-PasswordPrompt` -> `_WuuReadPassword` (`Read-Host -AsSecureString`);
+`MessageBox` error dialogs -> console output.
+
+### Four test-authoring bugs - all produced FALSE failures that looked like product bugs
+
+Worth recording because each sent me chasing a non-existent defect in the module:
+
+1. **Extracting a scriptblock by counting braces with a hand-rolled quote tracker breaks on an
+   apostrophe inside a COMMENT** ("the store's own table") - it opens a phantom string and then
+   swallows the real closing brace, yielding a 19 KB "scriptblock" that does not parse.
+   **Use `[PSParser]::Tokenize`** - it already understands comments and strings.
+2. **Hashtable literals tokenise as `GroupStart '@{'`, not `'{'`.** Counting only `'{'` makes
+   `@{...}` look unbalanced and ends the block early. Count both forms.
+3. **`ScriptBlock.ToString()` returns the BODY WITHOUT the outer braces.** Production calls
+   `[scriptblock]::Create({...}.ToString())`; feeding the braces into `Create` produces a
+   scriptblock whose body is a *nested* scriptblock literal, so `& $helper` merely **prints the
+   helper's source** instead of running it - a silent no-op indistinguishable from a broken
+   helper. Extract the inner text.
+4. **Asserting "no WPF references" against raw scriptblock text flags explanatory comments**
+   (`# Was: ... [Brushes]::LightYellow`). Strip comments before matching.
 
 **Remaining `Dispatcher` refs: 12**, all GUI-only chrome in `Wuu.Core.psm1` that is deleted
 with `ui/`: the `JobTimer` (`DispatcherTimer`), `$eventWindowInit` column-resize /
