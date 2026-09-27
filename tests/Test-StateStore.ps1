@@ -109,4 +109,43 @@ if (Remove-WuuComputerRow -Store $store -Computer 'nope') { Fail 'remove of miss
 $op = New-WuuOperatorContext
 if (-not $op.User -or -not $op.RunId -or -not $op.Machine) { Fail 'operator context incomplete' } else { Pass "operator context: $($op.User)@$($op.Machine) elevated=$($op.Elevated)" }
 
+# 6. Settings + Status: the payload-facing replacement for the three Auto* checkboxes
+#    and the StatusTextBox. Verified by grep that those are the ONLY $uiHash members
+#    payloads need for behaviour (everything else is menu wiring / ListView chrome).
+if ($store.Settings.AutoDownload -ne $false -or $store.Settings.AutoInstall -ne $false -or $store.Settings.AutoReboot -ne $false) {
+    Fail 'settings should default to false'
+} else { Pass 'settings default to false' }
+
+Set-WuuSetting -Store $store -Name 'AutoDownload' -Value $true | Out-Null
+Set-WuuSetting -Store $store -Name 'AutoInstall' -Value $true | Out-Null
+if ($store.Settings.AutoDownload -ne $true -or $store.Settings.AutoInstall -ne $true) { Fail 'Set-WuuSetting did not persist' }
+else { Pass 'Set-WuuSetting persists (AutoDownload/AutoInstall)' }
+
+# invalid setting name must be rejected (ValidateSet)
+$rejected = $false
+try { Set-WuuSetting -Store $store -Name 'NotASetting' -Value $true | Out-Null } catch { $rejected = $true }
+if (-not $rejected) { Fail 'invalid setting name was accepted' } else { Pass 'invalid setting name rejected' }
+
+# Settings must be READABLE from an isolated worker runspace (payloads read them)
+$store.SetStatus('test status from main')
+$iss2 = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$iss2.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+$rs2 = [runspacefactory]::CreateRunspace($iss2); $rs2.ApartmentState='STA'; $rs2.Open()
+$rs2.SessionStateProxy.SetVariable('store', $store)
+$ps2 = [powershell]::Create().AddScript({
+    # This is exactly what a payload does instead of reading a WPF checkbox
+    $ad = $store.Settings.AutoDownload
+    $ai = $store.Settings.AutoInstall
+    $store.SetStatus('status written by worker')
+    return "AD=$ad AI=$ai"
+})
+$ps2.Runspace = $rs2
+$h2 = $ps2.BeginInvoke()
+$out2 = @($ps2.EndInvoke($h2))
+$ps2.Dispose(); $rs2.Close(); $rs2.Dispose()
+if (@($out2)[0] -ne 'AD=True AI=True') { Fail ("worker could not read settings: " + (@($out2) -join '|')) }
+else { Pass 'ISOLATED worker read Settings (replaces checkbox .IsChecked)' }
+if ($store.Status -ne 'status written by worker') { Fail "worker SetStatus failed ('$($store.Status)')" }
+else { Pass 'ISOLATED worker SetStatus works (replaces StatusTextBox.Text)' }
+
 if ($fail) { Write-Host 'SOME CHECKS FAILED' -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS' -ForegroundColor Cyan }

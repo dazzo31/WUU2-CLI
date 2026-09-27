@@ -117,22 +117,44 @@ function New-WuuStateStore {
     Returns a synchronized hashtable. Keys:
       Rows     [arraylist] synchronized list of computer row objects (ordered)
       ByName   [hashtable] synchronized, case-insensitive Computer -> row
+      Settings [hashtable] synchronized operator settings payloads read
+      Status   [string]    status-bar text (replaces StatusTextBox)
       Revision [int]       global monotonic counter; renderers poll this
-    The whole object is worker-safe: collection ops are synchronized, and Touch()
-    is an object method (resolves from isolated runspaces).
+
+    The whole object is worker-safe: collection ops are synchronized, plain property
+    reads/writes are safe, and Touch() is an object method (resolves from isolated
+    runspaces where module functions are invisible).
+
+    SETTINGS replaces the GUI checkbox reads in payloads:
+      $uiHash.AutoDownloadCheckBox.IsChecked  ->  $stateStore.Settings.AutoDownload
+      $uiHash.AutoInstallCheckBox.IsChecked   ->  $stateStore.Settings.AutoInstall
+      $uiHash.AutoRebootCheckBox.IsChecked    ->  $stateStore.Settings.AutoReboot
+    (Verified by grep: those three are the ONLY $uiHash members payloads need for
+    behaviour - every other uiHash member is menu wiring or ListView/Window chrome.)
     #>
     $rows = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
     $byName = [hashtable]::Synchronized(@{})
     $store = [hashtable]::Synchronized(@{
         Rows     = $rows
         ByName   = $byName
+        Settings = [hashtable]::Synchronized(@{
+            AutoDownload = $false
+            AutoInstall  = $false
+            AutoReboot   = $false
+        })
+        Status   = ''
         Revision = 0
     })
     # Worker-safe redraw signal. `Touch` is a SCRIPT METHOD on the store object, so it
     # resolves from an isolated worker runspace (which cannot see module functions).
-    # It is bound to THIS store instance via the closure below - do not replace with a
-    # module-level function, workers would fail to find it.
+    # Do not replace with a module-level function - workers would fail to find it.
     $store | Add-Member -MemberType ScriptMethod -Name Touch -Force -Value {
+        $this.Revision = [int]$this.Revision + 1
+    }
+    # Worker-safe status-bar setter (replaces $uiHash.StatusTextBox.Text = $x).
+    $store | Add-Member -MemberType ScriptMethod -Name SetStatus -Force -Value {
+        param([string]$Message)
+        $this.Status = $Message
         $this.Revision = [int]$this.Revision + 1
     }
     return $store
@@ -225,6 +247,25 @@ function Set-WuuComputerRowColor {
     $Row.Color = $Color
 }
 
+function Set-WuuSetting {
+    <#
+    .SYNOPSIS
+    Sets an operator setting payloads read (replaces checkbox .IsChecked assignments).
+    .DESCRIPTION
+    Console-shell only - workers just READ $stateStore.Settings.<Name>. Kept as a
+    function so the setting names/validation live in one place.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Store,
+        [Parameter(Mandatory)]
+        [ValidateSet('AutoDownload', 'AutoInstall', 'AutoReboot')]
+        [string]$Name,
+        [Parameter(Mandatory)][bool]$Value
+    )
+    $Store.Settings[$Name] = $Value
+    return $Value
+}
+
 function New-WuuOperatorContext {
     <#
     .SYNOPSIS
@@ -256,5 +297,6 @@ Export-ModuleMember -Function @(
     'Remove-WuuComputerRow'
     'Get-WuuComputerRow'
     'Set-WuuComputerRowColor'
+    'Set-WuuSetting'
     'New-WuuOperatorContext'
 )

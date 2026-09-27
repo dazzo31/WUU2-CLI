@@ -10,7 +10,10 @@ function Import-WuuModules {
     # session-state isolation hides sibling exports otherwise). Both the app
     # startup and tests/Test-PendingDrain.ps1 use this single import path.
     param([Parameter(Mandatory)][string]$WuuRoot)
-    foreach ($m in @('Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate')) {
+    # Wuu.State first: Wuu.Core's startup creates the state store via New-WuuStateStore,
+    # and worker runspaces receive it. Order matters only for readability otherwise -
+    # all are imported -Global.
+    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
@@ -140,6 +143,10 @@ $global:jobCleanup = [hashtable]::Synchronized(@{})
 $global:updatesHash = [hashtable]::Synchronized(@{})
 $global:performanceHash = [hashtable]::Synchronized(@{})
 $global:errorSuggestionsHash = New-WuuErrorSuggestions
+# Console edition: presentation-agnostic state store replaces the WPF ListView as the
+# place payloads report progress. Injected into every worker + cleanup runspace.
+$stateStore = New-WuuStateStore
+$global:stateStore = $stateStore
 
 
 #region Logging
@@ -2403,6 +2410,8 @@ $newRunspace.Open()
 $newRunspace.SessionStateProxy.SetVariable('jobCleanup',$jobCleanup)
 $newRunspace.SessionStateProxy.SetVariable('jobs',$jobs)
 $newRunspace.SessionStateProxy.SetVariable('uiHash',$uiHash)
+# Console edition: the cleanup loop writes timeout state into the store, not the ListView.
+$newRunspace.SessionStateProxy.SetVariable('stateStore',$stateStore)
 $newRunspace.SessionStateProxy.SetVariable('LogPath',$global:LogPath)
 $newRunspace.SessionStateProxy.SetVariable('LogLock',$global:LogLock)
 $newRunspace.SessionStateProxy.SetVariable('backgroundProcessing',$backgroundProcessing)
@@ -2474,33 +2483,27 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                     $jobsToRemove += $runspace
                     
 
-                    # Update computer status to show timeout (item lookup must happen on the UI thread)
-                    # Note: language constructs only inside the action - pipeline cmdlets (Where-Object)
-                    # would bind to this busy cleanup runspace and deadlock the UI thread.
+                    # Update computer status to show timeout.
+                    # Console edition: no dispatcher needed - write straight into the
+                    # synchronized state store and Touch() to signal a redraw. This runs in
+                    # the cleanup runspace, which cannot see module functions, so the row is
+                    # resolved from the store's own hashtable.
+                    # Language constructs only - a pipeline cmdlet here would bind to the busy
+                    # cleanup runspace (the GUI edition deadlocked on exactly that).
                     try {
-                        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                            $computer = $null
-                            foreach ($entry in $uiHash.Listview.Items) {
-                                if ($entry.Computer -eq $timedOutComputer) { $computer = $entry; break }
-                            }
-                            if ($computer) {
-                                $uiHash.Listview.Items.EditItem($computer)
-                                $computer.Status = "Operation timed out after 10 minutes"
-                                $computer.UpdatesStatus = 'Timeout'
-                                $computer.State = 'Timeout'
-                                # Timeout is recoverable - yellow, matching Set-ComputerTimeout
-                                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($computer)
-                                if($listViewItem) {
-                                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightYellow
-                                }
-                                $uiHash.Listview.Items.CommitEdit()
-                                $uiHash.Listview.Items.Refresh()
-                            }
-                        })
+                        $timedOutRow = $stateStore.ByName[$timedOutComputer.ToLowerInvariant()]
+                        if ($timedOutRow) {
+                            $timedOutRow.Status = 'Operation timed out after 10 minutes'
+                            $timedOutRow.UpdatesStatus = 'Timeout'
+                            $timedOutRow.State = 'Timeout'
+                            # Timeout is recoverable - yellow, matching Set-ComputerTimeout
+                            $timedOutRow.Color = 'Timeout'
+                            $stateStore.Touch()
+                        }
                     } catch {
-                        # If UI update fails, just log it
+                        # If the row update fails, just log it
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                        $logEntry = "[$timestamp] [WARN] Timeout UI update skipped for ${timedOutComputer}: $($_.Exception.Message)"
+                        $logEntry = "[$timestamp] [WARN] Timeout row update skipped for ${timedOutComputer}: $($_.Exception.Message)"
                         & $WriteLogFileScript $logEntry
                     }
                 }
@@ -4507,6 +4510,8 @@ $wuuContext = @{
     RestartComputer             = $RestartComputer
     BackgroundProcessing        = $global:backgroundProcessing
     CredDialogXamlPath          = Join-Path $WuuRoot 'ui\CredentialDialog.xaml'
+    # Console edition: the state store worker runspaces write progress into.
+    StateStore                  = $stateStore
 }
 Initialize-WuuWindowsUpdateContext -Context $wuuContext
 

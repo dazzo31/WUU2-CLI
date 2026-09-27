@@ -11,7 +11,7 @@ function Initialize-WuuWindowsUpdateContext {
     # UseCustomCredentials, CustomCredentials, CredentialCache, PerformanceThreshold,
     # ConfigPaths, SearchTimeout, SessionTimeout, RebootCheckTimeout, MaxConcurrentJobs,
     # GetUpdates, DownloadUpdates, InstallUpdates, RestartComputer,
-    # BackgroundProcessing, CredDialogXamlPath
+    # BackgroundProcessing, CredDialogXamlPath, StateStore (console edition)
     param([Parameter(Mandatory)][hashtable]$Context)
     $script:WuuCtx = $Context
 }
@@ -33,6 +33,10 @@ function New-ComputerRunspace {
             $newRunspace.Open()
             Write-InfoLog "Runspace opened successfully for: $($ComputerItem.Computer)"
         $newRunspace.SessionStateProxy.SetVariable("uiHash",$uiHash)
+        # Console edition: worker payloads report progress through the synchronized state
+        # store instead of WPF. `stateStore` is a raw synchronized hashtable with a Touch()
+        # script method, so workers can use it without module-function access.
+        $newRunspace.SessionStateProxy.SetVariable("stateStore",$ctx.StateStore)
         $newRunspace.SessionStateProxy.SetVariable("updatesHash",$updatesHash)
         $newRunspace.SessionStateProxy.SetVariable("performanceHash",$performanceHash)
         $newRunspace.SessionStateProxy.SetVariable("errorSuggestionsHash",$errorSuggestionsHash)
@@ -119,50 +123,39 @@ function New-ComputerRunspace {
             }
         }.ToString()))
         
-        # Add safe ListView update function to runspace
-        # CRITICAL: the dispatcher action below executes on the UI thread while the worker
-        # runspace that owns this scriptblock is BLOCKED inside Dispatcher.Invoke waiting for
-        # it. Pipeline cmdlets (Where-Object/Select-Object/Sort-Object...) inside the action
-        # would need that busy worker runspace's engine to run -> guaranteed deadlock.
-        # Only use PowerShell LANGUAGE constructs (foreach/if/property sets) in here.
+        # Safe row-update helper for worker runspaces (console edition).
+        # Replaces the GUI's ListView EditItem/CommitEdit/Refresh + Dispatcher.Invoke with a
+        # plain write into the synchronized state store, then a Touch() to signal a redraw.
+        #
+        # HISTORY / WHY THIS SHAPE: in the GUI edition the dispatcher action executed on the
+        # UI thread while this worker runspace was BLOCKED inside Dispatcher.Invoke waiting
+        # for it, so any pipeline cmdlet (Where-Object/Select-Object/...) inside the action
+        # deadlocked the whole app. The store removes the dispatch entirely, but the rule is
+        # kept: LANGUAGE CONSTRUCTS ONLY below. Do not add pipeline cmdlets.
         $newRunspace.SessionStateProxy.SetVariable('SafeUpdateListViewItemScript', [scriptblock]::Create({
             param(
                 [string]$ComputerName,
                 [hashtable]$Properties
             )
-            
-            # Check if GUI is ready and ListView is properly initialized
-            if (-not $uiHash.ListView -or -not $uiHash.clientObservable) {
-                return
-            }
-            
+
+            if (-not $stateStore) { return }
             try {
-                $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                    # Find the actual item in the ListView that corresponds to this computer
-                    # (foreach loop, NOT a Where-Object pipeline - see comment above)
-                    $actualItem = $null
-                    foreach ($item in $uiHash.Listview.Items) {
-                        if ($item.Computer -eq $ComputerName) { $actualItem = $item; break }
-                    }
-                    
-                    if ($actualItem) {
-                        $uiHash.Listview.Items.EditItem($actualItem)
-                        
-                        foreach ($propertyName in $Properties.Keys) {
-                            $actualItem.$propertyName = $Properties[$propertyName]
-                        }
-                        
-                        $uiHash.Listview.Items.CommitEdit()
-                        $uiHash.Listview.Items.Refresh()
-                    }
-                })
+                # Resolve the row from the store's own synchronized hashtable - worker
+                # runspaces cannot see module functions (Get-WuuComputerRow etc.).
+                $targetRow = $stateStore.ByName[$ComputerName.ToLowerInvariant()]
+                if (-not $targetRow) { return }
+
+                foreach ($propertyName in $Properties.Keys) {
+                    $targetRow.$propertyName = $Properties[$propertyName]
+                }
+                $stateStore.Touch()
             } catch {
-                # Silently ignore ListView update errors during startup
+                # Silently ignore row update errors during startup
             }
         }.ToString()))
 
         # Timeout state helper for worker runspaces. Mirrors Set-ComputerTimeout in
-        # Wuu.Core.psm1 but uses only language constructs + the injected $uiHash so
+        # Wuu.Core.psm1 but uses only language constructs + the injected $stateStore so
         # it is safe to invoke from an isolated runspace.
         $newRunspace.SessionStateProxy.SetVariable('SetComputerTimeoutScript', [scriptblock]::Create({
             param(
@@ -172,18 +165,15 @@ function New-ComputerRunspace {
                 [string]$Detail = ''
             )
             try {
-                $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                    $uiHash.Listview.Items.EditItem($Computer)
-                    $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
-                    $Computer.TimeoutSource    = $Phase
-                    $Computer.UpdatesStatus    = 'Timeout'
-                    $Computer.State            = 'Timeout'
-                    $detailSuffix = if ($Detail) { " $Detail" } else { '' }
-                    $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
-                    $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-                    if ($listViewItem) { $listViewItem.Background = [System.Windows.Media.Brushes]::LightYellow }
-                    $uiHash.Listview.Items.CommitEdit()
-                })
+                $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
+                $Computer.TimeoutSource    = $Phase
+                $Computer.UpdatesStatus    = 'Timeout'
+                $Computer.State            = 'Timeout'
+                $detailSuffix = if ($Detail) { " $Detail" } else { '' }
+                $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
+                # Was: listViewItem.Background = [Brushes]::LightYellow (recoverable = yellow)
+                $Computer.Color = 'Timeout'
+                if ($stateStore) { $stateStore.Touch() }
             } catch { }
         }.ToString()))
 
@@ -214,12 +204,9 @@ function New-ComputerRunspace {
             $statusString = $stateToStatus[$State]
             if ($StatusDetail) { $statusString += " $StatusDetail" }
             try {
-                $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                    $uiHash.Listview.Items.EditItem($Computer)
-                    $Computer.State = $State
-                    $Computer.Status = $statusString
-                    $uiHash.Listview.Items.CommitEdit()
-                })
+                $Computer.State = $State
+                $Computer.Status = $statusString
+                if ($stateStore) { $stateStore.Touch() }
             } catch { }
         }.ToString()))
 

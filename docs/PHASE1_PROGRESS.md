@@ -12,12 +12,37 @@
 
 | Deliverable | State |
 |---|---|
-| `src/Wuu.State.psm1` (state store + row factory + operator context) | **DONE** |
-| `tests/Test-StateStore.ps1` (headless + isolated-worker proof) | **DONE — 14/14 PASS** |
-| Rewire `Wuu.WindowsUpdate.psm1` dispatcher actions → store | NOT STARTED |
-| Rewire `Wuu.Core.psm1` payloads (~200 sites) → store | NOT STARTED |
+| `src/Wuu.State.psm1` (store + row factory + settings + operator context) | **DONE** |
+| `tests/Test-StateStore.ps1` (headless + isolated-worker proof) | **DONE, 19/19 PASS** |
+| `Wuu.WindowsUpdate.psm1` dispatcher actions → store | **DONE** |
+| `stateStore` injected into worker + jobCleanup runspaces + context | **DONE** |
+| `Wuu.Core.psm1` payloads (89 remaining `Dispatcher` refs) → store | NOT STARTED |
 | Headless payload harness (`Start-WuuApplication` stub) | NOT STARTED |
 | Delete `ui/` + XAML load path | NOT STARTED |
+
+**Remaining `Dispatcher` references: 89** (measured in `Wuu.Core.psm1`). These are the
+payload/event-handler sites (`$GetUpdates`, `$DownloadUpdates`, `$InstallUpdates`,
+`$RestartComputer`, `$AddEntry`, `$removeEntry`, …) plus GUI-only chrome that gets deleted
+with `ui/`. `Wuu.WindowsUpdate.psm1` is fully rewired.
+
+## New in the second increment
+
+- **`Settings` on the store** replaces the three `$uiHash.Auto*CheckBox.IsChecked` reads.
+  Enumerated the *entire* `$uiHash` surface used by payloads to size this properly: the three
+  checkboxes are the only behavioural members; everything else is menu wiring
+  (`AddADMenu`, `ExitMenu`, …), ListView chrome (`Listview`, `clientObservable`, `GridView`)
+  or `Window`. Verified by regex over both modules — do not guess this again.
+- **`SetStatus` store method** replaces `$uiHash.StatusTextBox.Text = $x`.
+- **`Set-WuuSetting`** validated setter (console-shell side).
+- **Rewired `Wuu.WindowsUpdate.psm1`**: `SafeUpdateListViewItemScript`,
+  `SetComputerTimeoutScript`, `SetComputerStateScript` write to the store + `Touch()`.
+  Timeout colour `[Brushes]::LightYellow` → `$Computer.Color = 'Timeout'`.
+- **Rewired the jobCleanup 10-minute-timeout handler** in `Wuu.Core.psm1` (was a
+  `Dispatcher.Invoke` + `foreach` lookup; now a direct `$stateStore.ByName[...]` write).
+- **`stateStore` injected** into `New-ComputerRunspace`, the jobCleanup runspace, and the
+  WindowsUpdate context (`StateStore` key).
+- **`docs/SUGGESTIONS_FOR_GUI.md`** — 7 structural improvements for the WPF edition with risk
+  ratings and adoption order (requested by the user).
 
 ---
 
@@ -113,23 +138,25 @@ module-function access). The keystone risk of Phase 1 is therefore retired.
 
 ## Next actions (in order)
 
-1. **Rewire `Wuu.WindowsUpdate.psm1`** (smallest surface, 663 lines): the two dispatcher
-   blocks — `SafeUpdateListViewItemScript` and the jobCleanup timeout handler — plus
-   `New-ComputerRunspace` variable injection (add `stateStore` beside `uiHash`). Keep the
-   **language-constructs-only** rule: both of those paths can be reached while another
-   thread is blocked waiting on us.
-2. **Rewire `Wuu.Core.psm1`** (~200 sites, mechanical): each
-   `EditItem(x); ...; CommitEdit(); Refresh()` block becomes direct property writes plus
-   one `$store.Touch()`. Each `ContainerFromItem(...).Background = Brushes::X` becomes
-   `Set-WuuComputerRowColor`. Keep payloads free of module function calls.
-3. **Headless harness test**: import the modules and run a payload with the store, with
-   **no WPF assembly loadable in the process** — proves payloads are truly decoupled.
-4. **Delete `ui/`** and the `XamlReader` load path once nothing references it.
+1. **Rewire `Wuu.Core.psm1` payloads** (89 `Dispatcher` refs, mechanical). Each
+   `EditItem(x); ...; CommitEdit(); Refresh()` block becomes direct property writes on the
+   already-in-scope `$Computer` row plus one `$stateStore.Touch()`. Each
+   `ContainerFromItem(...).Background = Brushes::X` becomes `$row.Color = 'Error'|'Timeout'`.
+   Each `$uiHash.Auto*CheckBox.IsChecked` read becomes `$stateStore.Settings.Auto*`.
+   Each `$uiHash.StatusTextBox.Text = $x` becomes `$stateStore.SetStatus($x)`.
+   Delete GUI-only chrome (`$eventWindowInit`, `$eventKeyDown`, column resize, all the
+   `$uiHash.*Menu.Add_Click` wiring) when `ui/` goes.
+2. **Headless harness test**: import the modules and run a payload against the store with
+   **no WPF assembly loadable** — proves payloads are truly decoupled.
+3. **Delete `ui/`** and the `XamlReader` load path once nothing references it.
 
 ## Constraints to carry forward (do not lose these)
 
-- Worker runspaces: **no module functions, no pipeline cmdlets on callback paths** —
-  language constructs only. (`Where-Object`/`Select-Object` in a dispatcher-bound action
-  caused a permanent two-thread deadlock in the GUI edition.)
+- Worker runspaces: **no module functions, no pipeline cmdlets on callback paths** — language
+  constructs only. (`Where-Object`/`Select-Object` in a dispatcher-bound action caused a
+  permanent two-thread deadlock in the GUI edition. The dispatcher is gone, but the rule is
+  kept because the same paths can still be reached while another thread waits on us.)
 - Row objects: **all properties must exist at creation** (`New-WuuComputerRow`).
-- `Touch()` is a store *method*; functions in `Wuu.State` are console-shell-only.
+- `Touch()` / `SetStatus()` are store *methods* (resolve in workers); `Wuu.State` *functions*
+  are console-shell-only.
+- An **empty ArrayList/hashtable is falsy** in PowerShell — assert on `$null`/`.Count`.
