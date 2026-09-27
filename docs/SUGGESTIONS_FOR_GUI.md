@@ -180,6 +180,60 @@ logged, asserted on in tests, or rendered in a non-GUI surface without change.
 
 ---
 
+## S10 — The config-load path is a third copy of the row contract (highest-value S2 instance)
+
+**Problem.** `$eventLoadConfig` does not just create a row — it also clears
+`clientObservable` and re-creates it (`ItemsSource` re-assignment) inside a dispatcher invoke,
+then creates each row with its **own** `New-Object PSObject -Property @{...}` literal carrying
+a *different* default set from `AddEntry` (`Status = 'Loaded from config...'`,
+`UpdatesStatus = 'Unknown'`, `Pending = $false`). So the three row-creation sites (S2) differ
+not only in mechanism but in **initial values**, and the load path additionally depends on
+`clientObservable` existing *and* being re-bindable.
+
+**Suggestion.** `New-WuuComputerRow -Computer X -StateSource BulkAdd` then set the two or
+three differing fields explicitly. The "loaded from config" differences are *policy*, not
+schema, so they belong as visible overrides rather than buried in a duplicate literal.
+Dropping the `clientObservable` re-creation also removes a real hazard: an
+`ObservableCollection` swap while the ListView is bound can lose selection/scroll state.
+
+**Value note.** This is the concrete site where S2 pays off most, because it is the one that
+has drifted furthest from the others. Adopting S2 with just `AddEntry` + this path would
+already eliminate the divergence.
+
+---
+
+## S11 — Status messages are set as `TextBox.Text`, so they cannot be logged or asserted on
+
+**Problem.** `Update-Status`/`Update-StatusBackground` write directly to
+`$uiHash.StatusTextBox.Text` inside a dispatcher invoke. Status is therefore only observable
+in the GUI: it cannot be logged with the message, asserted in a test, or surfaced in any
+non-GUI host. Several error paths also set the status *instead of* logging.
+
+**Suggestion.** Make the status a value in a small state object (`{ Text; Level; Timestamp }`)
+and have the renderer display it. Then every status change can also be written to the debug
+log (one line), which is exactly what made the CLI edition's auto-download investigation
+possible to diagnose from a log file rather than from the code.
+
+**Risk if adopted:** low, but touches many call sites. Pairs naturally with S1.
+
+---
+
+## S12 — Password prompting is a GUI-only function on the load path
+
+**Problem.** `$eventLoadConfig` calls `Show-PasswordPrompt`, a bespoke XAML dialog. Because the
+whole path is written around it, the load operation cannot run in a console, a scheduled task,
+or a test without that dialog. (The CLI edition replaced it with a five-line
+`Read-Host -AsSecureString` wrapper.)
+
+**Suggestion.** Split "obtain a password" from "do the load": the load path should accept a
+`SecureString` parameter, with the dialog as one *caller* rather than a dependency. That also
+makes the decrypt path unit-testable with a synthetic password (and is the only way to test
+the wrong-password branch, which today can only be exercised by a human typing).
+
+**Risk if adopted:** low-medium: mostly a signature change plus moving the prompt to the caller.
+
+---
+
 ## Not suggested
 
 - **Don't** try to unify the GUI and CLI shells behind one abstraction. The two editions share
@@ -192,14 +246,35 @@ logged, asserted on in tests, or rendered in a non-GUI surface without change.
 
 ## Suggested adoption order
 
-1. **S2 + S5** — small, zero-risk, immediately reduce future breakage and improve diagnosability.
-2. **S8 + S9** — small, self-contained; fix UI-collection lookups and status colour modelling
-   without touching the payloads.
+1. **S2 + S10 + S5** — row factory applied to all three creation sites (S10 is the one that
+   has drifted furthest), plus the auto-tail decision log. Small, zero-risk.
+2. **S8 + S9 + S11** — small, self-contained: keyed lookups, status colour as a level, status
+   as a loggable value.
 3. **S4 + S6** — small, consolidates duplicated error/timeout handling.
-4. **S1** — the big one; do it module-by-module with `Test-StateStore.ps1`-style proof at each
+4. **S12** — split password acquisition from the load path; unlocks testing the wrong-password
+   branch.
+5. **S1** — the big one; do it module-by-module with `Test-StateStore.ps1`-style proof at each
    step. Highest value (removes the deadlock class and the virtualized-row colour bug).
-5. **S3** — cleanup pass after S2 lands.
-6. **S7** — opportunistic.
+6. **S3** — cleanup pass after S2 lands.
+7. **S7** — opportunistic.
+
+## Verification recipe for a mechanical pass (proven on the CLI edition)
+
+The CLI edition's ~200-site payload pass used generated edits, not hand-editing. What actually
+caught the mistakes was this combination — each step found a different bug class:
+
+1. **PS 5.1 parser pass** on every touched file (`[Language.Parser]::ParseFile`) — catches
+   structural damage. Found 20 errors from a bad generator.
+2. **Targeted corruption greps**, not just "does it parse": `if (\s*\)` (empty conditions),
+   orphaned braces, and a **count of expected new calls** (e.g. `$stateStore.Touch()` should
+   equal the number of transformed blocks). Parsing can succeed while semantics are wrong.
+3. **Read the `git diff`** — this is what caught a *deleted `return`* that parsed fine.
+4. **Diff size sanity** — a pass that should be roughly line-neutral showing −600 lines means
+   something was swallowed.
+
+Corollary: **commit before a mechanical pass** so a revert is one command. The CLI pass was
+reverted twice before it was safe; that is the expected cost, not a sign of failure.
+
 
 ## Process note (from actually doing this refactor)
 
