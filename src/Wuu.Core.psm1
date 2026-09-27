@@ -1019,13 +1019,9 @@ $DownloadUpdates = {
         $dlStats = ($updatesHash[$Computer.computer] | Where-Object {$_.IsDownloaded -eq $false} | Select-Object -ExpandProperty MaxDownloadSize | Measure-Object -Sum)
 
         #Update status
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = "Downloading $($dlStats.Count) Updates ($([math]::Round($dlStats.Sum/1MB))MB)."
             $computer.State = 'Downloading'
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
 
         $remoteCred = $null
         if ($UseCustomCredentials -and $Computer.computer -ne 'localhost' -and $Computer.computer -ne $env:COMPUTERNAME) {
@@ -1035,12 +1031,8 @@ $DownloadUpdates = {
             param($p)
             if ($p.Phase -ne 'Downloading') { return }
             $progressText = "Downloading $($p.Current)/$($p.Total): $($p.Title)"
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
                 $Computer.Status = $progressText
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
         }
         $taskResult = & $InvokeRemoteTaskScript -ComputerName $Computer.computer -ScriptPath $ConfigPaths.DownloadScript -Operation 'Download' -Credential $remoteCred -ProgressCallback $onProgress
         if (-not $taskResult.Success) {
@@ -1049,14 +1041,10 @@ $DownloadUpdates = {
         $numDownloaded = $taskResult.Count
 
         #Update status
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = 'Download complete.'
             $computer.State = 'UpdatesFound'
             $computer.Downloaded += $numDownloaded
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
         
         #Auto-install if enabled and there are downloaded updates ready for installation
         if($uiHash.AutoInstallCheckBox.IsChecked -and $computer.Downloaded -gt 0){
@@ -1072,32 +1060,24 @@ $DownloadUpdates = {
             if($downloadedUpdates -and -not $alreadyAutoFlow -and -not $alreadyPending){
                 # Queue install as a follow-up (nested BeginInvoke on this busy runspace
                 # would silently never run the install payload).
-                $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                    $uiHash.Listview.Items.EditItem($Computer)
                     $computer.Status = 'Auto-install of downloaded updates queued...'
                     $computer.State = 'Installing'
                     $Computer.PendingOp = 'InstallAndRecheck'
                     $Computer.Pending   = $true
-                    $uiHash.Listview.Items.CommitEdit()
-                    $uiHash.Listview.Items.Refresh()
-                })
+                if ($stateStore) { $stateStore.Touch() }
             }
         }
     }
     Catch{
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = "Error occured: $($_.Exception.Message)."
             $computer.UpdatesStatus = 'Error'
             $computer.State = 'Error'
             # Set background color to grey for errored entries
             $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
             if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+        $Computer.Color = 'Error'
             }
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
 
         #Cancel any remaining actions
         exit
@@ -1326,13 +1306,9 @@ $GetUpdates = {
         # Phase gating is handled on the UI thread by Start-PendingUpdateCheck before this job starts.
 
         #Update status
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = 'Validating connectivity and services...'
             $computer.State = 'Connecting'
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
 
         Set-Location $path
 
@@ -1353,12 +1329,8 @@ $GetUpdates = {
                 $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Checking system dependencies for $($Computer.Computer)"
                 & $WriteLogFileScript $logEntry
             }
-            $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
                 $computer.Status = 'Checking system dependencies...'
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
             
             # Skip complex dependency checking - just assume local connectivity
             $depStatus = "Dependencies: Skipping checks for stability"
@@ -1368,12 +1340,8 @@ $GetUpdates = {
                 & $WriteLogFileScript $logEntry
             }
             
-            $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
                 $computer.Status = $depStatus
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
             
             Start-Sleep -Seconds 2
         }
@@ -1446,12 +1414,8 @@ $GetUpdates = {
                 }
                 if (-not $pingOk) {
                     $errorMessage = "Computer $($Computer.computer) is not reachable (ping timeout after 2s). Check network connectivity, firewall ICMP rules, or verify the computer exists."
-                    $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                        $uiHash.Listview.Items.EditItem($Computer)
                         $computer.Status = $errorMessage
-                        $uiHash.Listview.Items.CommitEdit()
-                        $uiHash.Listview.Items.Refresh()
-                    })
+                    if ($stateStore) { $stateStore.Touch() }
                     throw $errorMessage
                 }
                 
@@ -1571,13 +1535,9 @@ $GetUpdates = {
                 }
                 
                 # Update status for COM object creation
-                $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                    $uiHash.Listview.Items.EditItem($Computer)
                     $computer.Status = "Creating Windows Update session (attempt $retryCount/$maxRetries)..."
                     $computer.State = 'Checking'
-                    $uiHash.Listview.Items.CommitEdit()
-                    $uiHash.Listview.Items.Refresh()
-                })
+                if ($stateStore) { $stateStore.Touch() }
                 
                 # Try to create the COM instance with timeout
                 $sessionCreated = $false
@@ -1781,8 +1741,6 @@ $GetUpdates = {
 
         # Update UI in a safer way that avoids cross-thread exceptions
         try {
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
                 $computer.Available = $adjustedAvailableCount
                 $computer.Downloaded = $dlCount
                 $computer.RebootRequired = $rebootRequired
@@ -1807,9 +1765,7 @@ $GetUpdates = {
                     }
                 }
                 
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
         } catch {
             # If UI update fails, just log it but don't crash
             if ($EnableDebugLogging) {
@@ -1860,15 +1816,11 @@ $GetUpdates = {
             # Queue a follow-up download instead of nested-BeginInvoke on this busy runspace
             # (a second pipeline started from inside the runspace silently never runs).
             # If AutoInstall is also on, run the full unattended chain in ONE later pipeline.
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
                 $computer.Status = 'Auto-download of available updates queued...'
                 $computer.State = 'Downloading'
-                $Computer.PendingOp = if ($uiHash.AutoInstallCheckBox.IsChecked) { 'AutoFlow' } else { 'Download' }
+                $Computer.PendingOp = if ($stateStore.Settings.AutoInstall) { 'AutoFlow' } else { 'Download' }
                 $Computer.Pending   = $true
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
         }
     }
     Catch{
@@ -1924,14 +1876,10 @@ $GetUpdates = {
             if ($timeoutPhase -in @('WUA Session','Update Search') -and $Computer.RetryCount -lt 2) {
                 $retryDelaySec = 60
                 try {
-                    $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                        $uiHash.Listview.Items.EditItem($Computer)
                         $Computer.RetryCount += 1
                         $Computer.RetryAt = [DateTime]::Now.AddSeconds($retryDelaySec)
                         $Computer.Status = "Timeout during $timeoutPhase - auto-retry $($Computer.RetryCount)/2 in ${retryDelaySec}s."
-                        $uiHash.Listview.Items.CommitEdit()
-                        $uiHash.Listview.Items.Refresh()
-                    })
+                    if ($stateStore) { $stateStore.Touch() }
                     Write-DebugLog "[$($Computer.Computer)] Scheduled auto-retry $($Computer.RetryCount)/2 in ${retryDelaySec}s" -Level 'INFO'
                 } catch {
                     Write-DebugLog "[$($Computer.Computer)] Failed to schedule auto-retry: $($_.Exception.Message)" -Level 'WARN'
@@ -1940,19 +1888,15 @@ $GetUpdates = {
         }
         else {
             # Terminal error - grey row, Error status
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
                 $computer.Status = "Error occurred: $errorMessage"
                 $computer.UpdatesStatus = 'Error'
                 $computer.State = 'Error'
                 # Set background color to grey for errored entries
                 $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
                 if($listViewItem) {
-                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+            $Computer.Color = 'Error'
                 }
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
         }
 
         #Cancel any remaining actions
@@ -1973,14 +1917,10 @@ $InstallUpdates = {
 
         #Update status
         $installCount = ($updatesHash[$Computer.computer] | Where-Object {$_.IsDownloaded -eq $true -and $_.InstallationBehavior.CanRequestUserInput -eq $false} | Measure-Object).Count
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = "Installing $installCount Updates, this may take some time."
             $computer.State = 'Installing'
             $computer.InstallErrors = 0
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
 
         $remoteCred = $null
         if ($UseCustomCredentials -and $Computer.computer -ne 'localhost' -and $Computer.computer -ne $env:COMPUTERNAME) {
@@ -1990,12 +1930,8 @@ $InstallUpdates = {
             param($p)
             if ($p.Phase -ne 'Installing') { return }
             $progressText = "Installing $($p.Current)/$($p.Total): $($p.Title)"
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
                 $Computer.Status = $progressText
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
         }
         $taskResult = & $InvokeRemoteTaskScript -ComputerName $Computer.computer -ScriptPath $ConfigPaths.InstallScript -Operation 'Install' -Credential $remoteCred -ProgressCallback $onProgress
         if (-not $taskResult.Success) {
@@ -2005,8 +1941,6 @@ $InstallUpdates = {
         $rebootRequired = $taskResult.RebootRequired
 
         #Update status
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.InstallErrors = $installErrors
             if ($rebootRequired -eq $True) {
                 $computer.Status = 'Install complete. Reboot required.'
@@ -2017,24 +1951,18 @@ $InstallUpdates = {
                 $computer.State = 'Complete'
                 $computer.RebootRequired = $False
             }
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
     }
     Catch{
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = "Error occured: $($_.Exception.Message)"
             $computer.UpdatesStatus = 'Error'
             $computer.State = 'Error'
             # Set background color to grey for errored entries
             $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
             if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+        $Computer.Color = 'Error'
             }
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
 
         #Cancel any remaining actions
         exit
@@ -2050,50 +1978,34 @@ $RemoveOfflineComputer = {
     Param ($computer)
     try{
         #Update status
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($computer)
             $computer.Status = 'Testing Connectivity.'
             $computer.State = 'Connecting'
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
         #Verify connectivity
         if(Test-Connection -Count 1 -ComputerName $computer.Computer -Quiet){
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($computer)
                 $computer.Status = 'Online.'
                 $computer.State = 'Connected'
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
         }
         else{
             #Remove unreachable computers
             $updatesHash.Remove($computer.computer)
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($computer)
                 # Check if clientObservable exists before trying to remove from it
                 if ($uiHash.clientObservable) {
                     $uiHash.clientObservable.Remove($computer)
                 }
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
         }
     }
     Catch{
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($computer)
             $computer.Status = "Error occured: $($_.Exception.Message)"
             $computer.State = 'Error'
             # Set background color to grey for errored entries
             $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($computer)
             if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+        $computer.Color = 'Error'
             }
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
 
         #Cancel any remaining actions
         exit
@@ -2108,13 +2020,9 @@ $RestartComputer = {
         if($afterInstall -and -not $uiHash.AutoRebootCheckBox.IsChecked){return}
         if($afterInstall -and -not $Computer.RebootRequired){return}
         # Update status
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = 'Restarting... Waiting for computer to shutdown.'
             $computer.State = 'Rebooting'
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
 
         #Restart and wait until remote COM can be connected
         Restart-Computer $Computer.computer -Force
@@ -2128,13 +2036,9 @@ $RestartComputer = {
         }
 
         #Update status
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = 'Restarting... Waiting for computer to come online.'
             $computer.State = 'Rebooting'
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
 
         $onlineWait = 0
         While($true){ #Wait for computer to come online (each COM probe is bounded by a 10s pool call)
@@ -2168,13 +2072,9 @@ $RestartComputer = {
             }
         }
 
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = 'Restart complete. Computer is online.'
             $computer.State = 'Connected'
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
     }
     catch{
         # Reboot timeouts are RECOVERABLE - the computer may still come back online
@@ -2190,18 +2090,14 @@ $RestartComputer = {
             }
             try { & $WriteDebugLogScript -Message "[$($Computer.Computer)] Reboot timeout classified as recoverable: $timeoutPhase" -Level 'WARN' } catch { }
         } else {
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
                 $computer.Status = "Error occured: $($_.Exception.Message)"
                 $computer.State = 'Error'
                 # Set background color to grey for errored entries
                 $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
                 if($listViewItem) {
-                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+            $Computer.Color = 'Error'
                 }
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
         }
 
         #Cancel any remaining actions
@@ -3353,16 +3249,12 @@ $eventDownloadUpdates = {
         #Don't bother downloading if nothing available.
         if($_.Available -eq $_.Downloaded){
             #Update status based on whether computer is up-to-date or already has downloads
-            $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                $uiHash.Listview.Items.EditItem($_)
                 if($_.Available -eq 0){
                     $_.Status = 'Up-to-Date - No updates available for download.'
                 } else {
                     $_.Status = 'All available updates are already downloaded.'
                 }
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
             return
         }
 
@@ -3390,8 +3282,6 @@ $eventInstallUpdates = {
         
         if(-not $downloadedUpdates){
             #Update status based on whether there are updates available for download
-            $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                $uiHash.Listview.Items.EditItem($_)
                 if($availableUpdates){
                     $_.Status = 'Download Available Updates - No downloaded updates ready for installation.'
                 } elseif($_.Available -eq 0) {
@@ -3399,9 +3289,7 @@ $eventInstallUpdates = {
                 } else {
                     $_.Status = 'No updates available that can be installed remotely (may require user input).'
                 }
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            if ($stateStore) { $stateStore.Touch() }
             
             #No need to continue if there are no updates to install.
             return
@@ -3980,12 +3868,8 @@ $eventShowUpdateHistory = {
             throw "Failed to retrieve update history: $($comResult.Error)"
         }
     } Catch{
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($computer)
             $computer.Status = "Error Occured: $($_.exception.Message)"
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
     }
 }
 $eventViewUpdateLog = {
@@ -4021,17 +3905,13 @@ $WUServiceAction = {
         try { & $WriteDebugLogScript -Message "Performing Windows Update service action '$Action' on $($Computer.Computer)" -Level 'INFO' -Computer $Computer.Computer } catch { }
         
         # Update status
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = switch ($Action) {
                 'Start'   { 'Starting Windows Update Service...' }
                 'Stop'    { 'Stopping Windows Update Service...' }
                 'Restart' { 'Restarting Windows Update Service...' }
                 default   { "${Action}ing Windows Update Service..." }
             }
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
         
         # Perform the service action with timeout protection (avoids hangs)
         if ($Computer.Computer -eq 'localhost' -or $Computer.Computer -eq $env:COMPUTERNAME) {
@@ -4075,29 +3955,21 @@ $WUServiceAction = {
         }
         
         # Update status with result
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = $result
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
         
         try { & $WriteDebugLogScript -Message "Windows Update service action '$Action' completed successfully on $($Computer.Computer)" -Level 'SUCCESS' -Computer $Computer.Computer } catch { }
         
     } Catch {
         try { & $WriteDebugLogScript -Message "Windows Update service action '$Action' failed on $($Computer.Computer): $($_.Exception.Message)" -Level 'ERROR' -Computer $Computer.Computer } catch { }
         
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = "Service $Action failed: $($_.Exception.Message)"
             # Set background color to grey for errored entries
             $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
             if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+        $Computer.Color = 'Error'
             }
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        if ($stateStore) { $stateStore.Touch() }
     }
 }
 
