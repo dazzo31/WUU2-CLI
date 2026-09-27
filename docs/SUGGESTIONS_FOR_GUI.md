@@ -141,6 +141,45 @@ functions would shrink the module and make them unit-testable without WPF.
 
 ---
 
+## S8 — Replace row-existence lookups on `ListView.Items` with a keyed lookup
+
+**Problem.** Duplicate detection in `AddEntry` is
+`($uiHash.Listview.Items | Select-Object -Expand Computer) -contains $computer` — an O(n)
+pipeline enumeration of the **UI collection**, executed on whatever thread calls AddEntry.
+Several other places search `ListView.Items` with a `foreach` for the same reason (the
+`SafeUpdateListViewItem` helper, the timeout handler, `$removeEntry`). Every one of these is
+a UI-thread-affinity and cost issue that only exists because the ListView is doubling as the
+data model.
+
+**Suggestion.** Keep a `Computer -> row` hashtable alongside the collection (the CLI edition's
+`$store.ByName` — case-insensitive) and use `ContainsKey` for existence and direct indexing
+for lookup. Duplicate detection becomes O(1) with no UI enumeration and no thread affinity.
+This is a small, self-contained change that can be made *without* adopting S1 wholesale:
+add the hashtable next to `clientObservable`, populate it in `AddEntry`, remove in
+`$removeEntry`.
+
+**Risk if adopted:** low. Behaviour must match the existing case handling (the CLI store is
+case-insensitive via `ToLowerInvariant()`; the GUI's `-contains` is case-insensitive by
+default for strings, so they agree).
+
+---
+
+## S9 — Status-bar colour is mixed into the status write
+
+**Problem.** Copy-cell handlers set both the text **and** the colour in the same dispatcher
+action (`$uiHash.StatusTextBox.Foreground = 'Green'|'Orange'|'Red'`), and the two
+`Update-Status` / `Update-StatusBackground` helpers differ *only* by DispatcherPriority.
+Status is therefore modelled as a UI mutation rather than a value.
+
+**Suggestion.** Treat status as `{ Text; Level }` where Level is
+`Info`/`Success`/`Warning`/`Error`, set once, and let the renderer map Level to a brush/colour.
+That removes the Foreground writes, makes the two helpers one, and means a status can be
+logged, asserted on in tests, or rendered in a non-GUI surface without change.
+
+**Risk if adopted:** very low; mechanical.
+
+---
+
 ## Not suggested
 
 - **Don't** try to unify the GUI and CLI shells behind one abstraction. The two editions share
@@ -154,8 +193,28 @@ functions would shrink the module and make them unit-testable without WPF.
 ## Suggested adoption order
 
 1. **S2 + S5** — small, zero-risk, immediately reduce future breakage and improve diagnosability.
-2. **S4 + S6** — small, consolidates duplicated error/timeout handling.
-3. **S1** — the big one; do it module-by-module with `Test-StateStore.ps1`-style proof at each
+2. **S8 + S9** — small, self-contained; fix UI-collection lookups and status colour modelling
+   without touching the payloads.
+3. **S4 + S6** — small, consolidates duplicated error/timeout handling.
+4. **S1** — the big one; do it module-by-module with `Test-StateStore.ps1`-style proof at each
    step. Highest value (removes the deadlock class and the virtualized-row colour bug).
-4. **S3** — cleanup pass after S2 lands.
-5. **S7** — opportunistic.
+5. **S3** — cleanup pass after S2 lands.
+6. **S7** — opportunistic.
+
+## Process note (from actually doing this refactor)
+
+The CLI edition's payload pass was done with a **conservative, report-the-rest** generator
+rather than hand-editing ~200 sites or a greedy regex. Two bugs still slipped through and
+both are worth avoiding if the GUI edition does a similar mechanical pass:
+
+1. **Never build emitted PowerShell from a double-quoted string in a generator.** `"if ($store.Touch())"`
+   in generator source substitutes the *generator's* `$store` (empty) into the output. Use
+   single quotes / `-f` with single-quoted templates.
+2. **Never match a whole statement block on one line.** A regex that accepts
+   `... Invoke(...){ ... }` on a single line will match and then consume the *next* statement
+   (in our case a `return`) as part of the block.
+
+Verify mechanically after any such pass: a PS 5.1 parse check **plus** greps for the specific
+corruption shapes (empty `if (`, orphaned braces) **plus** reading the diff. The CLI pass was
+reverted twice before it was safe to commit — that is the expected cost, not a failure.
+
