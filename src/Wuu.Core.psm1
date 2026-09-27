@@ -637,6 +637,21 @@ function Update-StatusBackground {
 
 # Function to log error messages
 
+# Console password prompt (replaces the WPF Show-PasswordPrompt dialog).
+# Returns a SecureString, or $null if the operator cancelled (empty password).
+function _WuuReadPassword {
+    param([string]$Prompt = 'Password')
+    try {
+        $sec = Read-Host -Prompt $Prompt -AsSecureString
+    } catch {
+        # -AsSecureString is PS 5.1+; if unavailable, fail closed rather than echo a password
+        Write-ErrorLog "Secure password prompt unavailable: $($_.Exception.Message)"
+        return $null
+    }
+    if ($null -eq $sec -or $sec.Length -eq 0) { return $null }
+    return $sec
+}
+
 # Function to log success messages
 
 # Function to show message box and log error
@@ -3624,8 +3639,8 @@ $eventLoadConfig = {
         # Suspend background processing to prevent interference with password dialog
         Suspend-BackgroundProcessing -Reason "encrypted computer list load"
         
-        # Prompt for password using GUI dialog
-        $securePassword = Show-PasswordPrompt -Title "Decrypt Computer List" -Message "Enter the password to decrypt the computer list configuration:"
+        # Prompt for password (console edition: SecureString prompt, no WPF dialog)
+        $securePassword = _WuuReadPassword -Prompt 'Enter the password to decrypt the computer list configuration'
         
         if ($securePassword -eq $null) {
             # User cancelled the password prompt
@@ -3641,72 +3656,46 @@ $eventLoadConfig = {
         if ($loadResult.Success) {
             $loadedComputers = $loadResult.Config.Computers
             
-            # Clear current items from the ObservableCollection
-            $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                if ($uiHash.clientObservable) {
-                    $uiHash.clientObservable.Clear()
-                }
-            })
+            # Console edition: clear the store and add the loaded rows directly.
+            # (GUI edition cleared clientObservable then added rows inside a dispatcher
+            # invoke; the store needs neither.)
+            foreach ($row in @(Get-WuuComputerRow -Store $stateStore)) {
+                Remove-WuuComputerRow -Store $stateStore -Computer $row.Computer | Out-Null
+            }
 
-            # Add loaded items to the ObservableCollection
+            # Add loaded items to the store
             ForEach ($compData in $loadedComputers) {
-                $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                    if ($null -eq $uiHash.clientObservable) {
-                        $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-                        $uiHash.ListView.ItemsSource = $uiHash.clientObservable
-                    }
-                    try {
-                        # Only load computer name and phase - all other data starts fresh
-                        $computerObject = New-Object PSObject -Property @{
-                            State = 'Queued'
-                            StateTimestamp = Get-Date
-                            StateSource = 'BulkAdd'
-                            Computer = if ($compData.Computer) { $compData.Computer } else { "Unknown" }
-                            Phase = if ($compData.Phase) { $compData.Phase } else { "Phase 1" }
-                            Available = 0  # Start fresh
-                            Downloaded = 0  # Start fresh
-                            InstallErrors = 0  # Start fresh
-                            Status = "Loaded from config. Right-click > Check For Updates to refresh status."
-                            RebootRequired = $false  # Start fresh
-                            UpdatesStatus = "Unknown"  # Start fresh
-                            Runspace = $null
-                            Pending = $false  # Loaded computers wait for a manual Check For Updates
-                            TimeoutExpiresAt = $null
-                            TimeoutSource = ''
-                            RetryCount = 0
-                            RetryAt = $null
-                        }
-                        
-                        $uiHash.clientObservable.Add($computerObject)
-                        Write-InfoLog "Successfully loaded computer: $($computerObject.Computer)"
-                    } catch {
-                        Write-ErrorLog "Failed to add computer: $($compData.Computer). Error: $($_.Exception.Message)"
-                        Update-Status "Error adding $($compData.Computer): $($_.Exception.Message)"
-                    }
-                })
+                try {
+                    # Only load computer name and phase - all other data starts fresh
+                    $row = New-WuuComputerRow -Computer $(if ($compData.Computer) { $compData.Computer } else { 'Unknown' }) `
+                                              -Phase $(if ($compData.Phase) { $compData.Phase } else { 'Phase 1' }) `
+                                              -StateSource 'BulkAdd'
+                    $row.Status = 'Loaded from config. Select the row and Check For Updates to refresh status.'
+                    $row.UpdatesStatus = 'Unknown'
+                    $row.Pending = $false   # Loaded computers wait for a manual Check For Updates
+                    Add-WuuComputerRow -Store $stateStore -Row $row | Out-Null
+                    Write-InfoLog "Successfully loaded computer: $($row.Computer)"
+                } catch {
+                    Write-ErrorLog "Failed to add computer: $($compData.Computer). Error: $($_.Exception.Message)"
+                    Update-Status "Error adding $($compData.Computer): $($_.Exception.Message)"
+                }
             }
             
             # Worker runspaces are created on demand (New-ComputerRunspace) when an operation is requested
             Update-Status "Encrypted computer list loaded from $configPath"
         } else {
-            # Show error dialog for load failure (likely wrong password)
+            # Console edition: report the failure without a modal dialog.
             $errorMessage = $loadResult.Error
-            
-            # Check if error is related to decryption (wrong password)
             if ($errorMessage -match "decrypt|password|invalid|corrupt") {
-                [System.Windows.MessageBox]::Show(
-                    "Failed to load the encrypted computer list.`n`nThis is usually caused by an incorrect password.`n`nError Details: $errorMessage`n`nPlease try again with the correct password.",
-                    "Load Computer List - Authentication Error",
-                    'OK',
-                    'Error'
-                )
+                Write-Host ''
+                Write-Host 'Failed to load the encrypted computer list. This is usually caused by an incorrect password.' -ForegroundColor Red
+                Write-Host "Error details: $errorMessage" -ForegroundColor Red
+                Write-Host 'Please try again with the correct password.' -ForegroundColor Red
             } else {
-                [System.Windows.MessageBox]::Show(
-                    "Failed to load the encrypted computer list.`n`nError Details: $errorMessage`n`nPlease check that the file exists and is not corrupted.",
-                    "Load Computer List - File Error",
-                    'OK',
-                    'Error'
-                )
+                Write-Host ''
+                Write-Host 'Failed to load the encrypted computer list.' -ForegroundColor Red
+                Write-Host "Error details: $errorMessage" -ForegroundColor Red
+                Write-Host 'Please check that the file exists and is not corrupted.' -ForegroundColor Red
             }
             
             Update-Status "Failed to load encrypted computer list: $($loadResult.Error)"
