@@ -16,9 +16,56 @@
 | `tests/Test-StateStore.ps1` (headless + isolated-worker proof) | **DONE, 19/19 PASS** |
 | `Wuu.WindowsUpdate.psm1` dispatcher actions → store | **DONE** |
 | `stateStore` injected into worker + jobCleanup runspaces + context | **DONE** |
-| `Wuu.Core.psm1` payloads (89 remaining `Dispatcher` refs) → store | NOT STARTED |
+| `Wuu.Core.psm1` payloads → store | **MOSTLY DONE, 12 GUI-chrome refs left** |
 | Headless payload harness (`Start-WuuApplication` stub) | NOT STARTED |
-| Delete `ui/` + XAML load path | NOT STARTED |
+| Delete `ui/` + XAML load path | NOT STARTED (removes the last 12 refs) |
+
+**Remaining `Dispatcher` refs: 12**, all GUI-only chrome in `Wuu.Core.psm1` that is deleted
+with `ui/`: the `JobTimer` (`DispatcherTimer`), `$eventWindowInit` column-resize /
+visual-tree grip wiring (3 `BeginInvoke`), the pre-`ShowDialog` dispatcher diagnostics, and
+`$eventActionMenu` menu enable/disable. **No payload path references WPF any more.**
+
+---
+
+## Increment 3 - the payload pass (the bulk of Phase 1)
+
+- **`$AddEntry`**: the ~120-line dual-branch (pre-dispatch diagnostics + direct vs dispatched
+  `clientObservable`/ListView path) collapsed to ~15 lines via `New-WuuComputerRow` +
+  `Add-WuuComputerRow`. Duplicate detection now `$stateStore.ByName.ContainsKey(...)`.
+- **`$removeEntry`** / **`$clearComputerList`**: `Remove-WuuComputerRow` / `Get-WuuComputerRow`.
+- **`$DownloadUpdates` / `$GetUpdates` / `$InstallUpdates` / `$RestartComputer` /
+  `$RemoveOfflineComputer` / `$WUServiceAction`** and the event handlers: 32 blocks
+  transformed mechanically, 7 handled by hand (single-line invokes, multiline status blocks,
+  and blocks the shape-matcher refused).
+- **`SafeUpdateListViewItem`, `Set-ComputerState`, `Set-ComputerTimeout`, `Update-Status`,
+  `Update-StatusBackground`**: rewritten to store writes (increment 3a).
+- Copy-cell status colours (`Foreground = 'Green'|'Orange'|'Red'`) dropped - the store
+  carries status *text*; colour is a renderer concern.
+
+### The mechanical transformer - and the bugs it taught us
+
+`Scripts\_transform-dispatchers.ps1` (excluded from release zips) rewrites only blocks whose
+opening line closes its own argument list, whose closing line is exactly `})`, and whose body
+contains an `EditItem` call. 32 matched; everything else is **reported, not guessed**.
+
+A first, greedy version corrupted the file two ways - **both reverted, fixed, and documented
+in the script header:**
+
+1. The appended redraw line was built with a **double-quoted** format string, so `$stateStore`
+   interpolated to empty *inside the transformer's own scope* and emitted
+   `if ( ) { $stateStore.Touch() }` into the module (20 parse errors).
+   **Lesson: any generator that emits PowerShell must build emitted code from SINGLE-quoted
+   strings, or the generator's own variables get substituted into the output.**
+2. Single-line `[action]{...})` blocks matched the open-regex and **swallowed the following
+   statement** (a `return` disappeared).
+   **Lesson: match on an opening line that ENDS with `{`, never a whole block on one line.**
+
+Both were caught by a PS 5.1 parse check plus reading `git diff` - which is why the
+transformation was reverted twice rather than committed blind. Integrity greps on the final
+pass: `0` empty-`if` matches, `0` `Brushes]::` left, `36` `Touch()` calls.
+
+---
+
 
 **Remaining `Dispatcher` references: 89** (measured in `Wuu.Core.psm1`). These are the
 payload/event-handler sites (`$GetUpdates`, `$DownloadUpdates`, `$InstallUpdates`,

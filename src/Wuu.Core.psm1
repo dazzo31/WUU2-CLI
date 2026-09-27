@@ -856,13 +856,11 @@ $eventAssignPhase = {
         
         # Refresh the view once after all updates
         try {
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.Refresh()
-            })
-            Write-InfoLog "List view refreshed after phase assignment"
+            if ($stateStore) { $stateStore.Touch() }
+            Write-InfoLog "Store refresh signalled after phase assignment"
         } catch {
             $errorMsg = $_.Exception.Message
-            Write-ErrorLog "Failed to refresh list view - Error: $errorMsg"
+            Write-ErrorLog "Failed to signal refresh after phase assignment - Error: $errorMsg"
         }
 
         # Update status with appropriate message
@@ -893,7 +891,7 @@ $removeEntry = {
     # Add null/empty check to prevent crashes when no computers are selected
     if (-not $ComputerNames -or $ComputerNames.Count -eq 0) {
         Write-DebugLog "Remove computers called with no selections - ignoring operation" -Level 'DEBUG'
-        $uiHash.Window.Dispatcher.Invoke([action]{$uiHash.StatusTextBox.Text="No computers selected for removal"}) | Out-Null
+        $stateStore.SetStatus('No computers selected for removal')
         return
     }
     
@@ -957,18 +955,12 @@ $removeEntry = {
                 }
             }
             
-            # Remove from UI with proper thread safety
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                try {
-                    # Check if clientObservable exists before trying to remove from it
-                    if ($uiHash.clientObservable) {
-                        $uiHash.clientObservable.Remove($Computer)
-                    }
-                    $uiHash.Listview.Items.Refresh()
-                } catch {
-                    Write-WarningLog "Failed to remove UI item for $($Computer.Computer): $($_.Exception.Message)"
-                }
-            })
+            # Remove from the state store (console edition; no dispatcher/ListView)
+            try {
+                Remove-WuuComputerRow -Store $stateStore -Computer $Computer.Computer | Out-Null
+            } catch {
+                Write-WarningLog "Failed to remove store row for $($Computer.Computer): $($_.Exception.Message)"
+            }
             
             Write-SuccessLog "Successfully removed computer: $($Computer.Computer)"
         } catch {
@@ -984,8 +976,8 @@ $removeEntry = {
 $clearComputerList = {
     Write-InfoLog "Clearing all computers from list"
     
-    # Get all computers before clearing
-    $allComputers = @($uiHash.Listview.Items)
+    # Get all computers before clearing (snapshot from the store)
+    $allComputers = Get-WuuComputerRow -Store $stateStore
     
     if ($allComputers.Count -gt 0) {
         # Remove all computers using the removeEntry ScriptBlock
@@ -2324,23 +2316,15 @@ $eventCopyCellContent = {
             Write-InfoLog "Successfully copied '$cellContent' to clipboard"
             
             # Update status
-            $uiHash.StatusTextBox.Dispatcher.Invoke('Background',[action]{
-                $uiHash.StatusTextBox.Foreground = 'Green'
-                $uiHash.StatusTextBox.Text = "Copied '$cellContent' to clipboard"
-            })
+            # Console edition: status colour is a name the renderer maps; no WPF Foreground.
+            $stateStore.SetStatus("Copied '$cellContent' to clipboard")
         } else {
             Write-WarningLog "No item selected for copy operation"
-            $uiHash.StatusTextBox.Dispatcher.Invoke('Background',[action]{
-                $uiHash.StatusTextBox.Foreground = 'Orange'
-                $uiHash.StatusTextBox.Text = "No item selected to copy"
-            })
+            $stateStore.SetStatus('No item selected to copy')
         }
     } catch {
         Write-ErrorLog "Error copying cell content: $($_.Exception.Message)"
-        $uiHash.StatusTextBox.Dispatcher.Invoke('Background',[action]{
-            $uiHash.StatusTextBox.Foreground = 'Red'
-            $uiHash.StatusTextBox.Text = "Failed to copy cell content: $($_.Exception.Message)"
-        })
+        $stateStore.SetStatus("Failed to copy cell content: $($_.Exception.Message)")
     }
 }
 
