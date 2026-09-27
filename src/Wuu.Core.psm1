@@ -347,14 +347,12 @@ function Set-ComputerState {
     }
 
     try {
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
-            $Computer.State = $State
-            $Computer.Status = $statusString
-            $uiHash.Listview.Items.CommitEdit()
-        })
+        # Console edition: write straight to the store; no dispatcher/ListView.
+        $Computer.State = $State
+        $Computer.Status = $statusString
+        $stateStore.Touch()
     } catch {
-        Write-DebugLog "Set-ComputerState dispatcher failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
+        Write-DebugLog "Set-ComputerState store failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
     }
 
     Write-DebugLog "[$($Computer.Computer)] State -> $State : $statusString" -Level 'DEBUG'
@@ -381,23 +379,18 @@ function Set-ComputerTimeout {
     )
 
     try {
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
-            $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
-            $Computer.TimeoutSource    = $Phase
-            $Computer.UpdatesStatus    = 'Timeout'
-            $Computer.State            = 'Timeout'
-            $detailSuffix = if ($Detail) { " $Detail" } else { '' }
-            $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
-            # Timeout is recoverable - yellow, not the terminal-error grey
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if ($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightYellow
-            }
-            $uiHash.Listview.Items.CommitEdit()
-        })
+        # Console edition: write straight to the store; no dispatcher/ListView.
+        $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
+        $Computer.TimeoutSource    = $Phase
+        $Computer.UpdatesStatus    = 'Timeout'
+        $Computer.State            = 'Timeout'
+        $detailSuffix = if ($Detail) { " $Detail" } else { '' }
+        $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
+        # Timeout is recoverable - yellow, not the terminal-error grey
+        $Computer.Color = 'Timeout'
+        $stateStore.Touch()
     } catch {
-        Write-DebugLog "Set-ComputerTimeout dispatcher failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
+        Write-DebugLog "Set-ComputerTimeout store failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
     }
 
     Write-DebugLog "[$($Computer.Computer)] TIMEOUT in $Phase after ${TimeoutSec}s. $Detail" -Level 'WARN'
@@ -619,11 +612,10 @@ function Invoke-AutoRecovery {
 function Update-Status {
     param([string]$Message)
     try {
-        $uiHash.StatusTextBox.Dispatcher.Invoke('Normal', [action]{
-            $uiHash.StatusTextBox.Text = $Message
-        })
+        # Console edition: store-held status text (renderer draws it); no dispatcher.
+        $stateStore.SetStatus($Message)
     } catch {
-        # Silently handle dispatcher errors during shutdown
+        # Silently handle errors during shutdown
     }
 }
 
@@ -631,11 +623,11 @@ function Update-Status {
 function Update-StatusBackground {
     param([string]$Message)
     try {
-        $uiHash.StatusTextBox.Dispatcher.Invoke('Background', [action]{
-            $uiHash.StatusTextBox.Text = $Message
-        })
+        # Console edition: same path as Update-Status - there is no UI-thread priority
+        # distinction once the status is just a value in the store.
+        $stateStore.SetStatus($Message)
     } catch {
-        # Silently handle dispatcher errors during shutdown
+        # Silently handle errors during shutdown
     }
 }
 
@@ -733,47 +725,35 @@ function Resume-BackgroundProcessing {
 
 #region ScriptBlocks
 
-# Helper function to safely update ListView items (main-session copy).
+# Helper function to safely update computer rows (main-session copy).
 # The runspace copy is injected as $SafeUpdateListViewItemScript in
 # New-ComputerRunspace (Wuu.WindowsUpdate.psm1) - keep both in sync.
-# CRITICAL: the dispatcher action below executes on the UI thread while a
-# calling worker runspace may be BLOCKED inside Dispatcher.Invoke waiting for
-# it. Pipeline cmdlets (Where-Object/Select-Object) inside the action would
-# need that busy worker runspace's engine to run -> guaranteed deadlock.
-# Only use PowerShell LANGUAGE constructs (foreach/if/property sets) in here.
+#
+# Console edition: writes into the presentation-agnostic state store. The GUI edition
+# needed a Dispatcher.Invoke here because the ListView lives on the UI thread; the store
+# is a synchronized hashtable, so no dispatch is required and the historical deadlock
+# class is gone. The LANGUAGE-CONSTRUCTS-ONLY rule is kept: this path can still be
+# reached while a worker is blocked waiting on us, and a pipeline cmdlet would bind to
+# the busy caller's engine.
 function SafeUpdateListViewItem {
     param(
         [string]$ComputerName,
         [hashtable]$Properties
     )
-    
-    # Check if GUI is ready and ListView is properly initialized
-    if (-not $uiHash.ListView -or -not $uiHash.clientObservable) {
-        return
-    }
-    
+
+    if (-not $stateStore) { return }
+
     try {
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            # Find the actual item in the ListView that corresponds to this computer
-            # (foreach loop, NOT a Where-Object pipeline - see comment above)
-            $actualItem = $null
-            foreach ($item in $uiHash.Listview.Items) {
-                if ($item.Computer -eq $ComputerName) { $actualItem = $item; break }
-            }
-            
-            if ($actualItem) {
-                $uiHash.Listview.Items.EditItem($actualItem)
-                
-                foreach ($propertyName in $Properties.Keys) {
-                    $actualItem.$propertyName = $Properties[$propertyName]
-                }
-                
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            }
-        })
+        # Resolve the row from the store's own synchronized hashtable.
+        $targetRow = $stateStore.ByName[$ComputerName.ToLowerInvariant()]
+        if (-not $targetRow) { return }
+
+        foreach ($propertyName in $Properties.Keys) {
+            $targetRow.$propertyName = $Properties[$propertyName]
+        }
+        $stateStore.Touch()
     } catch {
-        # Silently ignore ListView update errors during startup
+        # Silently ignore row update errors during startup
     }
 }
 
@@ -808,196 +788,34 @@ $AddEntry = {
             continue
         }
         
-        if(($uiHash.Listview.Items | Select-Object -Expand Computer) -contains $computer){
+        # Console edition: existence check against the store (no ListView enumeration).
+        if ($stateStore.ByName.ContainsKey($computer.ToLowerInvariant())) {
             Write-InfoLog "Skipping duplicate computer: $computer"
             continue
         }
         
-        Write-InfoLog "Adding computer '$computer' to ListView - Thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
+        Write-InfoLog "Adding computer '$computer' to the state store - Thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
         try {
-            # Check UI state before dispatcher invoke
-            Write-InfoLog "Pre-dispatch check - Window exists: $($uiHash.Window -ne $null)"
-            Write-InfoLog "Pre-dispatch check - ListView exists: $($uiHash.ListView -ne $null)"
-            Write-InfoLog "Pre-dispatch check - clientObservable exists: $($uiHash.clientObservable -ne $null)"
-            Write-InfoLog "Pre-dispatch check - ListView ItemsSource: $($uiHash.ListView.ItemsSource -ne $null)"
-            
-            # Check dispatcher state before invoke
-            Write-InfoLog "Pre-dispatch check - Dispatcher CheckAccess: $($uiHash.ListView.Dispatcher.CheckAccess())"
-            Write-InfoLog "Pre-dispatch check - Dispatcher HasShutdownStarted: $($uiHash.ListView.Dispatcher.HasShutdownStarted)"
-            Write-InfoLog "Pre-dispatch check - Dispatcher HasShutdownFinished: $($uiHash.ListView.Dispatcher.HasShutdownFinished)"
-            
-            # Check if ListView is still valid
-            if ($uiHash.ListView.Dispatcher.HasShutdownStarted) {
-                Write-ErrorLog "Dispatcher shutdown has started, cannot invoke UI operations for computer: $computer"
-                throw "Dispatcher shutdown in progress"
-            }
-            
-            # Use safer dispatcher invoke pattern with timeout
-            if ($uiHash.ListView.Dispatcher.CheckAccess()) {
-                Write-InfoLog "Already on UI thread, executing directly for computer: $computer"
-                # We're already on the UI thread, execute directly
-                try {
-                    Write-InfoLog "Direct execution for computer: $computer - Thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
-                    
-                    # Initialize clientObservable if it doesn't exist
-                    if ($null -eq $uiHash.clientObservable) {
-                        Write-InfoLog "Initializing clientObservable for computer: $computer"
-                        $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-                        $uiHash.ListView.ItemsSource = $uiHash.clientObservable
-                        Write-InfoLog "clientObservable initialized successfully for computer: $computer"
-                    }
-                    
-                    Write-InfoLog "Creating PSObject for computer: $computer"
-                    $computerObject = New-Object PSObject -Property @{
-                        State = 'Queued'
-                        StateTimestamp = Get-Date
-                        StateSource = 'Add-Computer-Direct'
-                        Computer = $computer
-                        Phase = "Phase 1"
-                        Available = 0 -as [int]
-                        Downloaded = 0 -as [int]
-                        InstallErrors = 0 -as [int]
-                        Status = "Initializing..."
-                        RebootRequired = $false -as [bool]
-                        UpdatesStatus = "Initializing"
-                        Runspace = $null
-                        Pending = $true
-                        TimeoutExpiresAt = $null
-                        TimeoutSource = ''
-                        RetryCount = 0
-                        RetryAt = $null
-                    }
-                    Write-InfoLog "PSObject created successfully for computer: $computer"
-                    
-                    Write-InfoLog "Adding PSObject to clientObservable for computer: $computer (Current count: $($uiHash.clientObservable.Count))"
-                    $uiHash.clientObservable.Add($computerObject)
-                    Write-InfoLog "PSObject added to clientObservable for computer: $computer (New count: $($uiHash.clientObservable.Count))"
-                    
-                    Write-InfoLog "Committing and refreshing ListView for computer: $computer"
-                    try {
-                        $uiHash.Listview.Items.CommitEdit()
-                        $uiHash.Listview.Items.Refresh()
-                        Write-InfoLog "ListView committed and refreshed for computer: $computer"
-                    } catch {
-                        Write-InfoLog "ListView commit/refresh failed for computer: $computer - continuing anyway"
-                    }
-                    
-                    Write-InfoLog "Successfully added computer '$computer' to ListView (direct execution)"
-                } catch {
-                    Write-ErrorLog "DIRECT EXECUTION ERROR for computer '$computer': $($_.Exception.Message)"
-                    Write-ErrorLog "Direct execution error type: $($_.Exception.GetType().FullName)"
-                    Write-ErrorLog "Direct execution stack trace: $($_.ScriptStackTrace)"
-                    # Don't throw - continue with other computers
-                    Write-InfoLog "Continuing with other computers despite error for: $computer"
-                }
-            } else {
-                Write-InfoLog "Not on UI thread, using dispatcher invoke for computer: $computer"
-                $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                try {
-                    Write-InfoLog "Inside dispatcher action for computer: $computer - Thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
-                    
-                    # Initialize clientObservable if it doesn't exist (can happen when loading computer list before window initialization)
-                    if ($null -eq $uiHash.clientObservable) {
-                        Write-InfoLog "Initializing clientObservable for computer: $computer"
-                        $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-                        $uiHash.ListView.ItemsSource = $uiHash.clientObservable
-                        Write-InfoLog "clientObservable initialized successfully for computer: $computer"
-                    }
-                    
-                    Write-InfoLog "Creating PSObject for computer: $computer"
-                    $computerObject = New-Object PSObject -Property @{
-                        State = 'Queued'
-                        StateTimestamp = Get-Date
-                        StateSource = 'Add-Computer-Dispatched'
-                        Computer = $computer
-                        Phase = "Phase 1"
-                        Available = 0 -as [int]
-                        Downloaded = 0 -as [int]
-                        InstallErrors = 0 -as [int]
-                        Status = "Initializing..."
-                        RebootRequired = $false -as [bool]
-                        UpdatesStatus = "Initializing"
-                        Runspace = $null
-                        Pending = $true
-                        TimeoutExpiresAt = $null
-                        TimeoutSource = ''
-                        RetryCount = 0
-                        RetryAt = $null
-                    }
-                    Write-InfoLog "PSObject created successfully for computer: $computer"
-                    
-                    Write-InfoLog "Adding PSObject to clientObservable for computer: $computer (Current count: $($uiHash.clientObservable.Count))"
-                    $uiHash.clientObservable.Add($computerObject)
-                    Write-InfoLog "PSObject added to clientObservable for computer: $computer (New count: $($uiHash.clientObservable.Count))"
-                    
-                    Write-InfoLog "Committing and refreshing ListView for computer: $computer"
-                    try {
-                        $uiHash.Listview.Items.CommitEdit()
-                        $uiHash.Listview.Items.Refresh()
-                        Write-InfoLog "ListView committed and refreshed for computer: $computer"
-                    } catch {
-                        Write-InfoLog "ListView commit/refresh failed for computer: $computer - continuing anyway"
-                    }
-                    
-                    Write-InfoLog "Successfully added computer '$computer' to ListView"
-                } catch {
-                    Write-ErrorLog "DISPATCHER ERROR for computer '$computer': $($_.Exception.Message)"
-                    Write-ErrorLog "Dispatcher error type: $($_.Exception.GetType().FullName)"
-                    Write-ErrorLog "Dispatcher stack trace: $($_.ScriptStackTrace)"
-                    Write-ErrorLog "Dispatcher thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
-                    
-                    if ($_.Exception.InnerException) {
-                        Write-ErrorLog "Dispatcher inner exception: $($_.Exception.InnerException.Message)"
-                    }
-                    
-                    # Check state after error
-                    Write-ErrorLog "Post-error state - clientObservable exists: $($uiHash.clientObservable -ne $null)"
-                    Write-ErrorLog "Post-error state - ListView exists: $($uiHash.ListView -ne $null)"
-                    Write-ErrorLog "Post-error state - Window exists: $($uiHash.Window -ne $null)"
-                    
-                    # Don't throw - continue with other computers
-                    Write-InfoLog "Continuing with other computers despite dispatcher error for: $computer"
-                }
-            })
-            }
+            # Console edition: no dispatcher, no thread-affinity check, no ObservableCollection,
+            # no ListView commit/refresh. The store is a synchronized hashtable, so this is a
+            # plain add that works from any thread. The GUI edition needed ~120 lines of
+            # pre-dispatch diagnostics + direct/dispatched branches here; the failures those
+            # guarded against (dispatcher shutdown, cross-thread invoke, stale ItemsSource,
+            # virtualized rows) cannot occur with a store.
+            $computerObject = New-WuuComputerRow -Computer $computer -StateSource 'AddEntry'
+            Add-WuuComputerRow -Store $stateStore -Row $computerObject | Out-Null
+            Write-InfoLog "Computer '$computer' added to the state store (count: $($stateStore.Rows.Count))"
         } catch {
-            Write-ErrorLog "CRITICAL ERROR adding computer '$computer' to ListView: $($_.Exception.Message)"
+            Write-ErrorLog "ERROR adding computer '$computer' to the state store: $($_.Exception.Message)"
             Write-ErrorLog "Error type: $($_.Exception.GetType().FullName)"
             Write-ErrorLog "Stack trace: $($_.ScriptStackTrace)"
-            Write-ErrorLog "Main thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
-            
-            # Special handling for MethodInvocationException
-            if ($_.Exception -is [System.Management.Automation.MethodInvocationException]) {
-                Write-ErrorLog "MethodInvocationException detected - this suggests a threading or object disposal issue"
-                Write-ErrorLog "Target object: $($_.Exception.InvocationInfo.InvocationType)"
-                Write-ErrorLog "Method name: $($_.Exception.InvocationInfo.MethodName)"
-                
-                # Check if this is a dispatcher-related issue
-                if ($_.Exception.Message -match "dispatcher|thread|invoke") {
-                    Write-ErrorLog "This appears to be a dispatcher threading issue"
-                    Write-ErrorLog "Dispatcher state - CheckAccess: $($uiHash.ListView.Dispatcher.CheckAccess())"
-                    Write-ErrorLog "Dispatcher state - HasShutdownStarted: $($uiHash.ListView.Dispatcher.HasShutdownStarted)"
-                    Write-ErrorLog "Dispatcher state - HasShutdownFinished: $($uiHash.ListView.Dispatcher.HasShutdownFinished)"
-                }
-            }
-            
-            if ($_.Exception.InnerException) {
-                Write-ErrorLog "Inner exception: $($_.Exception.InnerException.Message)"
-                Write-ErrorLog "Inner exception type: $($_.Exception.InnerException.GetType().FullName)"
-            }
-            
-            # Additional diagnostic information
-            Write-ErrorLog "Error context - Window state: $($uiHash.Window.WindowState)"
-            Write-ErrorLog "Error context - Window IsVisible: $($uiHash.Window.IsVisible)"
-            Write-ErrorLog "Error context - Window IsLoaded: $($uiHash.Window.IsLoaded)"
-            
             # Don't throw - continue with other computers
-            Write-InfoLog "Continuing with other computers despite critical error for: $computer"
+            Write-InfoLog "Continuing with other computers despite error for: $computer"
         }
     }
 
-    # Runspace creation and job startup are handled by the UI job timer (Start-PendingUpdateCheck)
-    # so the UI thread is never blocked waiting for job slots.
+    # Runspace creation and job startup are handled by the job timer (Start-PendingUpdateCheck)
+    # so the calling thread is never blocked waiting for job slots.
 }
 
 # Create and configure the persistent per-computer worker runspace
