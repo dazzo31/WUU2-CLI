@@ -204,5 +204,118 @@ if ($auditRaw -notmatch 'Flush\(\$true\)') {
     Fail 'audit does not flush records to disk (a crash could lose "durable" records)'
 } else { Pass 'audit flushes records to disk' }
 
+# --- 10. ISO 27001 A.8.15 event-logging invariants -----------------------------------------
+#     These assert the CONTENT contract: an auditor needs WHO/WHAT/WHICH/WHEN/WHERE/OUTCOME on
+#     every event, denied attempts as first-class records, and reads logged as well as changes.
+#     Same RAW-vs-tokenised caveat as (g)-(i): these patterns contain '::', '$' and quotes.
+#     See docs/ISO_27001_A815_MAPPING.md.
+
+# (a) Every event must identify the actor, the host it came from, and the originating process.
+#     Dropping any of these makes "who did this, from where" unanswerable for that record.
+foreach ($field in @(
+    @{ Name = 'runId';         Pattern = 'runId\s+=';                       Why = 'actor/run identifier' }
+    @{ Name = 'timestampUtc';  Pattern = 'timestampUtc\s+=';                Why = 'when the event occurred' }
+    @{ Name = 'operator';      Pattern = 'operator\s+=';                    Why = 'which account acted' }
+    @{ Name = 'host';          Pattern = 'host\s+=';                        Why = 'where the action came from' }
+    @{ Name = 'processId';     Pattern = 'processId\s+=';                   Why = 'originating process' }
+    @{ Name = 'category';      Pattern = 'category\s+=';                    Why = 'event classification' }
+    @{ Name = 'action';        Pattern = 'action\s+=';                      Why = 'what was done' }
+    @{ Name = 'targets';       Pattern = 'targets\s+=';                     Why = 'which target was affected' }
+    @{ Name = 'result';        Pattern = 'result\s+=';                      Why = 'outcome of the action' }
+    @{ Name = 'durationMs';    Pattern = 'durationMs\s+=';                  Why = 'how long the action took' }
+    @{ Name = 'wuuVersion';    Pattern = 'wuuVersion\s+=';                  Why = 'producing build' }
+)) {
+    if ($auditRaw -notmatch $field.Pattern) {
+        Fail "audit record is missing '$($field.Name)' ($($field.Why)) - required by ISO 27001 A.8.15"
+    }
+}
+if ($failed) { } else { Pass 'audit records carry the full A.8.15 event field set (who/what/which/when/where/outcome)' }
+
+# (b) Timestamps must be ISO 8601 in UTC. A local-time or format-less timestamp is ambiguous
+#     across DST and across hosts, which is exactly where an incident timeline gets contested.
+if ($auditRaw -notmatch "ToUniversalTime\(\)\.ToString\('o'\)") {
+    Fail 'audit timestamps are not ISO 8601 UTC to millisecond precision'
+} else { Pass 'audit timestamps are ISO 8601 UTC (round-trip format)' }
+
+# (c) Refusals must be recorded as FIRST-CLASS events. A.8.15 expects denied/unsuccessful
+#     attempts to be logged; a run of refusals is the signal an auditor looks for.
+if ($auditRaw -notmatch "function\s+Write-WuuAuditDenial") {
+    Fail 'no Write-WuuAuditDenial - refusals would not be recorded (A.8.15 requires denied attempts logged)'
+} elseif ($auditRaw -notmatch "Result\s+'denied'") {
+    Fail 'Write-WuuAuditDenial does not write result=denied'
+} else { Pass 'refused attempts are recorded as first-class denied events' }
+
+# (d) A denial must NOT be fail-closed. The operation was already blocked; a logging failure
+#     must not turn a refusal into an error the operator cannot interpret.
+$denialBlock = [regex]::Match($auditRaw, '(?s)function\s+Write-WuuAuditDenial\s*\{.*?\n\}').Value
+if ($denialBlock -match 'FailClosed') {
+    Fail 'Write-WuuAuditDenial uses the fail-closed path - a refusal must never be blocked by logging'
+} else { Pass 'denials are recorded best-effort (a refusal is never blocked by logging)' }
+
+# (e) A denial must NOT write an intent record: a 'started' row would falsely imply the change
+#     had begun when it was in fact refused.
+if ($denialBlock -match "'started'") {
+    Fail "Write-WuuAuditDenial writes a 'started' intent record - implies a refused change began"
+} else { Pass 'denials write no intent record (a refused change never began)' }
+
+# (f) The category taxonomy must exist so reports can be filtered without per-callsite drift,
+#     and the ValidateSet must list the categories the classifier can actually return.
+if ($auditRaw -notmatch 'function\s+Resolve-WuuAuditCategory') {
+    Fail 'no Resolve-WuuAuditCategory - events would carry no ISO category'
+}
+foreach ($cat in @('session', 'access', 'configuration_change', 'data_change', 'operational', 'outcome')) {
+    if ($auditRaw -notmatch ("'" + [regex]::Escape($cat) + "'")) {
+        Fail "audit category taxonomy is missing '$cat' (A.8.15 grouping)"
+    }
+}
+if ($failed) { } else { Pass 'audit category taxonomy is complete (6 categories)' }
+
+# (g) READ-ONLY access must be logged. A.8.15 covers access to information, not only change
+#     to it - "who inspected which hosts, when" must be answerable after an incident.
+$cmdRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Command.psm1') -Raw
+if ($cmdRaw -notmatch "'operational'") {
+    Fail 'read-only verbs are not categorised - reads are not being logged (A.8.15)'
+} elseif ($cmdRaw -notmatch 'Logged\s*=\s*\$true') {
+    Fail 'read-only verbs do not report Logged - callers cannot tell logged from unaudited'
+} else { Pass 'read-only access is logged (reported distinctly from the fail-closed path)' }
+
+# (h) A read must not be routed through the mutating choke point: that would write a spurious
+#     'started' intent record for an operation that changes nothing, and wrongly demand -Reason.
+if ($cmdRaw -match "(?s)else\s*\{\s*Invoke-WuuAuditedAction") {
+    Fail 'read-only path appears to use the mutating choke point (spurious intent records)'
+} else { Pass 'read-only access bypasses the mutating choke point (no spurious intent records)' }
+
+# (i) Retention: no code path may delete audit DATA. Deletion capability would silently defeat
+#     the "keep forever" policy - see docs/AUDIT_RETENTION.md.
+#     Deliberately precise: the module DOES legitimately remove a transient '.wuu-write-probe'
+#     file from the directory resolver (a writability test). That is not audit data, so the
+#     check targets removal of the record file ($LogPath) or anything matching the audit file
+#     pattern, rather than any use of Remove-Item. A blunt check here would have been a false
+#     positive, and a false positive in a compliance gate is worse than no gate - it trains
+#     people to ignore the gate.
+$dataDeletePatterns = @(
+    'Remove-Item[^\r\n]*\$LogPath'
+    'Remove-Item[^\r\n]*\$Session\.LogPath'
+    'Remove-Item[^\r\n]*\.jsonl'
+    'Remove-Item[^\r\n]*transcript'
+    'Clear-Content[^\r\n]*\$LogPath'
+    'Clear-Content[^\r\n]*\.jsonl'
+    'FileMode\]::Truncate'
+    '\[IO\.File\]::Delete'
+    '\.Delete\(\)\s*$'
+    'Set-Content[^\r\n]*\.jsonl'
+    'Out-File[^\r\n]*\.jsonl'
+    # A whole-file rewrite of the log path destroys every prior record's chain position, so it
+    # counts as deletion for retention purposes. (The directory resolver legitimately uses
+    # Set-Content on its transient probe file, which is why this is anchored to $LogPath.)
+    'Set-Content[^\r\n]*\$LogPath'
+    'Out-File[^\r\n]*\$LogPath'
+    'WriteAllText[^\r\n]*\$LogPath'
+)
+$deleteHits = @($dataDeletePatterns | Where-Object { [regex]::IsMatch($auditRaw, $_, 'IgnoreCase') })
+if ($deleteHits.Count -gt 0) {
+    Fail "audit module contains a delete/truncate path for audit data (violates keep-forever retention): $($deleteHits -join ', ')"
+} else { Pass 'audit module has no delete/truncate path for audit data (retention is structural)' }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }
