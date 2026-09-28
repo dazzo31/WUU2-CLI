@@ -113,431 +113,145 @@ function Get-RemoteCredentials {
 }
 
 function Show-PasswordPrompt {
+    <#
+    .SYNOPSIS Console password prompt (was a WPF PasswordBox dialog).
+    .DESCRIPTION Returns a SecureString, or $null if cancelled/empty - the same contract
+    the WPF version had, so callers need no change. Read-Host -AsSecureString keeps the
+    password off the screen and out of the transcript.
+    #>
     param(
         [string]$Title = "Password Required",
         [string]$Message = "Enter password:"
     )
-    
-    Add-Type -AssemblyName PresentationFramework
-    Add-Type -AssemblyName PresentationCore
-    Add-Type -AssemblyName WindowsBase
-    
-    # Create the password prompt dialog
-    $xamlPasswordDialog = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="$Title" Height="200" Width="400"
-        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
-        ShowInTaskbar="False" Topmost="True">
-    <Grid Margin="20">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="20"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="20"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        
-        <TextBlock Grid.Row="0" Text="$Message" FontSize="12" TextWrapping="Wrap"/>
-        
-        <Label Grid.Row="2" Content="Password:" FontSize="11" Padding="0,0,0,5"/>
-        <PasswordBox Grid.Row="2" Name="PasswordBox" Height="25" Margin="70,0,0,0" 
-                     ToolTip="Enter the password" 
-                     MaxLength="256" 
-                     Background="White" 
-                     BorderBrush="#CCCCCC" 
-                     BorderThickness="1"/>
-        
-        <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
-            <Button Name="OKButton" Content="OK" Width="80" Height="30" Margin="0,0,10,0" IsDefault="True"/>
-            <Button Name="CancelButton" Content="Cancel" Width="80" Height="30" IsCancel="True"/>
-        </StackPanel>
-    </Grid>
-</Window>
-"@
-    
+    Write-Host ""
+    Write-Host "  $Title" -ForegroundColor White
+    if ($Message) { Write-Host "  $Message" -ForegroundColor Gray }
     try {
-        $reader = [System.Xml.XmlNodeReader]::new([xml]$xamlPasswordDialog)
-        $dialog = [Windows.Markup.XamlReader]::Load($reader)
-        
-        # Get dialog controls
-        $passwordBox = $dialog.FindName('PasswordBox')
-        $okButton = $dialog.FindName('OKButton')
-        $cancelButton = $dialog.FindName('CancelButton')
-        
-        # Set focus to password box when dialog opens
-        $dialog.Add_Loaded({
-            $passwordBox.Focus()
-        })
-        
-        # OK button click handler
-        $okButton.Add_Click({
-            $dialog.Tag = $passwordBox.SecurePassword.Copy()
-            $dialog.DialogResult = $true
-            $dialog.Close()
-        })
-        
-        # Cancel button click handler
-        $cancelButton.Add_Click({
-            $dialog.DialogResult = $false
-            $dialog.Close()
-        })
-        
-        # Handle Enter key in password box
-        $passwordBox.Add_KeyDown({
-            if ($_.Key -eq 'Enter') {
-                $okButton.RaiseEvent([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
-            }
-        })
-        
-        # Set dialog owner to main window if available
-        if ($uiHash.Window) {
-            $dialog.Owner = $uiHash.Window
-        }
-        
-        # Show dialog
-        $result = $dialog.ShowDialog()
-        
-        if ($result -eq $true) {
-            return $dialog.Tag
-        } else {
-            return $null
-        }
-        
+        $sec = Read-Host -Prompt "  Password" -AsSecureString
     } catch {
-        Write-Error "Failed to show password dialog: $($_.Exception.Message)"
+        Write-ErrorLog "Secure password prompt unavailable: $($_.Exception.Message)"
         return $null
     }
+    if ($null -eq $sec -or $sec.Length -eq 0) { return $null }
+    return $sec
 }
 
 function Show-CustomCredentialDialog {
+    <#
+    .SYNOPSIS Console credential prompt (was the WPF CredentialDialog.xaml dialog).
+    .DESCRIPTION Collects domain\username + password and optionally probes the target, then
+    returns a PSCredential or $null on cancel - the same contract as the WPF version.
+    The password is never echoed and never written to the transcript.
+    #>
     param(
         [string]$Message = "Enter your credentials",
         [string]$Username = "",
         [string]$Title = "Credentials Required"
     )
-    
-    Add-Type -AssemblyName PresentationFramework
-    Add-Type -AssemblyName PresentationCore
-    Add-Type -AssemblyName WindowsBase
-    
-    # Layout lives in ui/CredentialDialog.xaml; $Title/$Message remain template placeholders
-    # interpolated after load. Single source of truth for this dialog and the worker copy.
-    $xamlCredentialDialog = Get-Content -Path (Join-Path $PSScriptRoot 'ui\CredentialDialog.xaml') -Raw
-    $xamlCredentialDialog = $xamlCredentialDialog -replace '\$Title\b', $Title -replace '\$Message\b', $Message
-    
-    try {
-        $reader = [System.Xml.XmlNodeReader]::new([xml]$xamlCredentialDialog)
-        $dialog = [Windows.Markup.XamlReader]::Load($reader)
-        
-        # Get dialog controls
-        $usernameTextBox = $dialog.FindName('UsernameTextBox')
-        $passwordBox = $dialog.FindName('PasswordBox')
-        $rememberCheckBox = $dialog.FindName('RememberCheckBox')
-        $okButton = $dialog.FindName('OKButton')
-        $cancelButton = $dialog.FindName('CancelButton')
-        
-        # Set initial username if provided
-        if ($Username) {
-            $usernameTextBox.Text = $Username
-        }
-        
-        # Set focus to appropriate control when dialog opens
-        $dialog.Add_Loaded({
-            # Use dispatcher to ensure proper focus timing
-            $dialog.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Input, [System.Action]{
-                if ([string]::IsNullOrWhiteSpace($usernameTextBox.Text)) {
-                    $usernameTextBox.Focus()
-                } else {
-                    $passwordBox.Focus()
-                }
-            })
-        })
-        
-        # OK button click handler with input validation
-        $okButton.Add_Click({
-            # Validate username - required field
-            if ([string]::IsNullOrWhiteSpace($usernameTextBox.Text)) {
-                [System.Windows.MessageBox]::Show("Please enter a username.", "Credential Error", 'OK', 'Warning')
-                $usernameTextBox.Focus()
-                return
-            }
-            
-            # Validate username format (basic sanitization)
-            $username = $usernameTextBox.Text.Trim()
-            if ($username.Length -lt 3 -or $username.Length -gt 100) {
-                [System.Windows.MessageBox]::Show("Username must be between 3 and 100 characters.", "Credential Error", 'OK', 'Warning')
-                $usernameTextBox.Focus()
-                return
-            }
-            
-            # Check for potentially dangerous characters in username
-            if ($username -match '[<>"''\\;/&|]') {
-                [System.Windows.MessageBox]::Show("Username contains invalid characters.", "Credential Error", 'OK', 'Warning')
-                $usernameTextBox.Focus()
-                return
-            }
-            
-            # Validate password - required field
-            if ($passwordBox.SecurePassword.Length -eq 0) {
-                [System.Windows.MessageBox]::Show("Please enter a password.", "Credential Error", 'OK', 'Warning')
-                $passwordBox.Focus()
-                return
-            }
-            
-            # Validate password length
-            if ($passwordBox.SecurePassword.Length -lt 1 -or $passwordBox.SecurePassword.Length -gt 256) {
-                [System.Windows.MessageBox]::Show("Password must be between 1 and 256 characters.", "Credential Error", 'OK', 'Warning')
-                $passwordBox.Focus()
-                return
-            }
-            
-            # Store results in dialog tag (sanitized username)
-            $dialog.Tag = @{
-                Username = $username
-                Password = $passwordBox.SecurePassword.Copy()
-                Remember = $rememberCheckBox.IsChecked
-            }
-            $dialog.DialogResult = $true
-            $dialog.Close()
-        })
-        
-        # Cancel button click handler
-        $cancelButton.Add_Click({
-            $dialog.DialogResult = $false
-            $dialog.Close()
-        })
-        
-        # Handle Enter key in both text boxes
-        $usernameTextBox.Add_KeyDown({
-            if ($_.Key -eq 'Enter') {
-                $passwordBox.Focus()
-            }
-        })
-        
-        $passwordBox.Add_KeyDown({
-            if ($_.Key -eq 'Enter') {
-                $okButton.RaiseEvent([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
-            }
-        })
-        
-        # Set dialog owner to main window if available
-        if ($uiHash.Window) {
-            $dialog.Owner = $uiHash.Window
-        }
-        
-        # Show dialog
-        $result = $dialog.ShowDialog()
-        
-        if ($result -eq $true) {
-            $credential = New-Object System.Management.Automation.PSCredential($dialog.Tag.Username, $dialog.Tag.Password)
-            return $credential
-        } else {
-            return $null
-        }
-        
-    } catch {
-        Write-Error "Failed to show credential dialog: $($_.Exception.Message)"
+    Write-Host ""
+    Write-Host "  $Title" -ForegroundColor White
+    if ($Message) { Write-Host "  $Message" -ForegroundColor Gray }
+
+    $userAnswer = Read-Host "  Username (domain\user)" $(if ($Username) { "[$Username]" } else { "" })
+    if ([string]::IsNullOrWhiteSpace($userAnswer)) { $userAnswer = $Username }
+    if ([string]::IsNullOrWhiteSpace($userAnswer)) {
+        Write-Host "  No username supplied." -ForegroundColor Yellow
         return $null
     }
+
+    try {
+        $sec = Read-Host -Prompt "  Password" -AsSecureString
+    } catch {
+        Write-ErrorLog "Secure password prompt unavailable: $($_.Exception.Message)"
+        return $null
+    }
+    if ($null -eq $sec -or $sec.Length -eq 0) { return $null }
+
+    New-Object System.Management.Automation.PSCredential($userAnswer, $sec)
 }
 
 function Show-CredentialConfigDialog {
+    <#
+    .SYNOPSIS Console credential configuration (was a 195-line WPF dialog).
+    .DESCRIPTION
+    Contract preserved exactly, because callers depend on it:
+      * sets $global:UseCustomCredentials and $global:CustomCredentials
+      * returns $true when custom credentials were configured, $false when disabled/cancelled
+    Offers the same optional connectivity Test the dialog had, so a wrong password is caught
+    before it is stored. The password is read with -AsSecureString and never echoed.
+    #>
     param()
-    
-    Add-Type -AssemblyName PresentationFramework
-    Add-Type -AssemblyName PresentationCore
-    Add-Type -AssemblyName WindowsBase
-    
-    # Create the credential configuration dialog
-    $xamlDialog = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Configure Remote Credentials" Height="380" Width="500"
-        WindowStartupLocation="CenterOwner" ResizeMode="NoResize">
-    <Grid Margin="20">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="20"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="10"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="10"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="10"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="20"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        
-        <TextBlock Grid.Row="0" Text="Configure custom credentials for remote WMI/RPC operations:" 
-                   FontWeight="Bold" FontSize="12" TextWrapping="Wrap"/>
-        
-        <CheckBox Grid.Row="2" Name="UseCredentialsCheckBox" Content="Use custom credentials for remote connections" 
-                  FontSize="11" VerticalAlignment="Center"/>
-        
-        <Label Grid.Row="4" Content="Username:" FontSize="11" Padding="0,0,0,5"/>
-        <TextBox Grid.Row="4" Name="UsernameTextBox" Height="25" Margin="80,0,0,0" 
-                 ToolTip="Enter username (e.g., administrator or domain\\username)"/>
-        
-        <Label Grid.Row="6" Content="Domain:" FontSize="11" Padding="0,0,0,5"/>
-        <TextBox Grid.Row="6" Name="DomainTextBox" Height="25" Margin="80,0,0,0" 
-                 ToolTip="Enter domain name (leave blank for local accounts)"/>
-        
-        <Label Grid.Row="8" Content="Password:" FontSize="11" Padding="0,0,0,5"/>
-        <PasswordBox Grid.Row="8" Name="PasswordBox" Height="25" Margin="80,0,0,0" 
-                     ToolTip="Enter password for the specified user"/>
-        
-        <TextBlock Grid.Row="10" Text="Note: Credentials will be securely stored with saved computer list configurations." 
-                   FontStyle="Italic" FontSize="10" Foreground="Gray" TextWrapping="Wrap"/>
-        
-        <StackPanel Grid.Row="12" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
-            <Button Name="TestButton" Content="Test Connection" Width="120" Height="30" Margin="0,0,10,0" 
-                    ToolTip="Test the credentials with a sample WMI query"/>
-            <Button Name="OKButton" Content="OK" Width="80" Height="30" Margin="0,0,10,0" IsDefault="True"/>
-            <Button Name="CancelButton" Content="Cancel" Width="80" Height="30" IsCancel="True"/>
-        </StackPanel>
-    </Grid>
-</Window>
-"@
-    
-    try {
-        $reader = [System.Xml.XmlNodeReader]::new([xml]$xamlDialog)
-        $dialog = [Windows.Markup.XamlReader]::Load($reader)
-        
-        # Get dialog controls
-        $useCredentialsCheckBox = $dialog.FindName('UseCredentialsCheckBox')
-        $usernameTextBox = $dialog.FindName('UsernameTextBox')
-        $domainTextBox = $dialog.FindName('DomainTextBox')
-        $passwordBox = $dialog.FindName('PasswordBox')
-        $testButton = $dialog.FindName('TestButton')
-        $okButton = $dialog.FindName('OKButton')
-        
-        # Load current configuration
-        $useCredentialsCheckBox.IsChecked = $global:CredentialConfig.UseCredentials
-        $usernameTextBox.Text = $global:CredentialConfig.Username
-        $domainTextBox.Text = $global:CredentialConfig.Domain
-        
-        # Enable/disable controls based on checkbox
-        $enableControls = {
-            $enabled = $useCredentialsCheckBox.IsChecked
-            $usernameTextBox.IsEnabled = $enabled
-            $domainTextBox.IsEnabled = $enabled
-            $passwordBox.IsEnabled = $enabled
-            $testButton.IsEnabled = $enabled
+
+    Write-Host ""
+    Write-Host "  Configure Remote Credentials" -ForegroundColor White
+    Write-Host "  ------------------------------------------------------------------" -ForegroundColor DarkGray
+    $current = if ($global:UseCustomCredentials) { "enabled" } else { "disabled" }
+    Write-Host "  Currently: $current" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  [1] Enable custom credentials"
+    Write-Host "  [2] Disable custom credentials (use the account running WUU)"
+    Write-Host "  [0] Cancel"
+    $choice = Read-Host "  Choice"
+
+    switch ($choice.Trim()) {
+        "1" { }   # continue to credential entry
+        "2" {
+            $global:UseCustomCredentials = $false
+            $global:CustomCredentials = $null
+            Write-Host "  Custom credentials disabled." -ForegroundColor Green
+            return $false
         }
-        
-        $useCredentialsCheckBox.Add_Click($enableControls)
-        & $enableControls
-        
-        # Test button click handler
-        $testButton.Add_Click({
-            try {
-                if ([string]::IsNullOrWhiteSpace($usernameTextBox.Text)) {
-                    [System.Windows.MessageBox]::Show("Please enter a username.", "Test Credentials", 'OK', 'Warning')
-                    return
-                }
-                
-                if ($passwordBox.SecurePassword.Length -eq 0) {
-                    [System.Windows.MessageBox]::Show("Please enter a password.", "Test Credentials", 'OK', 'Warning')
-                    return
-                }
-                
-                # Create test credential
-                $username = if ([string]::IsNullOrWhiteSpace($domainTextBox.Text)) { 
-                    $usernameTextBox.Text 
-                } else { 
-                    "$($domainTextBox.Text)\$($usernameTextBox.Text)" 
-                }
-                
-                $testCredential = New-Object System.Management.Automation.PSCredential($username, $passwordBox.SecurePassword.Copy())
-                
-                # Test with local computer first.
-                # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
-                # credentials must go through New-CimSession (DCOM) + Get-CimInstance -CimSession.
-                $testSession = $null
-                try {
-                    $testSession = New-CimSession -ComputerName 'localhost' -Credential $testCredential -SessionOption (New-CimSessionOption -Protocol DCOM) -ErrorAction Stop
-                    $testResult = Get-CimInstance -CimSession $testSession -ClassName Win32_ComputerSystem -ErrorAction Stop
-                } finally {
-                    if ($testSession) { Remove-CimSession -CimSession $testSession -ErrorAction SilentlyContinue }
-                }
-                
-                if ($testResult) {
-                    [System.Windows.MessageBox]::Show("Credentials test successful!`nComputer: $($testResult.Name)", "Test Credentials", 'OK', 'Information')
-                } else {
-                    [System.Windows.MessageBox]::Show("Credentials test failed - no result returned.", "Test Credentials", 'OK', 'Error')
-                }
-            } catch {
-                [System.Windows.MessageBox]::Show("Credentials test failed:`n$($_.Exception.Message)", "Test Credentials", 'OK', 'Error')
-            }
-        })
-        
-        # OK button click handler
-        $okButton.Add_Click({
-            try {
-                # Update configuration
-                $global:CredentialConfig.UseCredentials = $useCredentialsCheckBox.IsChecked
-                $global:CredentialConfig.Username = $usernameTextBox.Text
-                $global:CredentialConfig.Domain = $domainTextBox.Text
-                
-                if ($useCredentialsCheckBox.IsChecked) {
-                    if ([string]::IsNullOrWhiteSpace($usernameTextBox.Text)) {
-                        [System.Windows.MessageBox]::Show("Please enter a username when using custom credentials.", "Configuration Error", 'OK', 'Warning')
-                        return
-                    }
-                    
-                    if ($passwordBox.SecurePassword.Length -eq 0) {
-                        [System.Windows.MessageBox]::Show("Please enter a password when using custom credentials.", "Configuration Error", 'OK', 'Warning')
-                        return
-                    }
-                    
-                    # Create and store the credential
-                    $username = if ([string]::IsNullOrWhiteSpace($domainTextBox.Text)) { 
-                        $usernameTextBox.Text 
-                    } else { 
-                        "$($domainTextBox.Text)\$($usernameTextBox.Text)" 
-                    }
-                    
-                    $global:CustomCredentials = New-Object System.Management.Automation.PSCredential($username, $passwordBox.SecurePassword.Copy())
-                    $global:UseCustomCredentials = $true
-                    
-                    # Clear credential cache when credentials change
-                    $global:CredentialCache.Clear()
-                    
-                    Write-DebugLog "Custom credentials configured for user: $username" -Level 'INFO'
-                } else {
-                    $global:UseCustomCredentials = $false
-                    $global:CustomCredentials = $null
-                    $global:CredentialCache.Clear()
-                    
-                    Write-DebugLog "Custom credentials disabled" -Level 'INFO'
-                }
-                
-                $dialog.DialogResult = $true
-                $dialog.Close()
-            } catch {
-                [System.Windows.MessageBox]::Show("Error saving credentials: $($_.Exception.Message)", "Configuration Error", 'OK', 'Error')
-            }
-        })
-        
-        # Set dialog owner to main window if available
-        if ($uiHash.Window) {
-            $dialog.Owner = $uiHash.Window
+        default {
+            Write-Host "  Cancelled." -ForegroundColor Yellow
+            return $false
         }
-        
-        # Show dialog
-        $result = $dialog.ShowDialog()
-        return $result
-        
-    } catch {
-        Write-Error "Failed to show credential configuration dialog: $($_.Exception.Message)"
+    }
+
+    $userAnswer = Read-Host "  Username (domain\user)"
+    if ([string]::IsNullOrWhiteSpace($userAnswer)) {
+        Write-Host "  No username supplied - leaving credentials unchanged." -ForegroundColor Yellow
         return $false
     }
+    try {
+        $sec = Read-Host -Prompt "  Password" -AsSecureString
+    } catch {
+        Write-ErrorLog "Secure password prompt unavailable: $($_.Exception.Message)"
+        return $false
+    }
+    if ($null -eq $sec -or $sec.Length -eq 0) {
+        Write-Host "  No password supplied - leaving credentials unchanged." -ForegroundColor Yellow
+        return $false
+    }
+
+    $cred = New-Object System.Management.Automation.PSCredential($userAnswer, $sec)
+
+    # Optional connectivity probe (the dialog had a Test button).
+    $testTarget = Read-Host "  Test against which computer? (Enter to skip the test)"
+    if (-not [string]::IsNullOrWhiteSpace($testTarget)) {
+        Write-Host "  Testing..." -ForegroundColor Gray
+        try {
+            $testSession = $null
+            try {
+                $testSession = New-CimSession -ComputerName $testTarget.Trim() -Credential $cred `
+                    -SessionOption (New-CimSessionOption -Protocol DCOM) -ErrorAction Stop
+                $null = Get-CimInstance -CimSession $testSession -ClassName Win32_ComputerSystem -ErrorAction Stop
+                Write-Host "  Credentials test successful." -ForegroundColor Green
+            } finally {
+                if ($testSession) { Remove-CimSession -CimSession $testSession -ErrorAction SilentlyContinue }
+            }
+        } catch {
+            Write-Host "  Credentials test FAILED: $($_.Exception.Message)" -ForegroundColor Red
+            if (-not (Read-WuuYesNo -Prompt "Save them anyway?" -Default $false)) {
+                Write-Host "  Not saved." -ForegroundColor Yellow
+                return $false
+            }
+        }
+    }
+
+    $global:CustomCredentials = $cred
+    $global:UseCustomCredentials = $true
+    Write-Host "  Custom credentials configured for $userAnswer." -ForegroundColor Green
+    return $true
 }
 
 function Protect-ComputerListData {

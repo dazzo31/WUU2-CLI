@@ -90,7 +90,6 @@ Initialize-WuuWindowsUpdateContext -Context @{
     InstallUpdates              = $payloadInstall
     RestartComputer             = $payloadRestart
     BackgroundProcessing        = $global:backgroundProcessing
-    CredDialogXamlPath          = Join-Path $root 'ui\CredentialDialog.xaml'
 }
 
 $fail = $false

@@ -1,0 +1,281 @@
+#Requires -Version 5.1
+<#
+.DESCRIPTION
+Console presentation layer for WUU2-CLI (Phase 1 final step / Phase 2 seed).
+
+Replaces the WPF shell that lived in Wuu.Core.psm1:
+  - MainWindow.xaml / XamlReader          -> Write-WuuStatusTable renderer
+  - ListView + items (the row display)    -> reads the state store's rows
+  - StatusTextBox                         -> the store's Status value
+  - Context menu + Menu items             -> the numbered interactive menu
+  - JobTimer (DispatcherTimer on the UI   -> the input loop's tick, which drains the
+    thread, pumps the WPF message loop)      pending-job queue each iteration
+
+WHY THE SCHEDULER IS POLLED BY THE INPUT LOOP (design note - do not "fix" this back to a timer)
+---------------------------------------------------------------------------------------------
+The GUI used a DispatcherTimer: it worked because ShowDialog() pumps a message loop, so a
+UI-thread timer could fire while the app sat waiting for the user. A console blocking on
+Read-Host has NO message loop, and a runspace-affine scriptblock timer cannot fire while the
+runspace is busy inside Read-Host. So a timer would silently never run, and the auto-flow
+(queued downloads/installs, Phase-E retries) would stall exactly like the old auto-download
+bug.
+
+Instead the menu loop reads the keyboard WITHOUT blocking ([Console]::KeyAvailable) and calls
+the scheduler once per tick. Same single runspace, no injection, no affinity problem, and the
+auto-flow keeps running while the operator sits at the menu.
+#>
+
+#region Rendering
+
+function Get-WuuRowColor {
+    <# Maps the store's colour NAME to a console colour. The store deliberately carries
+       names ('Error'/'Timeout'/'Success'/'Default'), not WPF brushes, so this is the only
+       place that knows about presentation. #>
+    param([string]$Color)
+    switch ($Color) {
+        'Error'   { 'DarkGray' }
+        'Timeout' { 'Yellow' }
+        'Success' { 'Green' }
+        default   { 'Gray' }
+    }
+}
+
+function Format-WuuTable {
+    <# Renders rows as a fixed-width text table.
+       Line-oriented on purpose (no cursor repositioning / progress bars) so a session
+       transcript stays readable and diff-able - see docs/CLI_AUDIT_PLAN.md section 5.3. #>
+    param(
+        [Parameter(Mandatory)][object[]]$Rows,
+        [int]$ComputerWidth = 20,
+        [int]$PhaseWidth = 9,
+        [int]$StateWidth = 14,
+        [int]$UpdWidth = 17
+    )
+    $sb = New-Object System.Text.StringBuilder
+    $fmt = "{0,-$ComputerWidth} {1,-$PhaseWidth} {2,-$StateWidth} {3,-$UpdWidth} {4}"
+    [void]$sb.AppendLine(($fmt -f 'COMPUTER', 'PHASE', 'STATE', 'UPDATES', 'STATUS'))
+    [void]$sb.AppendLine(('-' * ($ComputerWidth + $PhaseWidth + $StateWidth + $UpdWidth + 4 + 40)))
+    foreach ($r in $Rows) {
+        $upd = "A:$($r.Available) D:$($r.Downloaded)"
+        if ($r.RebootRequired) { $upd += ' RBT' }
+        $name = [string]$r.Computer
+        if ($name.Length -gt $ComputerWidth) { $name = $name.Substring(0, $ComputerWidth - 1) + [char]0x2026 }
+        $status = [string]$r.Status
+        if ($status.Length -gt 60) { $status = $status.Substring(0, 59) + [char]0x2026 }
+        [void]$sb.AppendLine(($fmt -f $name, $r.Phase, $r.State, $upd, $status))
+    }
+    return $sb.ToString()
+}
+
+function Write-WuuStatusTable {
+    <# Writes the current rows. Does not clear the screen unless asked, so past output
+       remains in the transcript. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Store,
+        [switch]$Clear
+    )
+    if ($Clear) { try { Clear-Host } catch { } }
+    $rows = @(Get-WuuComputerRow -Store $Store)
+    if ($rows.Count -eq 0) {
+        Write-Host '  (no computers in the list)' -ForegroundColor DarkGray
+        return
+    }
+    # Colour per row is applied by writing each line individually.
+    Write-Host ''
+    $lines = (Format-WuuTable -Rows $rows) -split "`r?`n"
+    $headerLines = 2
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($i -lt $headerLines) { Write-Host $lines[$i] -ForegroundColor DarkCyan; continue }
+        $row = $rows[$i - $headerLines]
+        Write-Host $lines[$i] -ForegroundColor (Get-WuuRowColor -Color $row.Color)
+    }
+    Write-Host ''
+}
+
+function Write-WuuStatusLine {
+    param([Parameter(Mandatory)][hashtable]$Store)
+    $s = [string]$Store.Status
+    if ($s) { Write-Host "  $s" -ForegroundColor Cyan }
+}
+
+#endregion Rendering
+
+#region Menu
+
+function Get-WuuMenuActions {
+    <# The operation surface, mirroring the GUI context menu 1:1 (see
+       docs/CLI_AUDIT_PLAN.md section 4 for the parity table). Mutating actions are flagged
+       so the audit layer (Phase 4) can require a reason for them. #>
+    @(
+        @{ Key = '1';  Label = 'Check for updates';            Mutating = $false; Run = { param($ctx) & $ctx.EventGetUpdates } }
+        @{ Key = '2';  Label = 'Download updates';            Mutating = $true;  Run = { param($ctx) & $ctx.EventDownloadUpdates } }
+        @{ Key = '3';  Label = 'Install updates';             Mutating = $true;  Run = { param($ctx) & $ctx.EventInstallUpdates } }
+        @{ Key = '4';  Label = 'Restart computer(s)';         Mutating = $true;  Run = { param($ctx) & $ctx.EventRestartComputer } }
+        @{ Key = '5';  Label = 'Show available updates';      Mutating = $false; Run = { param($ctx) & $ctx.EventShowAvailableUpdates } }
+        @{ Key = '6';  Label = 'Show installed updates';      Mutating = $false; Run = { param($ctx) & $ctx.EventShowInstalledUpdates } }
+        @{ Key = '7';  Label = 'Update history';              Mutating = $false; Run = { param($ctx) & $ctx.EventShowUpdateHistory } }
+        @{ Key = '8';  Label = 'Audit WSUS updates';          Mutating = $false; Run = { param($ctx) & $ctx.EventAuditWSUSUpdates } }
+        @{ Key = '9';  Label = 'Add computer(s) manually';    Mutating = $false; Run = { param($ctx) & $ctx.EventAddComputer } }
+        @{ Key = 'a';  Label = 'Add from file (CSV/TXT)';     Mutating = $false; Run = { param($ctx) & $ctx.EventAddFile } }
+        @{ Key = 's';  Label = 'Show computers in a phase';   Mutating = $false; Run = { param($ctx) & $ctx.EventShowByPhase } }
+        @{ Key = 'p';  Label = 'Assign phase to selection';   Mutating = $false; Run = { param($ctx) & $ctx.EventAssignPhaseInteractive } }
+        @{ Key = 'r';  Label = 'Remove computer(s)';          Mutating = $false; Run = { param($ctx) & $ctx.EventRemoveSelected } }
+        @{ Key = 'c';  Label = 'Clear computer list';         Mutating = $false; Run = { param($ctx) & $ctx.ClearComputerList } }
+        @{ Key = 'x';  Label = 'Export list to file';         Mutating = $false; Run = { param($ctx) & $ctx.EventSaveComputerList } }
+        @{ Key = 'v';  Label = 'Save encrypted config';       Mutating = $false; Run = { param($ctx) & $ctx.EventSaveConfig } }
+        @{ Key = 'l';  Label = 'Load encrypted config';       Mutating = $false; Run = { param($ctx) & $ctx.EventLoadConfig } }
+        @{ Key = 'd';  Label = 'Set domain credentials';      Mutating = $false; Run = { param($ctx) & $ctx.EventSetDomainCredentials } }
+        @{ Key = 'o';  Label = 'Remove offline computers';    Mutating = $false; Run = { param($ctx) & $ctx.EventRemoveOfflineComputer } }
+        @{ Key = 'e';  Label = 'Show errors';                 Mutating = $false; Run = { param($ctx) & $ctx.GetErrors } }
+        @{ Key = 'w';  Label = 'Windows Update service';      Mutating = $true;  Run = { param($ctx) & $ctx.EventWUServiceActionInteractive } }
+        @{ Key = 't';  Label = 'Toggle auto download/install/reboot'; Mutating = $false; Run = { param($ctx) & $ctx.EventToggleSettings } }
+        @{ Key = '?';  Label = 'Help';                        Mutating = $false; Run = { param($ctx) & $ctx.ShowHelp } }
+        @{ Key = 'q';  Label = 'Quit';                        Mutating = $false; Run = { param($ctx) $ctx.Quit = $true } }
+    )
+}
+
+function Write-WuuMenu {
+    param([Parameter(Mandatory)][hashtable]$Store)
+    $dl = if ($Store.Settings.AutoDownload) { 'ON' } else { 'off' }
+    $il = if ($Store.Settings.AutoInstall) { 'ON' } else { 'off' }
+    $rb = if ($Store.Settings.AutoReboot) { 'ON' } else { 'off' }
+    Write-Host ''
+    Write-Host ("  Auto download: $dl   Auto install: $il   Auto reboot: $rb") -ForegroundColor DarkGray
+    Write-Host '  ------------------------------------------------------------------' -ForegroundColor DarkGray
+    $actions = Get-WuuMenuActions
+    foreach ($a in $actions) {
+        $mark = if ($a.Mutating) { '*' } else { ' ' }
+        Write-Host ("  [{0}] {1} {2}" -f $a.Key.PadLeft(2), $mark, $a.Label)
+    }
+    Write-Host '  (* = changes remote state)' -ForegroundColor DarkGray
+}
+
+#endregion Menu
+
+#region Input loop
+
+function Start-WuuConsoleLoop {
+    <#
+    .SYNOPSIS
+    Runs the interactive console menu until the operator quits.
+    .DESCRIPTION
+    Polls the keyboard non-blockingly so the job scheduler can be drained on every tick
+    (see the module header for why a timer cannot work here). The scheduler call is supplied
+    by the caller as a scriptblock so this module does not depend on Wuu.WindowsUpdate.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Store,
+        [Parameter(Mandatory)][scriptblock]$DrainScheduler,
+        [Parameter(Mandatory)][hashtable]$Actions,
+        [int]$TickMilliseconds = 250
+    )
+    Write-WuuStatusTable -Store $Store
+    Write-WuuStatusLine -Store $Store
+    Write-WuuMenu -Store $Store
+
+    $actions = Get-WuuMenuActions
+    while (-not $Actions.Quit) {
+        # Drain queued work (auto-flow, retries) before waiting for input, then keep draining
+        # while waiting - this is the replacement for the GUI's DispatcherTimer.
+        try { & $DrainScheduler } catch { Write-Warning "Scheduler tick failed: $($_.Exception.Message)" }
+
+        $pressed = $null
+        try {
+            if ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                $pressed = [string]$key.KeyChar
+            }
+        } catch {
+            # No console (redirected input / ISE): fall back to a blocking prompt
+            $pressed = Read-Host 'Select'
+        }
+
+        if (-not $pressed) {
+            Start-Sleep -Milliseconds $TickMilliseconds
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($pressed)) { continue }
+
+        $chosen = $null
+        foreach ($a in $actions) { if ($a.Key -eq $pressed.ToLowerInvariant()) { $chosen = $a; break } }
+        if (-not $chosen) {
+            Write-Host "  Unknown selection '$pressed' - press ? for help." -ForegroundColor Yellow
+            continue
+        }
+
+        if ($chosen.Key -eq 'q') { break }
+
+        Write-Host ''
+        Write-Host ("  > {0}" -f $chosen.Label) -ForegroundColor White
+        try {
+            & $chosen.Run $Actions
+        } catch {
+            Write-Host ("  Operation failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
+            Write-ErrorLog "$($chosen.Label) failed: $($_.Exception.Message)"
+        }
+
+        Write-WuuStatusTable -Store $Store
+        Write-WuuStatusLine -Store $Store
+        Write-WuuMenu -Store $Store
+    }
+    Write-Host ''
+    Write-Host '  Shutting down...' -ForegroundColor DarkGray
+}
+
+#endregion Input loop
+
+#region Selectors (shared by menu actions)
+
+function Read-WuuSelection {
+    <# Resolves which computers an action applies to. Accepts '*' for all, a comma list of
+       names, or a phase filter - the console equivalent of the GUI's row selection. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Store,
+        [string]$Prompt = 'Computer(s) - name(s), "all", or Enter to cancel'
+    )
+    $all = @(Get-WuuComputerRow -Store $Store)
+    if ($all.Count -eq 0) { Write-Host '  No computers in the list.' -ForegroundColor Yellow; return @() }
+    $ans = Read-Host "  $Prompt"
+    if ([string]::IsNullOrWhiteSpace($ans)) { return @() }
+    $ans = $ans.Trim()
+    if ($ans -match '^(all|\*)$') { return $all }
+    $wanted = $ans -split '[,;]'
+    $picked = New-Object System.Collections.ArrayList
+    foreach ($w in $wanted) {
+        $n = $w.Trim()
+        if (-not $n) { continue }
+        $row = Get-WuuComputerRow -Store $Store -Computer $n
+        if ($row) { $pick = $row } else {
+            # allow unambiguous prefix match
+            # NOTE: $matches is an automatic variable (regex results) - never reuse that name.
+            $prefixHits = @()
+            foreach ($r in $all) { if ($r.Computer -like "$n*") { $prefixHits += $r } }
+            if ($prefixHits.Count -eq 1) { $pick = $prefixHits[0] }
+            else { Write-Host "  '$n' not found (or ambiguous) - skipped." -ForegroundColor Yellow; continue }
+        }
+        $picked.Add($pick) | Out-Null
+    }
+    return $picked.ToArray()
+}
+
+function Read-WuuYesNo {
+    param([string]$Prompt, [bool]$Default = $false)
+    $suffix = if ($Default) { '[Y/n]' } else { '[y/N]' }
+    $ans = Read-Host "  $Prompt $suffix"
+    if ([string]::IsNullOrWhiteSpace($ans)) { return $Default }
+    return ($ans.Trim() -match '^(y|yes)$')
+}
+
+#endregion Selectors
+
+Export-ModuleMember -Function @(
+    'Get-WuuRowColor'
+    'Format-WuuTable'
+    'Write-WuuStatusTable'
+    'Write-WuuStatusLine'
+    'Get-WuuMenuActions'
+    'Write-WuuMenu'
+    'Start-WuuConsoleLoop'
+    'Read-WuuSelection'
+    'Read-WuuYesNo'
+)

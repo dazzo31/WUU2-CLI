@@ -28,11 +28,8 @@ foreach ($rel in $include) {
     }
 }
 
-# UI layouts (MainWindow.xaml, CredentialDialog.xaml, OUSelector.xaml)
-$uiSrc = Join-Path $repoRoot "ui"
-if (Test-Path $uiSrc) {
-    Copy-Item -Path $uiSrc -Destination (Join-Path $staging "ui") -Recurse -Force
-}
+# ui/ was removed in the console edition (Phase 1): the shell renders the state store instead
+# of XAML. Do not re-add a ui/ copy here.
 
 # src/ modules (WUU.ps1 imports them at startup)
 $srcSrc = Join-Path $repoRoot "src"

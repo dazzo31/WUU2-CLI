@@ -79,7 +79,6 @@ Initialize-WuuWindowsUpdateContext -Context @{
     MaxConcurrentJobs           = $global:MaxConcurrentJobs
     GetUpdates                  = $getUpdatesPayload
     BackgroundProcessing        = $global:backgroundProcessing
-    CredDialogXamlPath          = Join-Path $root 'ui\CredentialDialog.xaml'
 }
 
 $fail = $false

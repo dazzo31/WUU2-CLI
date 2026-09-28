@@ -47,7 +47,6 @@ Initialize-WuuWindowsUpdateContext -Context @{
     MaxConcurrentJobs = 10
     GetUpdates = { param($ComputerItem) 'payload-ran' }
     BackgroundProcessing = [hashtable]::Synchronized(@{ Suspended = $false })
-    CredDialogXamlPath = Join-Path $root 'ui\CredentialDialog.xaml'
 }
 
 # Must not throw; proves Write-InfoLog resolves inside the Wuu.WindowsUpdate function.

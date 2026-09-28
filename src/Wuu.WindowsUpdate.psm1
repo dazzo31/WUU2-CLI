@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .DESCRIPTION
 Per-computer worker runspaces, job scheduling, phase gating, and update payloads.
@@ -11,7 +11,6 @@ function Initialize-WuuWindowsUpdateContext {
     # UseCustomCredentials, CustomCredentials, CredentialCache, PerformanceThreshold,
     # ConfigPaths, SearchTimeout, SessionTimeout, RebootCheckTimeout, MaxConcurrentJobs,
     # GetUpdates, DownloadUpdates, InstallUpdates, RestartComputer,
-    # BackgroundProcessing, CredDialogXamlPath, StateStore (console edition)
     param([Parameter(Mandatory)][hashtable]$Context)
     $script:WuuCtx = $Context
 }
@@ -63,7 +62,6 @@ function New-ComputerRunspace {
         $newRunspace.SessionStateProxy.SetVariable("OfflineWaitSeconds",$ctx.OfflineWaitSeconds)
         $newRunspace.SessionStateProxy.SetVariable("OnlineWaitSeconds",$ctx.OnlineWaitSeconds)
         # ui/ layout file for the worker-side credential dialog (workers have no $PSScriptRoot)
-        $newRunspace.SessionStateProxy.SetVariable("CredDialogXamlPath", $ctx.CredDialogXamlPath)
         # Shared worker pool for bounded probes (isolated runspaces cannot see
         # module functions - the pool OBJECT and an unbound invoke script are
         # injected together; see New-PooledInvokeScript in Wuu.Workers.psm1)
@@ -214,109 +212,23 @@ function New-ComputerRunspace {
         $newRunspace.SessionStateProxy.SetVariable('InvokeRemoteTaskScript', [scriptblock]::Create((Get-Command -Name 'Invoke-WuuRemoteTask' -CommandType Function -ErrorAction Stop).ScriptBlock.ToString()))
 
         # Add custom credential dialog script to runspace
+        # Credential prompt helper for worker runspaces (console edition).
+        #
+        # The GUI injected a WPF dialog here. A worker runspace is an isolated, non-interactive
+        # context - it must NOT try to own the console (that would race the main session's input
+        # loop and could interleave prompts into the middle of an unrelated menu action). So this
+        # returns the documented 'no UI available' result and the caller falls back to default
+        # credentials. Interactive entry happens in the MAIN session before the worker starts
+        # (Wuu.Credentials Show-CustomCredentialDialog), which is how the console flow always
+        # supplies credentials.
         $newRunspace.SessionStateProxy.SetVariable('ShowCustomCredentialDialogScript', [scriptblock]::Create({
             param(
-                [string]$Message = "Enter your credentials",
-                [string]$Username = "",
-                [string]$Title = "Credentials Required"
+                [string]$Message = 'Enter your credentials',
+                [string]$Username = '',
+                [string]$Title = 'Credentials Required'
             )
-            
-            Add-Type -AssemblyName PresentationFramework
-            Add-Type -AssemblyName PresentationCore
-            Add-Type -AssemblyName WindowsBase
-            
-            # Layout lives in ui/CredentialDialog.xaml - single source of truth, loaded via
-            # the injected $CredDialogXamlPath variable (workers have no $PSScriptRoot).
-            $xamlCredentialDialog = Get-Content -Path $CredDialogXamlPath -Raw
-            $xamlCredentialDialog = $xamlCredentialDialog -replace '\$Title\b', $Title -replace '\$Message\b', $Message
-            
-            try {
-                $reader = [System.Xml.XmlNodeReader]::new([xml]$xamlCredentialDialog)
-                $dialog = [Windows.Markup.XamlReader]::Load($reader)
-                
-                # Get dialog controls
-                $usernameTextBox = $dialog.FindName('UsernameTextBox')
-                $passwordBox = $dialog.FindName('PasswordBox')
-                $rememberCheckBox = $dialog.FindName('RememberCheckBox')
-                $okButton = $dialog.FindName('OKButton')
-                $cancelButton = $dialog.FindName('CancelButton')
-                
-                # Set initial username if provided
-                if ($Username) {
-                    $usernameTextBox.Text = $Username
-                }
-                
-                # Set focus to appropriate control when dialog opens
-                $dialog.Add_Loaded({
-                    if ([string]::IsNullOrWhiteSpace($usernameTextBox.Text)) {
-                        $usernameTextBox.Focus()
-                    } else {
-                        $passwordBox.Focus()
-                    }
-                })
-                
-                # OK button click handler
-                $okButton.Add_Click({
-                    if ([string]::IsNullOrWhiteSpace($usernameTextBox.Text)) {
-                        [System.Windows.MessageBox]::Show("Please enter a username.", "Credential Error", 'OK', 'Warning')
-                        $usernameTextBox.Focus()
-                        return
-                    }
-                    
-                    if ($passwordBox.SecurePassword.Length -eq 0) {
-                        [System.Windows.MessageBox]::Show("Please enter a password.", "Credential Error", 'OK', 'Warning')
-                        $passwordBox.Focus()
-                        return
-                    }
-                    
-                    # Store results in dialog tag
-                    $dialog.Tag = @{
-                        Username = $usernameTextBox.Text
-                        Password = $passwordBox.SecurePassword.Copy()
-                        Remember = $rememberCheckBox.IsChecked
-                    }
-                    $dialog.DialogResult = $true
-                    $dialog.Close()
-                })
-                
-                # Cancel button click handler
-                $cancelButton.Add_Click({
-                    $dialog.DialogResult = $false
-                    $dialog.Close()
-                })
-                
-                # Handle Enter key in both text boxes
-                $usernameTextBox.Add_KeyDown({
-                    if ($_.Key -eq 'Enter') {
-                        $passwordBox.Focus()
-                    }
-                })
-                
-                $passwordBox.Add_KeyDown({
-                    if ($_.Key -eq 'Enter') {
-                        $okButton.RaiseEvent([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
-                    }
-                })
-                
-                # Set dialog owner to main window if available
-                if ($uiHash.Window) {
-                    $dialog.Owner = $uiHash.Window
-                }
-                
-                # Show dialog
-                $result = $dialog.ShowDialog()
-                
-                if ($result -eq $true) {
-                    $credential = New-Object System.Management.Automation.PSCredential($dialog.Tag.Username, $dialog.Tag.Password)
-                    return $credential
-                } else {
-                    return $null
-                }
-                
-            } catch {
-                # Fallback to Get-Credential if custom dialog fails
-                return Get-Credential -Message $Message -ErrorAction SilentlyContinue
-            }
+            # Signal 'cannot prompt from a worker runspace' - see the comment at the injection site.
+            return $null
         }.ToString()))
         
         # Add Get-RemoteCredentials function to runspace (with timeout protection to prevent hangs)
@@ -540,21 +452,20 @@ function Start-UpdateCheckJob {
             }
         }
         
-        # Update status if runspace creation fails (guard: dispatcher may be absent
-        # during shutdown or in test rigs)
-        if ($uiHash.ListView -and $uiHash.ListView.Dispatcher) {
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($ComputerItem)
+        # Update the row if runspace creation fails. Console edition: write to the store; no
+        # dispatcher and no ListView (this path previously checked Dispatcher existence and
+        # walked the visual tree for the row's container, neither of which exists now).
+        if ($ctx.StateStore) {
+            try {
                 $ComputerItem.Status = "Failed to initialize: $errorMessage"
                 $ComputerItem.UpdatesStatus = 'Error'
-                # Set background color to grey for errored entries
-                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($ComputerItem)
-                if($listViewItem) {
-                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
-                }
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+                $ComputerItem.State = 'Error'
+                # Errored entries render grey
+                $ComputerItem.Color = 'Error'
+                $ctx.StateStore.Touch()
+            } catch {
+                Write-WarningLog "Failed to update row for $($ComputerItem.Computer): $($_.Exception.Message)"
+            }
         }
         return $false
     }

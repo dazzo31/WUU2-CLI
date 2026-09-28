@@ -10,10 +10,10 @@ function Import-WuuModules {
     # session-state isolation hides sibling exports otherwise). Both the app
     # startup and tests/Test-PendingDrain.ps1 use this single import path.
     param([Parameter(Mandatory)][string]$WuuRoot)
-    # Wuu.State first: Wuu.Core's startup creates the state store via New-WuuStateStore,
-    # and worker runspaces receive it. Order matters only for readability otherwise -
-    # all are imported -Global.
-    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate')) {
+    # Wuu.State first: Wuu.Core's startup creates the state store via New-WuuStateStore, and
+    # worker runspaces receive it. Wuu.Console provides the presentation layer the shell uses.
+    # Order otherwise matters only for readability - all are imported -Global.
+    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
@@ -412,9 +412,8 @@ try {
     Write-DebugLog "Loading required .NET assemblies" -Level 'INFO'
     
     $assemblies = @(
-        'PresentationFramework',
-        'PresentationCore', 
-        'WindowsBase',
+        # Console edition: WPF assemblies (PresentationFramework/PresentationCore/WindowsBase)
+        # are deliberately NOT loaded. Only the non-GUI dependencies remain.
         'Microsoft.VisualBasic',
         'System.Windows.Forms'
     )
@@ -449,7 +448,7 @@ try {
     Write-DebugLog "All required assemblies loaded successfully" -Level 'INFO'
 } catch {
     Write-Error "Failed to load required assemblies: $($_.Exception.Message)"
-    Write-Host "This usually indicates a problem with .NET Framework or WPF installation." -ForegroundColor Red
+    Write-Host "This usually indicates a problem with a required .NET assembly." -ForegroundColor Red
     Read-Host "Press Enter to exit"
     exit
 }
@@ -472,45 +471,14 @@ try {
 }
 #endregion Load required modules
 
-#region Load XAML with enhanced error handling
-try {
-    Write-DebugLog "Loading XAML interface" -Level 'INFO'
-    
-    $xamlPath = Join-Path $scriptPath "ui\MainWindow.xaml"
-    Write-DebugLog "XAML file path: $xamlPath" -Level 'INFO'
-    
-    if (-not (Test-Path $xamlPath)) {
-        throw "XAML file not found at: $xamlPath"
-    }
-    
-    Write-DebugLog "Reading XAML content" -Level 'INFO'
-    [xml]$xaml = Get-Content $xamlPath -ErrorAction Stop
-    
-    Write-DebugLog "Creating XML reader" -Level 'INFO'
-    $reader = New-Object System.Xml.XmlNodeReader $xaml
-    
-    Write-DebugLog "Loading XAML into WPF" -Level 'INFO'
-    $uiHash.Window = [Windows.Markup.XamlReader]::Load($reader)
-    
-    if (-not $uiHash.Window) {
-        throw "Failed to create window object from XAML"
-    }
-    
-    Write-DebugLog "XAML interface loaded successfully" -Level 'INFO'
-    
-} catch {
-    Write-Error "Failed to load XAML interface: $($_.Exception.Message)"
-    Write-DebugLog "Error details: $($_.Exception.GetType().FullName)" -Level 'ERROR'
-Write-Host "This usually indicates a problem with the ui\MainWindow.xaml file or WPF." -ForegroundColor Red
-    
-    if ($_.Exception.InnerException) {
-        Write-DebugLog "Inner exception: $($_.Exception.InnerException.Message)" -Level 'ERROR'
-    }
-    
-    Read-Host "Press Enter to exit"
-    exit
-}
-#endregion
+#region Presentation layer (console)
+# Console edition: no XAML, no WPF, no window. The GUI loaded ui\MainWindow.xaml here via
+# [Windows.Markup.XamlReader] and resolved every control with FindName; the console shell
+# (Wuu.Console.psm1) renders the state store instead and the interactive menu replaces the
+# context menu. ui/ has been removed, so this region deliberately does nothing but record
+# that presentation is console-only.
+Write-DebugLog "Console presentation mode (no XAML/WPF)" -Level 'INFO'
+#endregion Presentation layer (console)
 
 #region Helper Functions
 
@@ -1080,10 +1048,7 @@ $DownloadUpdates = {
             $computer.UpdatesStatus = 'Error'
             $computer.State = 'Error'
             # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if($listViewItem) {
         $Computer.Color = 'Error'
-            }
         if ($stateStore) { $stateStore.Touch() }
 
         #Cancel any remaining actions
@@ -1899,10 +1864,7 @@ $GetUpdates = {
                 $computer.UpdatesStatus = 'Error'
                 $computer.State = 'Error'
                 # Set background color to grey for errored entries
-                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-                if($listViewItem) {
             $Computer.Color = 'Error'
-                }
             if ($stateStore) { $stateStore.Touch() }
         }
 
@@ -1965,10 +1927,7 @@ $InstallUpdates = {
             $computer.UpdatesStatus = 'Error'
             $computer.State = 'Error'
             # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if($listViewItem) {
         $Computer.Color = 'Error'
-            }
         if ($stateStore) { $stateStore.Touch() }
 
         #Cancel any remaining actions
@@ -1997,21 +1956,17 @@ $RemoveOfflineComputer = {
         else{
             #Remove unreachable computers
             $updatesHash.Remove($computer.computer)
-                # Check if clientObservable exists before trying to remove from it
-                if ($uiHash.clientObservable) {
-                    $uiHash.clientObservable.Remove($computer)
-                }
-            if ($stateStore) { $stateStore.Touch() }
+            # Remove the row from the store (was: $uiHash.clientObservable.Remove).
+            # NOTE: the mechanical transformer left this pointing at clientObservable, which no
+            # longer exists - it would silently no-op and leave unreachable rows in the list.
+            Remove-WuuComputerRow -Store $stateStore -Computer $computer.Computer | Out-Null
         }
     }
     Catch{
             $computer.Status = "Error occured: $($_.Exception.Message)"
             $computer.State = 'Error'
             # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($computer)
-            if($listViewItem) {
         $computer.Color = 'Error'
-            }
         if ($stateStore) { $stateStore.Touch() }
 
         #Cancel any remaining actions
@@ -2100,10 +2055,7 @@ $RestartComputer = {
                 $computer.Status = "Error occured: $($_.Exception.Message)"
                 $computer.State = 'Error'
                 # Set background color to grey for errored entries
-                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-                if($listViewItem) {
             $Computer.Color = 'Error'
-                }
             if ($stateStore) { $stateStore.Touch() }
         }
 
@@ -2256,369 +2208,15 @@ $jobCleanup.PowerShell.Runspace = $newRunspace
 $jobCleanup.Thread = $jobCleanup.PowerShell.BeginInvoke()
 #endregion
 
-#region Connect to controls
-$uiHash.ActionMenu = $uiHash.Window.FindName('ActionMenu')
-$uiHash.AddADContext = $uiHash.Window.FindName('AddADContext')
-$uiHash.AddADMenu = $uiHash.Window.FindName('AddADMenu')
-$uiHash.AddFileContext = $uiHash.Window.FindName('AddFileContext')
-$uiHash.AddComputerContext = $uiHash.Window.FindName('AddComputerContext')
-$uiHash.AddComputerMenu = $uiHash.Window.FindName('AddComputerMenu')
-$uiHash.AutoDownloadCheckBox = $uiHash.Window.FindName('AutoDownloadCheckBox')
-$uiHash.AutoInstallCheckBox = $uiHash.Window.FindName('AutoInstallCheckBox')
-$uiHash.AutoRebootCheckBox = $uiHash.Window.FindName('AutoRebootCheckBox')
-$uiHash.BrowseFileMenu = $uiHash.Window.FindName('BrowseFileMenu')
-$uiHash.CheckUpdatesContext = $uiHash.Window.FindName('CheckUpdatesContext')
-$uiHash.ClearComputerListMenu = $uiHash.Window.FindName('ClearComputerListMenu')
-$uiHash.DownloadUpdatesContext = $uiHash.Window.FindName('DownloadUpdatesContext')
-$uiHash.ExitMenu = $uiHash.Window.FindName('ExitMenu')
-$uiHash.GridView = $uiHash.Window.FindName('GridView')
-$uiHash.ExportListMenu = $uiHash.Window.FindName('ExportListMenu')
-$uiHash.SaveConfigMenu = $uiHash.Window.FindName('SaveConfigMenu')
-$uiHash.LoadConfigMenu = $uiHash.Window.FindName('LoadConfigMenu')
-$uiHash.InstallUpdatesContext = $uiHash.Window.FindName('InstallUpdatesContext')
-$uiHash.Listview = $uiHash.Window.FindName('Listview')
-$uiHash.ListviewContextMenu = $uiHash.Window.FindName('ListViewContextMenu')
-
-# Context menu event handler removed - it was causing issues when the ListView is empty
-# The individual menu item click handlers already have null checks to prevent errors
-
-$uiHash.CopyCellContext = $uiHash.Window.FindName('CopyCellContext')
-$uiHash.OfflineHostsMenu = $uiHash.Window.FindName('OfflineHostsMenu')
-$uiHash.Phase1Menu = $uiHash.Window.FindName('Phase1Menu')
-$uiHash.Phase2Menu = $uiHash.Window.FindName('Phase2Menu')
-$uiHash.Phase3Menu = $uiHash.Window.FindName('Phase3Menu')
-$uiHash.Phase4Menu = $uiHash.Window.FindName('Phase4Menu')
-$uiHash.Phase5Menu = $uiHash.Window.FindName('Phase5Menu')
-$uiHash.RemoteDesktopContext = $uiHash.Window.FindName('RemoteDesktopContext')
-$uiHash.RemoveComputerContext = $uiHash.Window.FindName('RemoveComputerContext')
-$uiHash.RestartContext = $uiHash.Window.FindName('RestartContext')
-$uiHash.SelectAllMenu = $uiHash.Window.FindName('SelectAllMenu')
-$uiHash.ShowUpdatesContext = $uiHash.Window.FindName('ShowUpdatesContext')
-$uiHash.ShowInstalledContext = $uiHash.Window.FindName('ShowInstalledContext')
-$uiHash.WSUSAuditContext = $uiHash.Window.FindName('WSUSAuditContext')
-$uiHash.StatusTextBox = $uiHash.Window.FindName('StatusTextBox')
-$uiHash.UpdateHistoryMenu = $uiHash.Window.FindName('UpdateHistoryMenu')
-$uiHash.ViewErrorMenu = $uiHash.Window.FindName('ViewErrorMenu')
-$uiHash.ViewUpdateLogContext = $uiHash.Window.FindName('ViewUpdateLogContext')
-$uiHash.WindowsUpdateServiceMenu = $uiHash.Window.FindName('WindowsUpdateServiceMenu')
-$uiHash.WURestartServiceMenu = $uiHash.Window.FindName('WURestartServiceMenu')
-$uiHash.WUStartServiceMenu = $uiHash.Window.FindName('WUStartServiceMenu')
-$uiHash.WUStopServiceMenu = $uiHash.Window.FindName('WUStopServiceMenu')
-$uiHash.SetDomainCredentialsContext = $uiHash.Window.FindName('SetDomainCredentialsContext')
-$uiHash.TestADConnectionMenu = $uiHash.Window.FindName('TestADConnectionMenu')
-#endregion Connect to controls
 
 #region Event ScriptBlocks
 
-#region Window and UI Events
-
-# Copy cell content functionality - improved implementation to prevent GUI hangs
-$eventCopyCellContent = {
-    try {
-        Write-InfoLog "Copy Cell Content function called"
-        $selectedItem = $uiHash.Listview.SelectedItem
-        if ($selectedItem) {
-            # Collect the computer name and status
-            $cellContent = "Computer: $($selectedItem.Computer)"
-            if ($selectedItem.Status -and $selectedItem.Status -ne 'Ready' -and $selectedItem.Status -ne '') {
-                $cellContent += " | Status: $($selectedItem.Status)"
-            }
-            
-            Write-InfoLog "Copying cell content: '$cellContent'"
-            
-            # Copy to clipboard with error handling
-            [System.Windows.Clipboard]::SetText($cellContent)
-            Write-InfoLog "Successfully copied '$cellContent' to clipboard"
-            
-            # Update status
-            # Console edition: status colour is a name the renderer maps; no WPF Foreground.
-            $stateStore.SetStatus("Copied '$cellContent' to clipboard")
-        } else {
-            Write-WarningLog "No item selected for copy operation"
-            $stateStore.SetStatus('No item selected to copy')
-        }
-    } catch {
-        Write-ErrorLog "Error copying cell content: $($_.Exception.Message)"
-        $stateStore.SetStatus("Failed to copy cell content: $($_.Exception.Message)")
-    }
-}
-
-# Proportionally resize the ListView GridView columns to fill the available width.
-# Called on window resize and when columns are resized by dragging (after the drag ends,
-# remaining columns redistribute leftover space so the header always spans the window).
-# Runs on the UI thread only. Returns nothing.
-function Set-ColumnProportionalWidths {
-    $listview = $uiHash.ListView
-    if (-not $listview -or -not $uiHash.GridView) { return }
-    $columns = $uiHash.GridView.Columns
-    if (-not $columns -or $columns.Count -eq 0) { return }
-
-    # Desired proportion of total width per column, looked up by Header text
-    # (GridViewColumn has no Name property). Sums to 1.0.
-    $proportions = @{
-        'Computer'       = 0.18
-        'Phase'          = 0.08
-        'Available'      = 0.07
-        'Downloaded'     = 0.08
-        'Install Errors' = 0.09
-        'Status'         = 0.28
-        'Reboot Required' = 0.11
-        'Updates Status' = 0.11
-    }
-
-    # Compute available width inside the ListView viewport (excludes the vertical scrollbar).
-    # ListView has BorderThickness=0, so no border compensation is needed.
-    $viewportWidth = $null
-    try {
-        # Walk the visual tree to the ScrollViewer (standard ListView template:
-        # ListView > Border > ScrollViewer > ItemsPresenter).
-        $child = [System.Windows.Media.VisualTreeHelper]::GetChild($listview, 0)
-        $guard = 0
-        while ($child -and $guard -lt 5) {
-            if ($child -is [System.Windows.Controls.ScrollViewer]) {
-                $viewportWidth = $child.ViewportWidth
-                break
-            }
-            if ([System.Windows.Media.VisualTreeHelper]::GetChildrenCount($child) -gt 0) {
-                $child = [System.Windows.Media.VisualTreeHelper]::GetChild($child, 0)
-            } else {
-                $child = $null
-            }
-            $guard++
-        }
-    } catch { $null = $_ }
-    if (-not $viewportWidth -or $viewportWidth -le 0) {
-        # Fallback: use ListView width directly if the visual tree is not ready yet.
-        $viewportWidth = $listview.ActualWidth
-    }
-    if (-not $viewportWidth -or $viewportWidth -le 100) { return }
-
-    # Water-filling distribution: columns whose proportional share falls below the
-    # minimum are pinned to it and the remaining columns re-split the leftover space,
-    # so the header spans the viewport exactly whenever it can. Columns the user has
-    # dragged keep their explicit width; the others absorb size changes. When even the
-    # minimums don't fit, the total exceeds the viewport and the ListView's horizontal
-    # scrollbar takes over (scrolling + manual resize still work - by design).
-    $minWidth = 40.0
-
-    $fixedTotal = 0.0
-    $freeColumns = @()   # columns to size proportionally
-    foreach ($column in $columns) {
-        if ($script:userResizedColumns -and $script:userResizedColumns.ContainsKey($column.Header)) {
-            $fixedTotal += [double]$column.Width
-        } else {
-            $proportion = $proportions[$column.Header]
-            if (-not $proportion) { $proportion = [double]1.0 / $columns.Count }
-            $freeColumns += [pscustomobject]@{ Column = $column; Proportion = $proportion }
-        }
-    }
-    if ($freeColumns.Count -eq 0) { return }   # every column user-sized: leave as-is
-
-    $remaining = $viewportWidth - $fixedTotal
-
-    # Pin shares that fall below minWidth, re-splitting the rest until stable.
-    $pinned = @()
-    $pending = @($freeColumns)
-    $stable = $false
-    while (-not $stable -and $pending.Count -gt 0) {
-        $stable = $true
-        $proportionTotal = 0.0
-        foreach ($entry in $pending) { $proportionTotal += $entry.Proportion }
-        $next = @()
-        foreach ($entry in $pending) {
-            $share = 0.0
-            if ($proportionTotal -gt 0) { $share = $remaining * ($entry.Proportion / $proportionTotal) }
-            if ($share -lt $minWidth) {
-                $pinned += $entry.Column
-                $remaining -= $minWidth
-                $stable = $false
-            } else {
-                $next += $entry
-            }
-        }
-        $pending = $next
-    }
-
-    # Assign integer widths; leftover pixels go to the last free column so the
-    # header spans the viewport exactly.
-    foreach ($column in $pinned) {
-        $column.Width = [int]$minWidth
-    }
-    if ($pending.Count -gt 0) {
-        $proportionTotal = 0.0
-        foreach ($entry in $pending) { $proportionTotal += $entry.Proportion }
-        $assigned = 0.0
-        foreach ($entry in $pending) {
-            $share = 0.0
-            if ($remaining -gt 0 -and $proportionTotal -gt 0) { $share = $remaining * ($entry.Proportion / $proportionTotal) }
-            $width = [math]::Floor($share)
-            if ($width -lt $minWidth) { $width = [int]$minWidth }
-            $entry.Column.Width = [int]$width
-            $assigned += $width
-        }
-        $leftover = $remaining - $assigned
-        if ($leftover -gt 0) {
-            $lastEntry = $pending[-1]
-            $lastEntry.Column.Width = [int]($lastEntry.Column.Width + $leftover)
-        }
-    }
-}
-
-$eventWindowInit = {
-    $Script:SortHash = @{}
-    
-    #Sort event handler
-    [System.Windows.RoutedEventHandler]$Global:ColumnSortHandler = {
-        If ($_.OriginalSource -is [System.Windows.Controls.GridViewColumnHeader]) {
-            Write-Verbose ('{0}' -f $_.Originalsource.getType().FullName)
-            If ($_.OriginalSource -AND $_.OriginalSource.Role -ne 'Padding') {
-                $Column = $_.Originalsource.Column.DisplayMemberBinding.Path.Path
-                Write-Debug ('Sort: {0}' -f $Column)
-                If ($SortHash[$Column] -eq 'Ascending') {
-                    $SortHash[$Column]  = 'Descending'
-                } Else {
-                    $SortHash[$Column]  = 'Ascending'
-                }
-                $uiHash.Listview.Items.SortDescriptions.clear()
-                Write-Verbose ('Sorting {0} by {1}' -f $Column, $SortHash[$Column])
-                $uiHash.Listview.Items.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription $Column, $SortHash[$Column]))
-                $uiHash.Listview.Items.Refresh()
-            }
-        }
-    }
-    $uiHash.Listview.AddHandler([System.Windows.Controls.GridViewColumnHeader]::ClickEvent, $ColumnSortHandler)
-
-    # Resizable/auto-fitting columns:
-    # NOTE: GridViewColumn has NO MinWidth property (unlike DataGridColumn) - the
-    # 40px floor during native grip drags is enforced by a DragDelta clamp handler
-    # in $script:hookHeaderGrips, and by the water-fill distribution below.
-    # 1) Window/ListView resize -> redistribute column widths proportionally so the
-    #    header always spans the available width.
-    # The fit must run AFTER layout completes: during the SizeChanged callback the
-    # ScrollViewer's ViewportWidth is still the PREVIOUS size, so calling the fit
-    # directly would compute widths from stale values. Defer to Render priority and
-    # coalesce bursts (interactive window resizing fires SizeChanged continuously).
-    $script:pendingColumnFit = $false
-    $uiHash.Listview.Add_SizeChanged({
-        if ($script:isDraggingColumn) { return }   # don't fight the mouse mid-drag
-        if ($script:pendingColumnFit) { return }
-        $script:pendingColumnFit = $true
-        $uiHash.ListView.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Render, [action]{
-            $script:pendingColumnFit = $false
-            Set-ColumnProportionalWidths
-        })
-    })
-
-    # 2) Hook each column's header resize grip. 'Loaded' is a DIRECT routed event, so
-    #    AddHandler on the ListView never sees header Loaded events; instead hook the
-    #    ListView's own Loaded (fires once, headers already exist in the visual tree)
-    #    and re-walk at idle in case headers are regenerated (column reorder).
-    # NOTE: handlers fire long after this scriptblock's scope ends, so all shared
-    # state must live in $script: scope, and per-grip state is recovered from the
-    # event sender (the Thumb's TemplatedParent is its GridViewColumnHeader).
-    # NOTE: the Thumb part name is PART_HeaderGripper (with 'er') - that exact name is
-    # what WPF's GridViewColumnHeader.HookupGripperEvents looks up to wire NATIVE
-    # drag-resize. Our handlers below only track which column was user-resized.
-    $script:userResizedColumns = @{}
-    $script:isDraggingColumn = $false
-    $script:draggingHeader = $null
-    $script:hookHeaderGrips = {
-        # Wire the drag-resize grip of every GridViewColumnHeader currently in the tree.
-        $stack = New-Object System.Collections.Generic.Stack[System.Windows.DependencyObject]
-        $stack.Push($uiHash.ListView)
-        while ($stack.Count -gt 0) {
-            $el = $stack.Pop()
-            if ($el -is [System.Windows.Controls.GridViewColumnHeader]) {
-                $grip = $el.Template.FindName('PART_HeaderGripper', $el)
-                if ($grip -and $grip.Tag -ne 'wired') {
-                    $grip.Tag = 'wired'
-                    # WPF's native gripper handlers subscribe FIRST (in OnApplyTemplate)
-                    # and set e.Handled=true on every drag event - CLR wrappers
-                    # (Add_DragStarted etc.) never see them. Register with
-                    # handledEventsToo=$true so our bookkeeping runs too.
-                    # Clamp: WPF's native gripper allows dragging a column to width 0;
-                    # GridViewColumn has no MinWidth, so enforce a 40px floor here.
-                    $grip.AddHandler(
-                        [System.Windows.Controls.Primitives.Thumb]::DragDeltaEvent,
-                        [System.Windows.Controls.Primitives.DragDeltaEventHandler]{
-                            param($thumb, $dragArgs)
-                            $header = $thumb.TemplatedParent
-                            if ($header -and $header.Column -and $header.Column.Width -lt 40) {
-                                $header.Column.Width = 40
-                            }
-                        }, $true)
-                    $grip.AddHandler(
-                        [System.Windows.Controls.Primitives.Thumb]::DragStartedEvent,
-                        [System.Windows.Controls.Primitives.DragStartedEventHandler]{
-                            param($thumb, $dragArgs)
-                            $script:isDraggingColumn = $true
-                            $script:draggingHeader = $thumb.TemplatedParent
-                        }, $true)
-                    $grip.AddHandler(
-                        [System.Windows.Controls.Primitives.Thumb]::DragCompletedEvent,
-                        [System.Windows.Controls.Primitives.DragCompletedEventHandler]{
-                            param($thumb, $dragArgs)
-                            $script:isDraggingColumn = $false
-                            $header = $thumb.TemplatedParent
-                            if ($header -and $header.Column) {
-                                # This column now keeps the width the user dragged it to
-                                $script:userResizedColumns[$header.Column.Header] = $true
-                            }
-                            $script:draggingHeader = $null
-                            # Redistribute the remaining columns so the header still spans the width
-                            Set-ColumnProportionalWidths
-                        }, $true)
-                }
-            }
-            $n = [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($el)
-            for ($i = 0; $i -lt $n; $i++) {
-                $stack.Push([System.Windows.Media.VisualTreeHelper]::GetChild($el, $i))
-            }
-        }
-    }
-    $uiHash.Listview.Add_Loaded({
-        & $script:hookHeaderGrips
-        # Headers can be regenerated when columns are reordered; re-check at idle.
-        $uiHash.ListView.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{
-            & $script:hookHeaderGrips
-        })
-    })
-
-    #Create and bind the observable collection to the GridView (if not already initialized)
-    if ($null -eq $uiHash.clientObservable) {
-        $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-        $uiHash.ListView.ItemsSource = $uiHash.clientObservable
-    }
-
-    # Size the columns to the actual window once the layout is measured.
-    # Render priority: guarantees the ScrollViewer's ViewportWidth is current.
-    $uiHash.ListView.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Render, [action]{
-        & $script:hookHeaderGrips
-        Set-ColumnProportionalWidths
-    })
-}
-$eventWindowClose = { #Runs when WUU closes
-    #Stop the job scheduler timer
-    if ($uiHash.JobTimer) { $uiHash.JobTimer.Stop() }
-
-    #Halt job processing
-    $jobCleanup.Flag = $False
-
-    #Stop all runspaces
-    $jobCleanup.PowerShell.Dispose()
-    
-    #Cleanup
-    [gc]::Collect()
-    [gc]::WaitForPendingFinalizers()    
-}
-
-#endregion Window and UI Events
 
 #region Menu and Action Events
 
 $eventActionMenu = { #Enable/disable action menu items
-    $uiHash.ClearComputerListMenu.IsEnabled = ($uiHash.Listview.Items.Count -gt 0)
-    $uiHash.OfflineHostsMenu.IsEnabled = ($uiHash.Listview.Items.Count -gt 0)
+    $uiHash.ClearComputerListMenu.IsEnabled = ($stateStore.Rows.Count -gt 0)
+    $uiHash.OfflineHostsMenu.IsEnabled = ($stateStore.Rows.Count -gt 0)
     $uiHash.ViewErrorMenu.IsEnabled = ($Error.Count -gt 0)
 }
 #region Active Directory Import
@@ -2701,311 +2299,90 @@ $TestADConnection = {
     $results | ForEach-Object { Write-InfoLog "  $_" }
 }
 
-$eventAddAD = { #Add computers from Active Directory
-    # Check if computer is joined to a domain first
+$eventAddAD = { #Add computers from Active Directory (console edition)
+    <#
+    .SYNOPSIS Imports computers from an AD OU.
+    .DESCRIPTION Console equivalent of the GUI flow. The GUI built a WPF OU-picker tree
+    from ui\OUSelector.xaml; here the operator picks an OU by number from a listed set, or
+    types an LDAP path directly. All errors go to the console rather than MessageBox.
+    #>
+    # Check the machine can reach AD at all before prompting.
     try {
-        # Test if we can access Active Directory services
         Write-InfoLog "Attempting to connect to Active Directory domain"
         $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
         Write-InfoLog "Successfully connected to domain: $($domain.Name)"
-    } catch [System.Security.Authentication.AuthenticationException] {
-        Write-ErrorLog "Authentication failed when accessing Active Directory: $($_.Exception.Message)"
-        [System.Windows.MessageBox]::Show(
-            "Authentication failed when accessing Active Directory.`n`nThis may be due to insufficient permissions or expired credentials.`n`nPlease ensure you have the necessary permissions to query Active Directory.",
-            "Active Directory Authentication Error",
-            'OK',
-            'Error'
-        )
-        return
-    } catch [System.ComponentModel.Win32Exception] {
-        # Directory service errors (Win32Exception is available in PowerShell 7)
-        Write-ErrorLog "Directory service error when accessing Active Directory: $($_.Exception.Message)"
-        [System.Windows.MessageBox]::Show(
-            "A directory service error occurred when accessing Active Directory.`n`nError: $($_.Exception.Message)`n`nThis may be due to network connectivity issues or domain controller availability.`n`nPlease check your network connection and try again.",
-            "Active Directory Service Error",
-            'OK',
-            'Error'
-        )
-        return
-    } catch [System.UnauthorizedAccessException] {
-        # Access denied
-        Write-ErrorLog "Access denied when accessing Active Directory: $($_.Exception.Message)"
-        [System.Windows.MessageBox]::Show(
-            "Access denied when accessing Active Directory.`n`nYou do not have sufficient permissions to query Active Directory.`n`nPlease contact your system administrator or run the application with appropriate credentials.",
-            "Active Directory Access Denied",
-            'OK',
-            'Error'
-        )
-        return
-    } catch [System.Runtime.InteropServices.COMException] {
-        # COM/RPC errors (common with domain connectivity issues)
-        Write-ErrorLog "COM/RPC error when accessing Active Directory: $($_.Exception.Message)"
-        [System.Windows.MessageBox]::Show(
-            "A communication error occurred when accessing Active Directory.`n`nError: $($_.Exception.Message)`n`nThis may be due to network connectivity issues or domain controller availability.`n`nPlease check your network connection and domain controller status.",
-            "Active Directory Communication Error",
-            'OK',
-            'Error'
-        )
-        return
-    } catch [System.SystemException] {
-        # Generic catch for domain issues or service unavailability
-        Write-ErrorLog "Active Directory services unavailable or not joined to a domain: $($_.Exception.Message)"
-        [System.Windows.MessageBox]::Show(
-            "Active Directory services are unavailable or this computer is not joined to a domain. Please check your network connection or domain configuration.",
-            "Active Directory Error",
-            'OK',
-            'Error'
-        )
-        return
     } catch {
-        # Generic catch-all for any other AD-related errors
-        Write-ErrorLog "Unexpected error when accessing Active Directory: $($_.Exception.Message)"
-        Write-ErrorLog "Exception type: $($_.Exception.GetType().FullName)"
-        
-        # Offer to run diagnostic test
-        $result = [System.Windows.MessageBox]::Show(
-            "An unexpected error occurred when accessing Active Directory.`n`nError: $($_.Exception.Message)`n`nError Type: $($_.Exception.GetType().Name)`n`nThis computer may not be joined to a domain, or there may be network connectivity issues.`n`nWould you like to run an AD connectivity test to diagnose the issue?",
-            "Active Directory Error",
-            'YesNo',
-            'Error'
-        )
-        
-        if ($result -eq 'Yes') {
-            & $TestADConnection
-        }
-        return
-    }
-    
-    #region OU Picker
-    $OUPickerHash = [hashtable]::Synchronized(@{})
-    try{
-        $ouPickerXamlPath = Join-Path $WuuRoot "ui\OUSelector.xaml"
-        Write-InfoLog "Checking OUSelector.xaml at $ouPickerXamlPath"
-        if (-not (Test-Path $ouPickerXamlPath)) {
-            Write-ErrorLog "OUSelector.xaml file not found at: $ouPickerXamlPath"
-            throw "OUSelector.xaml file not found at: $ouPickerXamlPath"
-        }
-        [xml]$xaml = Get-Content $ouPickerXamlPath -ErrorAction Stop
-        $reader = New-Object System.Xml.XmlNodeReader $xaml
-        $OUPickerHash.Window = [Windows.Markup.XamlReader]::Load($reader)
-        if (-not $OUPickerHash.Window) {
-            throw "Failed to create OUPicker window from XAML"
-        }
-    }
-    catch{
-        Write-ErrorLog "Failed to load OU selector XAML: $($_.Exception.Message)"
-        [System.Windows.MessageBox]::Show(
-            "Unable to load the Organizational Unit picker dialog.`n`nError: $($_.Exception.Message)`n`nThe ui\OUSelector.xaml file may be missing or corrupted.",
-            "OUPicker Error",
-            'OK',
-            'Error'
-        )
+        Write-ErrorLog "Active Directory unavailable: $($_.Exception.Message)"
+        Write-Host ""
+        Write-Host "  Cannot reach Active Directory: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  This host may not be domain-joined, or the domain controller is unreachable." -ForegroundColor Yellow
+        if (Read-WuuYesNo -Prompt "Run an AD connectivity test now?" -Default $false) { & $TestADConnection }
         return
     }
 
-    $OUPickerHash.OKButton = $OUPickerHash.Window.FindName('OKButton')
-    $OUPickerHash.CancelButton = $OUPickerHash.Window.FindName('CancelButton')
-    $OUPickerHash.OUTree = $OUPickerHash.Window.FindName('OUTree')
-
-    $OUPickerHash.OKButton.Add_Click({
-        if ($OUPickerHash.OUTree.SelectedItem) {
-            $OUPickerHash.SelectedOU = $OUPickerHash.OUTree.SelectedItem.Tag
-            $OUPickerHash.Window.Close()
-        } else {
-            [System.Windows.MessageBox]::Show('Please select an Organizational Unit first.', 'No Selection', 'OK', 'Information')
-        }
-    })
-    $OUPickerHash.CancelButton.Add_Click({$OUPickerHash.Window.Close()})
-
+    # Enumerate OUs so the operator can choose by number.
+    $ous = New-Object System.Collections.ArrayList
     try {
-        # Verify domain object is available before proceeding
-        if (-not $domain -or [string]::IsNullOrEmpty($domain.Name)) {
-            Write-ErrorLog "Domain object is not properly initialized"
-            throw "Domain information is not available"
+        $rootDse = [adsi]""
+        $defaultNc = [string]$rootDse.Properties["defaultNamingContext"][0]
+        if ($defaultNc) {
+            $searcher = New-Object System.DirectoryServices.DirectorySearcher
+            $searcher.SearchRoot = [adsi]"LDAP://$defaultNc"
+            $searcher.Filter = "(objectClass=organizationalUnit)"
+            $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+            $searcher.PageSize = 1000
+            foreach ($r in $searcher.FindAll()) { [void]$ous.Add([string]$r.Properties["distinguishedname"][0]) }
+            $searcher.Dispose()
         }
-        
-        # Building the tree runs synchronously on the UI thread; show a wait cursor
-        $uiHash.Window.Cursor = [System.Windows.Input.Cursors]::Wait
-
-        # Root the search at the verified domain rather than the default naming context
-        $domainRoot = $domain.GetDirectoryEntry()
-
-        $rootItem = New-Object System.Windows.Controls.TreeViewItem
-        $rootItem.Header = $domain.Name
-        $rootItem.Tag = $domainRoot.Properties['distinguishedName'].Value
-
-        # Use non-recursive approach to prevent stack overflow
-        function Add-ChildNodes($node, $maxDepth = 3, $currentDepth = 0){
-            try {
-                # Prevent infinite recursion and stack overflow
-                if ($currentDepth -ge $maxDepth) {
-                    Write-InfoLog "Maximum depth ($maxDepth) reached for OU: $($node.Tag)"
-                    return
-                }
-                
-                # Use a local searcher so recursion cannot mutate the parent's search state
-                $childSearcher = New-Object System.DirectoryServices.DirectorySearcher
-                $childSearcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$($node.Tag)")
-                $childSearcher.Filter = "(objectCategory=organizationalUnit)"
-                $childSearcher.SearchScope = "OneLevel"
-                $childOUs = $childSearcher.FindAll()
-                
-                # Limit the number of child OUs to prevent performance issues
-                $maxChildren = 50
-                $childCount = 0
-                
-                foreach ($childOU in $childOUs) {
-                    if ($childCount -ge $maxChildren) {
-                        Write-InfoLog "Limited child OUs to $maxChildren for performance"
-                        break
-                    }
-                    
-                    $childItem = New-Object System.Windows.Controls.TreeViewItem
-                    $childItem.Header = $childOU.Properties.name[0]
-                    $childItem.Tag = $childOU.Properties.distinguishedname[0]
-                    
-                    # Only add children if we haven't reached max depth
-                    if ($currentDepth -lt ($maxDepth - 1)) {
-                        Add-ChildNodes $childItem $maxDepth ($currentDepth + 1)
-                    }
-                    
-                    $node.Items.Add($childItem) | Out-Null
-                    $childCount++
-                }
-                
-                Write-InfoLog "Added $childCount child OUs to $($node.Header)"
-                
-            } catch {
-                Write-WarningLog "Error adding child nodes for $($node.Tag): $($_.Exception.Message)"
-            }
-        }
-        
-        # Start building the tree with depth limit
-        Write-InfoLog "Starting to build OU tree for $($domain.Name)"
-        Add-ChildNodes $rootItem 3 0
-        Write-InfoLog "Finished building OU tree for $($domain.Name)"
-        $OUPickerHash.OUTree.Items.Add($rootItem) | Out-Null
-        $uiHash.Window.Cursor = $null
-            Write-InfoLog "OU tree completed and added to TreeView"
     } catch {
-        $uiHash.Window.Cursor = $null
-        Write-ErrorLog "Error building OU tree: $($_.Exception.Message)"
-        [System.Windows.MessageBox]::Show(
-            "Error building the Organizational Unit tree.`n`nError: $($_.Exception.Message)`n`nYou may not have sufficient permissions to browse Active Directory.",
-            "OU Tree Error",
-            'OK',
-            'Warning'
-        )
-        return
+        Write-WarningLog "Could not enumerate OUs: $($_.Exception.Message)"
     }
 
-$OUPickerHash.Window.ShowDialog() | Out-Null
-    #endregion
-    
-#Verify user didn't hit 'cancel' before processing
-    if($OUPickerHash.SelectedOU){
-        #Update status
-        Update-Status 'Querying Active Directory for Computers...'
-
-        try {
-                Write-InfoLog "Searching LDAP path for computers in OU: $($OUPickerHash.SelectedOU)"
-                $Searcher = [adsisearcher]''
-                $Searcher.SearchRoot= [adsi]"LDAP://$($OUPickerHash.SelectedOU)"
-                $Searcher.Filter = '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
-                $Searcher.PropertiesToLoad.Add('name') | Out-Null
-
-                Write-InfoLog "Executing LDAP search for computers..."
-                $Results = $Searcher.FindAll()
-                Write-InfoLog "LDAP search completed. Found $($Results.Count) results"
-                
-                if($Results){
-                    #Add computers found
-                    Write-InfoLog "Processing $($Results.Count) computer results from AD"
-                    $computerNames = $Results | ForEach-Object { $_.Properties.name[0] }
-                    Write-InfoLog "Extracted computer names: $($computerNames -join ', ')"
-                    
-                    # Debug: Check if AddEntry function exists
-                    if ($AddEntry) {
-                        Write-InfoLog "AddEntry function exists, calling it with $($computerNames.Count) computers"
-                        Write-InfoLog "Current GUI state before AddEntry call:"
-                        Write-InfoLog "  - Window exists: $($uiHash.Window -ne $null)"
-                        Write-InfoLog "  - Window IsVisible: $($uiHash.Window.IsVisible)"
-                        Write-InfoLog "  - Window IsLoaded: $($uiHash.Window.IsLoaded)"
-                        Write-InfoLog "  - ListView exists: $($uiHash.ListView -ne $null)"
-                        Write-InfoLog "  - clientObservable exists: $($uiHash.clientObservable -ne $null)"
-                        Write-InfoLog "  - Current ListView count: $($uiHash.Listview.Items.Count)"
-                        
-                        # Call AddEntry with detailed error handling
-                        try {
-                            Write-InfoLog "About to call AddEntry with computers: $($computerNames -join ', ')"
-                            & $AddEntry $computerNames
-                            Write-InfoLog "AddEntry function completed successfully"
-                        } catch {
-                            Write-ErrorLog "CRITICAL ERROR in AddEntry during AD import: $($_.Exception.Message)"
-                            Write-ErrorLog "AddEntry error type: $($_.Exception.GetType().FullName)"
-                            Write-ErrorLog "AddEntry stack trace: $($_.ScriptStackTrace)"
-                            Write-ErrorLog "AddEntry thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
-                            
-                            if ($_.Exception.InnerException) {
-                                Write-ErrorLog "AddEntry inner exception: $($_.Exception.InnerException.Message)"
-                            }
-                            
-                            # Show error to user
-                            [System.Windows.MessageBox]::Show(
-                                "An error occurred while adding computers from Active Directory to the list.`n`nError: $($_.Exception.Message)`n`nThis may be a threading or UI synchronization issue. Check the debug log for more details.",
-                                "AD Import Error",
-                                'OK',
-                                'Error'
-                            )
-                            
-                            # Still update the status to show partial success
-                            Update-StatusBackground "AD import failed: $($_.Exception.Message)"
-                            return
-                        }
-                    } else {
-                        Write-ErrorLog "AddEntry function not found!"
-                        [System.Windows.MessageBox]::Show(
-                            "Internal error: AddEntry function not available.",
-                            "Internal Error",
-                            'OK',
-                            'Error'
-                        )
-                        return
-                    }
-                    
-                    Write-InfoLog "Imported $($Results.Count) computers from Active Directory."
-                    Write-InfoLog "Final GUI state after AddEntry:"
-                    Write-InfoLog "  - Window exists: $($uiHash.Window -ne $null)"
-                    Write-InfoLog "  - Window IsVisible: $($uiHash.Window.IsVisible)"
-                    Write-InfoLog "  - ListView exists: $($uiHash.ListView -ne $null)"
-                    Write-InfoLog "  - clientObservable exists: $($uiHash.clientObservable -ne $null)"
-                    Write-InfoLog "  - Final ListView count: $($uiHash.Listview.Items.Count)"
-
-                    #Update status
-                    Update-StatusBackground "Successfully Imported $($Results.Count) computers from Active Directory."
-                } else {
-                    Write-WarningLog "No computers found for the given LDAP path in AD."
-                    #Update status
-                    Update-StatusBackground 'No computers found, verify LDAP path...'
-                    [System.Windows.MessageBox]::Show("No computers found in the selected Organizational Unit.", "No Computers Found", 'OK', 'Warning')
-                }
-        } catch [System.Runtime.InteropServices.COMException] {
-            Write-ErrorLog "LDAP search error: $($_.Exception.Message)"
-            [System.Windows.MessageBox]::Show(
-                "There was an error accessing Active Directory during the search process. Please check your connection and try again.",
-                "LDAP Search Error",
-                'OK',
-                'Error'
-            )
-        } catch {
-            Write-ErrorLog "Unexpected error during LDAP search: $($_.Exception.Message)"
-            [System.Windows.MessageBox]::Show(
-                "An unexpected error occurred while querying Active Directory.`n`nError: $($_.Exception.Message)`n`nPlease check your connection or permissions.",
-                "LDAP Search Error",
-                'OK',
-                'Error'
-            )
+    $chosenOu = $null
+    if ($ous.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Organizational Units:" -ForegroundColor White
+        for ($n = 0; $n -lt $ous.Count; $n++) { Write-Host ("  [{0,3}] {1}" -f ($n + 1), $ous[$n]) }
+        Write-Host "  [  0] (type an LDAP path manually)" -ForegroundColor DarkGray
+        $pick = Read-Host "  Choose an OU by number (Enter to cancel)"
+        if ([string]::IsNullOrWhiteSpace($pick)) { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
+        if ($pick -match "^\d+$") {
+            $idx = [int]$pick
+            if ($idx -ge 1 -and $idx -le $ous.Count) { $chosenOu = $ous[$idx - 1] }
         }
+    }
+    if (-not $chosenOu) {
+        $chosenOu = Read-Host "  LDAP path of the OU (e.g. OU=Workstations,DC=contoso,DC=com)"
+        if ([string]::IsNullOrWhiteSpace($chosenOu)) { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
+    }
+
+    Write-InfoLog "Searching LDAP path for computers in OU: $chosenOu"
+    try {
+        $Searcher = New-Object System.DirectoryServices.DirectorySearcher
+        $Searcher.SearchRoot = [adsi]"LDAP://$chosenOu"
+        $Searcher.Filter = "(objectCategory=computer)"
+        $Searcher.PageSize = 1000
+        $searchResults = @($Searcher.FindAll())
+        $Searcher.Dispose()
+
+        if ($searchResults.Count -eq 0) {
+            Write-Host "  No computers found in that OU." -ForegroundColor Yellow
+            return
+        }
+        Write-Host ""
+        Write-Host "  Found $($searchResults.Count) computer(s) in $chosenOu" -ForegroundColor White
+        if (-not (Read-WuuYesNo -Prompt "Add all of them to the list?" -Default $true)) {
+            Write-Host "  Cancelled." -ForegroundColor Yellow; return
+        }
+        $names = @($searchResults | ForEach-Object { [string]$_.Properties["name"][0] } | Where-Object { $_ })
+        & $AddEntry $names
+        Write-Host "  Added $($names.Count) computer(s) from Active Directory." -ForegroundColor Green
+    } catch [System.Runtime.InteropServices.COMException] {
+        Write-ErrorLog "COM/RPC error querying AD: $($_.Exception.Message)"
+        Write-Host "  Communication error with Active Directory: $($_.Exception.Message)" -ForegroundColor Red
+    } catch {
+        Write-ErrorLog "AD search failed: $($_.Exception.Message)"
+        Write-Host "  AD search failed: $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
@@ -3053,8 +2430,8 @@ $eventAddFile = { #Add computers from CSV or TXT file with advanced options
             
             # Get existing computers to check for duplicates
             $existingComputers = @()
-            if ($uiHash.Listview.Items.Count -gt 0) {
-                $existingComputers = $uiHash.Listview.Items | Select-Object -ExpandProperty Computer
+            if ($stateStore.Rows.Count -gt 0) {
+                $existingComputers = (Get-WuuComputerRow -Store $stateStore | Select-Object -ExpandProperty Computer)
             }
             
             if ($fileExtension -eq '.csv') {
@@ -3308,7 +2685,7 @@ $eventInstallUpdates = {
 
 #region System Management
 $eventRemoveOfflineComputer = {
-    $uiHash.Listview.Items | ForEach-Object {
+    (Get-WuuComputerRow -Store $stateStore) | ForEach-Object {
         if (-not $_.Runspace) {
             $item = $_
             try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
@@ -3445,135 +2822,10 @@ $eventPasteComputers = {
 }
 #endregion
 
-#region Keyboard and Context Menu Events
-$eventKeyDown = {
-    If ([System.Windows.Input.Keyboard]::IsKeyDown('RightCtrl') -OR [System.Windows.Input.Keyboard]::IsKeyDown('LeftCtrl')) {
-        # Check for Shift+Ctrl combinations
-        If ([System.Windows.Input.Keyboard]::IsKeyDown('RightShift') -OR [System.Windows.Input.Keyboard]::IsKeyDown('LeftShift')) {
-            Switch ($_.Key) {
-            'C' {&$eventCopyStatus}  # Ctrl+Shift+C = Copy status messages only
-            Default {$Null}
-            }
-        } Else {
-            Switch ($_.Key) {
-            'A' {$uiHash.Listview.SelectAll()}
-            'C' {&$eventCopyComputers}  # Ctrl+C = Copy detailed computer info
-            'V' {&$eventPasteComputers}
-            'O' {&$eventAddFile}  # Ctrl+O = Add computers from file
-            'S' {&$eventSaveComputerList}
-            Default {$Null}
-            }
-        }
-    }
-    ElseIf ($_.Key -eq 'Delete') {&$removeEntry @($uiHash.Listview.SelectedItems)}
-}
-$eventRightClick = {
-    try {
-        Write-InfoLog "Right-click event triggered"
-        # Enable/Disable buttons as needed
-        
-        # Check if ListView is properly initialized (but allow empty lists)
-        if (-not $uiHash.Listview) {
-            Write-ErrorLog "ListView control not found"
-            throw "ListView control is not initialized"
-        }
-        
-        if (-not $uiHash.Listview.Items -or $uiHash.Listview.Items.Count -eq 0) {
-            Write-InfoLog "ListView is empty, disabling item-specific context menu options"
-            # Disable all context menu items for empty ListView
-            if ($uiHash.RemoveComputerContext) { $uiHash.RemoveComputerContext.IsEnabled = $False }
-            if ($uiHash.RemoteDesktopContext) { $uiHash.RemoteDesktopContext.IsEnabled = $False }
-            if ($uiHash.CheckUpdatesContext) { $uiHash.CheckUpdatesContext.IsEnabled = $False }
-            if ($uiHash.DownloadUpdatesContext) { $uiHash.DownloadUpdatesContext.IsEnabled = $False }
-            if ($uiHash.InstallUpdatesContext) { $uiHash.InstallUpdatesContext.IsEnabled = $False }
-            if ($uiHash.RestartContext) { $uiHash.RestartContext.IsEnabled = $False }
-            if ($uiHash.ShowInstalledContext) { $uiHash.ShowInstalledContext.IsEnabled = $False }
-            if ($uiHash.ShowUpdatesContext) { $uiHash.ShowUpdatesContext.IsEnabled = $False }
-            if ($uiHash.UpdateHistoryMenu) { $uiHash.UpdateHistoryMenu.IsEnabled = $False }
-            if ($uiHash.ViewUpdateLogContext) { $uiHash.ViewUpdateLogContext.IsEnabled = $False }
-            if ($uiHash.WindowsUpdateServiceMenu) { $uiHash.WindowsUpdateServiceMenu.IsEnabled = $False }
-            Write-InfoLog "Context menu items disabled for empty ListView"
-        } elseif ($uiHash.Listview.SelectedItems.count -eq 0) {
-            # Safe context menu control access
-            if ($uiHash.RemoveComputerContext) { $uiHash.RemoveComputerContext.IsEnabled = $False }
-            if ($uiHash.RemoteDesktopContext) { $uiHash.RemoteDesktopContext.IsEnabled = $False }
-            if ($uiHash.CheckUpdatesContext) { $uiHash.CheckUpdatesContext.IsEnabled = $False }
-            if ($uiHash.DownloadUpdatesContext) { $uiHash.DownloadUpdatesContext.IsEnabled = $False }
-            if ($uiHash.InstallUpdatesContext) { $uiHash.InstallUpdatesContext.IsEnabled = $False }
-            if ($uiHash.RestartContext) { $uiHash.RestartContext.IsEnabled = $False }
-            if ($uiHash.ShowInstalledContext) { $uiHash.ShowInstalledContext.IsEnabled = $False }
-            if ($uiHash.ShowUpdatesContext) { $uiHash.ShowUpdatesContext.IsEnabled = $False }
-            if ($uiHash.UpdateHistoryMenu) { $uiHash.UpdateHistoryMenu.IsEnabled = $False }
-            if ($uiHash.ViewUpdateLogContext) { $uiHash.ViewUpdateLogContext.IsEnabled = $False }
-            if ($uiHash.WindowsUpdateServiceMenu) { $uiHash.WindowsUpdateServiceMenu.IsEnabled = $False }
-            Write-InfoLog "Context menu items disabled, no selection"
-        } elseif ($uiHash.Listview.SelectedItems.count -eq 1) {
-            # Safe context menu control access for single selection
-            if ($uiHash.RemoveComputerContext) { $uiHash.RemoveComputerContext.IsEnabled = $True }
-            if ($uiHash.RemoteDesktopContext) { $uiHash.RemoteDesktopContext.IsEnabled = $True }
-            if ($uiHash.CheckUpdatesContext) { $uiHash.CheckUpdatesContext.IsEnabled = $True }
-            $selection = $uiHash.Listview.SelectedItems[0]
-            Write-InfoLog "Processing single selection: $($selection.Computer)"
-            if ($selection -and $selection.Downloaded -ge 1) {
-                if ($uiHash.InstallUpdatesContext) { $uiHash.InstallUpdatesContext.IsEnabled = $True }
-            } else {
-                if ($uiHash.InstallUpdatesContext) { $uiHash.InstallUpdatesContext.IsEnabled = $False }
-            }
-            if ($uiHash.RestartContext) { $uiHash.RestartContext.IsEnabled = $True }
-            if ($uiHash.ShowInstalledContext) { $uiHash.ShowInstalledContext.IsEnabled = $True }
-            if ($selection -and $selection.Available -gt 0) {
-                if ($uiHash.ShowUpdatesContext) { $uiHash.ShowUpdatesContext.IsEnabled = $True }
-                if ($uiHash.DownloadUpdatesContext) { $uiHash.DownloadUpdatesContext.IsEnabled = $True }
-            } else {
-                if ($uiHash.ShowUpdatesContext) { $uiHash.ShowUpdatesContext.IsEnabled = $False }
-                if ($uiHash.DownloadUpdatesContext) { $uiHash.DownloadUpdatesContext.IsEnabled = $False }
-            }
-            if ($uiHash.UpdateHistoryMenu) { $uiHash.UpdateHistoryMenu.IsEnabled = $True }
-            if ($uiHash.ViewUpdateLogContext) { $uiHash.ViewUpdateLogContext.IsEnabled = $True }
-            if ($uiHash.WindowsUpdateServiceMenu) { $uiHash.WindowsUpdateServiceMenu.IsEnabled = $True }
-            Write-InfoLog "Context menu items enabled for single selection"
-        } else {
-            # Safe context menu control access for multiple selection
-            if ($uiHash.RemoveComputerContext) { $uiHash.RemoveComputerContext.IsEnabled = $True }
-            if ($uiHash.RemoteDesktopContext) { $uiHash.RemoteDesktopContext.IsEnabled = $False }
-            if ($uiHash.CheckUpdatesContext) { $uiHash.CheckUpdatesContext.IsEnabled = $True }
-            if ($uiHash.DownloadUpdatesContext) { $uiHash.DownloadUpdatesContext.IsEnabled = $True }
-            if ($uiHash.InstallUpdatesContext) { $uiHash.InstallUpdatesContext.IsEnabled = $True }
-            if ($uiHash.RestartContext) { $uiHash.RestartContext.IsEnabled = $True }
-            if ($uiHash.ShowInstalledContext) { $uiHash.ShowInstalledContext.IsEnabled = $False }
-            if ($uiHash.ShowUpdatesContext) { $uiHash.ShowUpdatesContext.IsEnabled = $False }
-            if ($uiHash.UpdateHistoryMenu) { $uiHash.UpdateHistoryMenu.IsEnabled = $False }
-            if ($uiHash.ViewUpdateLogContext) { $uiHash.ViewUpdateLogContext.IsEnabled = $False }
-            if ($uiHash.WindowsUpdateServiceMenu) { $uiHash.WindowsUpdateServiceMenu.IsEnabled = $True }
-            Write-InfoLog "Context menu items enabled for multiple selection"
-        }
-    } catch {
-        Write-ErrorLog "Right-click context menu error: $($_.Exception.Message)"
-        
-        # Only show persistent status message for actual errors, not normal operations
-        if ($_.Exception.Message -notmatch "ListView is not ready|ListView control is not initialized") {
-            Update-Status "Error in Right-Click Context Menu: $($_.Exception.Message)"
-        }
-        
-        if ($EnableDebugLogging) {
-            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-            $logEntry = "[$timestamp] [ERROR] Right-click context menu crash: $($_.Exception.GetType().FullName) - $($_.Exception.Message)"
-            Write-WuuLogEntry -Message $logEntry
-            if ($_.Exception.InnerException) {
-                $logEntry = "[$timestamp] [ERROR] Inner exception: $($_.Exception.InnerException.Message)"
-                Write-WuuLogEntry -Message $logEntry
-            }
-            $logEntry = "[$timestamp] [ERROR] Stack trace: $($_.ScriptStackTrace)"
-            Write-WuuLogEntry -Message $logEntry
-        }
-    }
-    Write-InfoLog "Right-click processing completed"
-}
-#endregion
 
 #region Configuration Management
 $eventSaveComputerList = {
-    If ($uiHash.Listview.Items.count -gt 0) {
+    If ($stateStore.Rows.Count -gt 0) {
         #Save dialog
         $dlg = new-object Microsoft.Win32.SaveFileDialog
         $dlg.FileName = 'Computer List'
@@ -3586,7 +2838,7 @@ $eventSaveComputerList = {
         #Verify file was selected
         If (-Not ([system.string]::IsNullOrEmpty($filepath))) {
             #Save file
-            $uiHash.Listview.Items | Select-Object -Expand Computer | Out-File $filePath -Force
+            (Get-WuuComputerRow -Store $stateStore | Select-Object -Expand Computer) | Out-File $filePath -Force
 
             #Update status
             Update-Status "Computer List saved to $filePath"
@@ -3600,7 +2852,7 @@ $eventSaveComputerList = {
 
 # Save encrypted computer list
 $eventSaveConfig = {
-    If ($uiHash.Listview.Items.count -gt 0) {
+    If ($stateStore.Rows.Count -gt 0) {
         try {
             # Suspend background processing to prevent interference with password dialog
             Suspend-BackgroundProcessing -Reason "encrypted computer list save"
@@ -3617,7 +2869,7 @@ $eventSaveConfig = {
             # Default path for config
             $configPath = Join-Path $WuuRoot 'ComputerList.config'
             
-            $saveResult = Save-ComputerListConfig -ComputerList $uiHash.Listview.Items -ConfigPath $configPath -Password $securePassword
+            $saveResult = Save-ComputerListConfig -ComputerList (Get-WuuComputerRow -Store $stateStore) -ConfigPath $configPath -Password $securePassword
             
             if ($saveResult.Success) {
                 Update-Status "Encrypted computer list saved to $configPath"
@@ -3708,13 +2960,50 @@ $eventLoadConfig = {
 #endregion
 
 #region Update Information and Service Management
+# Console edition: these handlers previously wrote to Out-GridView (a WPF-only cmdlet that
+# does not exist headlessly) and read $uiHash.Listview.SelectedItems. They now resolve rows
+# from the store and print to the console. Show-WuuObjectTable is a small local helper so the
+# output stays in the transcript (docs/CLI_AUDIT_PLAN.md section 5.3).
+function Show-WuuObjectTable {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
+        [Parameter(Mandatory)][string]$Title,
+        [int]$MaxWidth = 100
+    )
+    Write-Host ''
+    Write-Host ("  $Title") -ForegroundColor White
+    Write-Host ('  ' + ('-' * [Math]::Min($MaxWidth, 100))) -ForegroundColor DarkGray
+    if (-not $Items -or $Items.Count -eq 0) {
+        Write-Host '  (nothing to show)' -ForegroundColor DarkGray
+        return
+    }
+    foreach ($item in $Items) {
+        $props = @($item.PSObject.Properties | Where-Object { $_.Name -ne 'PSComputerName' })
+        foreach ($p in $props) {
+            $v = [string]$p.Value
+            if ([string]::IsNullOrWhiteSpace($v)) { continue }
+            if ($v.Length -gt $MaxWidth) { $v = $v.Substring(0, $MaxWidth - 1) + [char]0x2026 }
+            Write-Host ("  {0,-24} {1}" -f ($p.Name + ':'), $v)
+        }
+        Write-Host ''
+    }
+}
+
 $eventShowAvailableUpdates = {
-    ForEach ($Computer in $uiHash.Listview.SelectedItems){
-        $updatesHash[$computer.computer] | Select-Object Title,Description,IsDownloaded,IsMandatory,IsUninstallable,@{n='CanRequestUserInput';e={$_.InstallationBehavior.CanRequestUserInput}},LastDeploymentChangeTime,@{n='MaxDownloadSize (MB)';e={'{0:N2}' -f ($_.MaxDownloadSize/1MB)}},@{n='MinDownloadSize (MB)';e={'{0:N2}' -f ($_.MinDownloadSize/1MB)}},RecommendedCpuSpeed,RecommendedHardDiskSpace,RecommendedMemory,DriverClass,DriverManufacturer,DriverModel,DriverProvider,DriverVerDate | Out-GridView -Title "$($Computer.computer)'s Available Updates"
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Show available updates for which computers?')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    ForEach ($Computer in $rows) {
+        $updates = @($updatesHash[$computer.computer])
+        Show-WuuObjectTable -Items $updates -Title "$($Computer.computer): available updates ($($updates.Count))"
+        foreach ($u in $updates) {
+            Write-Host ("  - {0}" -f $u.Title)
+        }
     }
 }
 $eventShowInstalledUpdates = {
-    ForEach ($Computer in $uiHash.Listview.SelectedItems){
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Show installed updates for which computers?')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    ForEach ($Computer in $rows){
         $comResult = Invoke-RemoteComWithTimeout -ComputerName $Computer.computer -TimeoutSeconds 30 -ScriptBlock {
             param($ComputerName)
             try {
@@ -3735,7 +3024,7 @@ $eventShowInstalledUpdates = {
             }
         }
         if ($comResult.Success) {
-            $comResult.Output | Out-GridView -Title "$($Computer.computer)'s Installed Updates"
+            Show-WuuObjectTable -Items @($comResult.Output) -Title "$($Computer.computer): installed updates"
         } else {
             Update-Status "Failed to show installed updates for $($Computer.computer): $($comResult.Error)"
         }
@@ -3800,9 +3089,9 @@ $eventAuditWSUSUpdates = {
                 $audit | Select-Object Computer, WSUS_Server, Standard_Search_Count, Including_Hidden_Count, WSUS_Assigned_Count, Downloaded_Count, Not_Downloaded_Count, Reboot_Required | Format-List | Out-String | Write-Host -ForegroundColor Cyan
                 
                 if ($audit.Updates.Count -gt 0) {
-                    $audit.Updates | Out-GridView -Title "WSUS Audit: $($Computer.computer) - $($audit.Updates.Count) updates found"
+                    Show-WuuObjectTable -Items @($audit.Updates) -Title "WSUS Audit: $($Computer.computer) - $($audit.Updates.Count) updates found"
                 } else {
-                    [PSCustomObject]@{Title="No updates found"} | Out-GridView -Title "WSUS Audit: $($Computer.computer)"
+                    Write-Host "  WSUS Audit: $($Computer.computer) - no updates found" -ForegroundColor DarkGray
                 }
             }
         } else {
@@ -3812,7 +3101,9 @@ $eventAuditWSUSUpdates = {
 }
 $eventShowUpdateHistory = {
     Try{
-        $computer = $uiHash.Listview.SelectedItems | Select-Object -First 1
+        $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Show update history for which computers?')
+        if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+        foreach ($computer in $rows) {
         $comResult = Invoke-RemoteComWithTimeout -ComputerName $computer.computer -TimeoutSeconds 30 -ScriptBlock {
             param($ComputerName)
             try {
@@ -3836,23 +3127,37 @@ $eventShowUpdateHistory = {
         }
         
         if ($comResult.Success) {
-            $comResult.Output | Out-GridView -Title "$($computer.computer)'s Update History"
+            Show-WuuObjectTable -Items @($comResult.Output) -Title "$($computer.computer): update history"
         } else {
             throw "Failed to retrieve update history: $($comResult.Error)"
         }
+        }   # end foreach ($computer in $rows)
     } Catch{
             $computer.Status = "Error Occured: $($_.exception.Message)"
         if ($stateStore) { $stateStore.Touch() }
     }
 }
 $eventViewUpdateLog = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
-        &"\\$($_.computer)\c$\windows\windowsupdate.log"
+    # Console edition: print the local copy of the Windows Update log for each target.
+    # (The GUI opened \\<computer>\c$\windows\windowsupdate.log with the default handler.)
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'View Windows Update log for which computers?')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    foreach ($r in $rows) {
+        $p = "\\$($r.computer)\c`$\windows\windowsupdate.log"
+        if (Test-Path -LiteralPath $p) {
+            Write-Host "  --- $($r.computer) ---" -ForegroundColor White
+            Get-Content -LiteralPath $p -Tail 200 | Write-Host
+        } else {
+            Write-Host "  $($r.computer): log not reachable at $p" -ForegroundColor Yellow
+        }
     }
 }
 $eventWUServiceAction = {
-    Param ($Action)
-    $uiHash.Listview.SelectedItems | ForEach-Object {
+    Param ($Action, $TargetComputer)
+    # Console edition: when called from the interactive menu the target(s) are already
+    # resolved; fall back to the store's full list otherwise.
+    $targets = if ($TargetComputer) { @($TargetComputer) } else { @(Get-WuuComputerRow -Store $stateStore) }
+    $targets | ForEach-Object {
         if (-not $_.Runspace) {
             $item = $_
             try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
@@ -3938,10 +3243,7 @@ $WUServiceAction = {
         
             $computer.Status = "Service $Action failed: $($_.Exception.Message)"
             # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if($listViewItem) {
         $Computer.Color = 'Error'
-            }
         if ($stateStore) { $stateStore.Touch() }
     }
 }
@@ -3968,7 +3270,7 @@ $GetErrors = {
     }
     
     # Get computer-specific errors from status messages
-    foreach ($computer in $uiHash.Listview.Items) {
+    foreach ($computer in (Get-WuuComputerRow -Store $stateStore)) {
         if ($computer.Status -match '^Error|failed:|timeout') {
             $errorInfo += [PSCustomObject]@{
                 Timestamp = Get-Date
@@ -4045,95 +3347,223 @@ $eventSetDomainCredentials = {
 }
 #endregion
 
-#endregion
+#region Console action layer (replaces the GUI context menu / event wiring)
+<#
+The GUI selected rows via $uiHash.Listview.SelectedItems and invoked $event* closures that
+read that selection. The console has no ListView, so each action resolves its targets from the
+state store through Read-WuuSelection and then calls the SAME underlying payload/handler.
+That keeps one implementation per operation - the console wrappers only do selection and
+confirmation, which is exactly the part that differs from a GUI.
 
-#region Event Handlers
-$uiHash.ActionMenu.Add_SubmenuOpened($eventActionMenu) #Action Menu
-$uiHash.AddADContext.Add_Click($eventAddAD) #Add Computers From AD (Context)
-$uiHash.AddADMenu.Add_Click($eventAddAD) #Add Computers From AD (Menu)
-$uiHash.AddComputerContext.Add_Click($eventAddComputer) #Add Computers (Context)
-$uiHash.AddComputerMenu.Add_Click($eventAddComputer) #Add Computers (Menu)
-$uiHash.AddFileContext.Add_Click($eventAddFile) #Add Computers From File (Context)
-$uiHash.BrowseFileMenu.Add_Click($eventAddFile) #Add Computers From File (Menu)
-$uiHash.CheckUpdatesContext.Add_Click($eventGetUpdates) #Check For Updates (Context)
-$uiHash.ClearComputerListMenu.Add_Click($clearComputerList) #Clear Computer List
-$uiHash.DownloadUpdatesContext.Add_Click($eventDownloadUpdates) #Download Updates
-$uiHash.ExitMenu.Add_Click({$uiHash.Window.Close()}) #Exit
-$uiHash.UpdateHistoryMenu.Add_Click($eventShowUpdateHistory) #Get Update History
-$uiHash.ExportListMenu.Add_Click($eventSaveComputerList) #Exports Computer To File
-$uiHash.SaveConfigMenu.Add_Click($eventSaveConfig) #Save Encrypted Computer List
-$uiHash.LoadConfigMenu.Add_Click($eventLoadConfig) #Load Encrypted Computer List
-$uiHash.InstallUpdatesContext.Add_Click($eventInstallUpdates) #Install Updates
-$uiHash.Listview.Add_MouseRightButtonUp($eventRightClick) #On Right Click
-# Removed PreviewMouseDown event handler to prevent GUI hangs
-$uiHash.OfflineHostsMenu.Add_Click($eventRemoveOfflineComputer) #Remove Offline Computers
-$uiHash.RemoteDesktopContext.Add_Click({
-    try {
-        # Validate selection
-        if (-not $uiHash.Listview.SelectedItems -or $uiHash.Listview.SelectedItems.Count -eq 0) {
-            $uiHash.Window.Dispatcher.Invoke([action]{$uiHash.StatusTextBox.Text="Please select a computer first"}) | Out-Null
-            return
+Mutating actions confirm before running (the audit layer will additionally require a reason
+in Phase 4). Non-mutating actions run immediately.
+#>
+$consoleActions = [hashtable]::Synchronized(@{ Quit = $false })
+
+# --- helpers -----------------------------------------------------------------------------
+$consoleActions.ShowHelp = {
+    Write-Host ''
+    Write-Host '  WUU2-CLI - console Windows Update utility' -ForegroundColor White
+    Write-Host '  ------------------------------------------------------------------' -ForegroundColor DarkGray
+    Write-Host '  Keys operate on the computer list in the status table above.' -ForegroundColor Gray
+    Write-Host '  Most actions prompt for computer name(s); enter "all" for every row,' -ForegroundColor Gray
+    Write-Host '  a comma-separated list, or an unambiguous name prefix.' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  Auto download/install/reboot apply to checks and downloads started from' -ForegroundColor Gray
+    Write-Host '  here; press [t] to toggle them.' -ForegroundColor Gray
+    Write-Host ''
+}
+
+$consoleActions.EventToggleSettings = {
+    $s = $stateStore.Settings
+    $s.AutoDownload = -not $s.AutoDownload
+    $s.AutoInstall  = -not $s.AutoInstall
+    $s.AutoReboot   = -not $s.AutoReboot
+    Update-Status ("Auto download {0}, auto install {1}, auto reboot {2}" -f `
+        $(if ($s.AutoDownload) { 'ON' } else { 'off' }), `
+        $(if ($s.AutoInstall) { 'ON' } else { 'off' }), `
+        $(if ($s.AutoReboot) { 'ON' } else { 'off' }))
+    Write-Host '  Settings updated.' -ForegroundColor Green
+}
+
+# --- selection-driven action adapters ---------------------------------------------------
+# Each adapter: pick rows -> (confirm if mutating) -> run the existing handler against them.
+$consoleActions.EventGetUpdates = {
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Check which computers? ("all" for every row, Enter to cancel)')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    foreach ($r in $rows) {
+        if ($r.PSObject.Properties['RetryCount']) { $r.RetryCount = 0; $r.RetryAt = $null }
+        if (-not $r.Runspace) {
+            if ($r.PSObject.Properties['Pending']) { $r.Pending = $false }
+            [void](Start-UpdateCheckJob -ComputerItem $r)
+        } else {
+            $temp = New-Object PSObject -Property @{
+                PowerShell = $null; Runspace = $null; StartTime = Get-Date; Computer = $r.Computer
+            }
+            $temp.PowerShell = [powershell]::Create().AddScript($GetUpdates).AddArgument($r)
+            $temp.PowerShell.Runspace = $r.Runspace
+            $temp.Runspace = $temp.PowerShell.BeginInvoke()
+            $jobs.Add($temp) | Out-Null
         }
-        
-        # Validate computer property exists
-        $selectedComputer = $uiHash.Listview.SelectedItems.Computer
-        if ([string]::IsNullOrWhiteSpace($selectedComputer)) {
-            $uiHash.Window.Dispatcher.Invoke([action]{$uiHash.StatusTextBox.Text="Selected item has no computer name"}) | Out-Null
-            return
-        }
-        
-        # Launch RDP
-        mstsc.exe /v $selectedComputer
-        Write-InfoLog "Launched RDP to $selectedComputer"
-    } catch {
-        $errorMsg = $_.Exception.Message
-        Write-ErrorLog "Error in RemoteDesktopContext click: $errorMsg"
-        $uiHash.Window.Dispatcher.Invoke([action]{
-            $uiHash.StatusTextBox.Text = "RDP failed: $errorMsg"
-        }) | Out-Null
     }
-}) #RDP
-$uiHash.RemoveComputerContext.Add_Click({
-    try {
-        # Validate selection
-        if (-not $uiHash.Listview.SelectedItems -or $uiHash.Listview.SelectedItems.Count -eq 0) {
-            $uiHash.Window.Dispatcher.Invoke([action]{$uiHash.StatusTextBox.Text="Please select computers to remove first"}) | Out-Null
-            return
-        }
-        
-        # Call removeEntry with validated selection
-        &$removeEntry @($uiHash.Listview.SelectedItems)
-        Write-InfoLog "Removed $($uiHash.Listview.SelectedItems.Count) computers via context menu"
-    } catch {
-        $errorMsg = $_.Exception.Message
-        Write-ErrorLog "Error in RemoveComputerContext click: $errorMsg"
-        $uiHash.Window.Dispatcher.Invoke([action]{
-            $uiHash.StatusTextBox.Text = "Remove failed: $errorMsg"
-        }) | Out-Null
+    Write-Host "  Queued update check for $($rows.Count) computer(s)." -ForegroundColor Green
+}
+
+$consoleActions.EventDownloadUpdates = {
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Download updates for which computers?')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    if (-not (Read-WuuYesNo -Prompt "Download updates to $($rows.Count) computer(s)?" -Default $true)) {
+        Write-Host '  Cancelled.' -ForegroundColor Yellow; return
     }
-}) #Delete Computers
-$uiHash.RestartContext.Add_Click($eventRestartComputer) #Restart Computer
-$uiHash.SelectAllMenu.Add_Click({$uiHash.Listview.SelectAll()}) #Select All
-$uiHash.ShowUpdatesContext.Add_Click($eventShowAvailableUpdates) #Show Available Updates
-$uiHash.ShowInstalledContext.Add_Click($eventShowInstalledUpdates) #Show Installed Updates
-$uiHash.WSUSAuditContext.Add_Click($eventAuditWSUSUpdates) #Audit WSUS Updates
-$uiHash.ViewUpdateLogContext.Add_Click($eventViewUpdateLog) #Show Installed Updates
-$uiHash.Window.Add_Closed($eventWindowClose) #On Window Close
-$uiHash.Window.Add_SourceInitialized($eventWindowInit) #On Window Open
-$uiHash.Window.Add_KeyDown($eventKeyDown) #On key down
-$uiHash.WURestartServiceMenu.Add_Click({& $eventWUServiceAction 'Restart'}) #Restart Windows Update Service
-$uiHash.WUStartServiceMenu.Add_Click({& $eventWUServiceAction 'Start'}) #Start Windows Update Service
-$uiHash.WUStopServiceMenu.Add_Click({& $eventWUServiceAction 'Stop'}) #Stop Windows Update Service
-$uiHash.TestADConnectionMenu.Add_Click({& $TestADConnection}) #Test Active Directory Connection
-$uiHash.ViewErrorMenu.Add_Click({& $GetErrors | Out-GridView}) #View Errors
-$uiHash.Phase1Menu.Add_Click({&$eventAssignPhase 'Phase 1'}) #Assign Phase 1
-$uiHash.Phase2Menu.Add_Click({&$eventAssignPhase 'Phase 2'}) #Assign Phase 2
-$uiHash.Phase3Menu.Add_Click({&$eventAssignPhase 'Phase 3'}) #Assign Phase 3
-$uiHash.Phase4Menu.Add_Click({&$eventAssignPhase 'Phase 4'}) #Assign Phase 4
-$uiHash.Phase5Menu.Add_Click({&$eventAssignPhase 'Phase 5'}) #Assign Phase 5
-$uiHash.SetDomainCredentialsContext.Add_Click($eventSetDomainCredentials) #Toggle Domain Credentials
-$uiHash.CopyCellContext.Add_Click($eventCopyCellContent) #Copy Cell Content
-#endregion
+    foreach ($r in $rows) {
+        if (-not $r.Runspace) {
+            try { $r.Runspace = New-ComputerRunspace -ComputerItem $r } catch {
+                Write-ErrorLog "Failed to create runspace for $($r.Computer): $($_.Exception.Message)"; continue
+            }
+        }
+        if ($r.Available -eq $r.Downloaded) {
+            $r.Status = if ($r.Available -eq 0) { 'Up-to-Date - No updates available for download.' } else { 'All available updates are already downloaded.' }
+            if ($stateStore) { $stateStore.Touch() }
+            continue
+        }
+        $temp = "" | Select-Object PowerShell, Runspace
+        $temp.PowerShell = [powershell]::Create().AddScript($DownloadUpdates).AddArgument($r)
+        $temp.PowerShell.Runspace = $r.Runspace
+        $temp.Runspace = $temp.PowerShell.BeginInvoke()
+        $jobs.Add($temp) | Out-Null
+    }
+}
+
+$consoleActions.EventInstallUpdates = {
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Install updates on which computers?')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    if (-not (Read-WuuYesNo -Prompt "Install updates on $($rows.Count) computer(s)?" -Default $false)) {
+        Write-Host '  Cancelled.' -ForegroundColor Yellow; return
+    }
+    foreach ($r in $rows) {
+        if (-not $r.Runspace) {
+            try { $r.Runspace = New-ComputerRunspace -ComputerItem $r } catch {
+                Write-ErrorLog "Failed to create runspace for $($r.Computer): $($_.Exception.Message)"; continue
+            }
+        }
+        $temp = "" | Select-Object PowerShell, Runspace
+        $temp.PowerShell = [powershell]::Create().AddScript($InstallUpdates).AddArgument($r)
+        $temp.PowerShell.AddScript($RestartComputer).AddArgument($r).AddArgument($true)
+        $temp.PowerShell.AddScript($GetUpdates).AddArgument($r)
+        $temp.PowerShell.Runspace = $r.Runspace
+        $temp.Runspace = $temp.PowerShell.BeginInvoke()
+        $jobs.Add($temp) | Out-Null
+    }
+}
+
+$consoleActions.EventRestartComputer = {
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Restart which computers?')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    $names = ($rows | ForEach-Object { $_.Computer }) -join ', '
+    Write-Host "  About to RESTART: $names" -ForegroundColor Yellow
+    if (-not (Read-WuuYesNo -Prompt 'Confirm restart?' -Default $false)) {
+        Write-Host '  Cancelled.' -ForegroundColor Yellow; return
+    }
+    foreach ($r in $rows) {
+        if (-not $r.Runspace) {
+            try { $r.Runspace = New-ComputerRunspace -ComputerItem $r } catch {
+                Write-ErrorLog "Failed to create runspace for $($r.Computer): $($_.Exception.Message)"; continue
+            }
+        }
+        $temp = "" | Select-Object PowerShell, Runspace
+        $temp.PowerShell = [powershell]::Create().AddScript($RestartComputer).AddArgument($r).AddArgument($false)
+        $temp.PowerShell.AddScript($GetUpdates).AddArgument($r)
+        $temp.PowerShell.Runspace = $r.Runspace
+        $temp.Runspace = $temp.PowerShell.BeginInvoke()
+        $jobs.Add($temp) | Out-Null
+    }
+}
+
+$consoleActions.EventRemoveOfflineComputer = {
+    if (-not (Read-WuuYesNo -Prompt 'Test connectivity and remove unreachable computers?' -Default $false)) {
+        Write-Host '  Cancelled.' -ForegroundColor Yellow; return
+    }
+    & $eventRemoveOfflineComputer
+}
+
+$consoleActions.EventAssignPhaseInteractive = {
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Assign a phase to which computers?')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    $phase = Read-Host '  Phase (1-5)'
+    if ($phase -notmatch '^[1-5]$') { Write-Host '  Invalid phase.' -ForegroundColor Yellow; return }
+    foreach ($r in $rows) { $r.Phase = "Phase $phase" }
+    if ($stateStore) { $stateStore.Touch() }
+    Write-Host "  Assigned $($rows.Count) computer(s) to Phase $phase." -ForegroundColor Green
+}
+
+$consoleActions.EventShowByPhase = {
+    foreach ($p in 1..5) {
+        $n = 0
+        foreach ($r in @(Get-WuuComputerRow -Store $stateStore)) { if ($r.Phase -eq "Phase $p") { $n++ } }
+        Write-Host ("  Phase {0}: {1} computer(s)" -f $p, $n)
+    }
+}
+
+$consoleActions.EventRemoveSelected = {
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Remove which computers from the list?')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    & $removeEntry $rows
+}
+
+$consoleActions.ClearComputerList = { & $clearComputerList }
+
+$consoleActions.EventAddComputer = {
+    $ans = Read-Host '  Computer name(s), comma or semicolon separated'
+    if ([string]::IsNullOrWhiteSpace($ans)) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    $names = @($ans -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    & $AddEntry $names
+    Write-Host "  Added $($names.Count) computer(s)." -ForegroundColor Green
+}
+
+$consoleActions.EventAddFile = {
+    $path = Read-Host '  Path to CSV/TXT file'
+    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
+        Write-Host '  File not found.' -ForegroundColor Red; return
+    }
+    $ext = [IO.Path]::GetExtension($path).ToLowerInvariant()
+    if ($ext -eq '.csv') {
+        $csv = Import-Csv -Path $path
+        if (-not $csv -or $csv.Count -eq 0) { Write-Host '  File contained no rows.' -ForegroundColor Yellow; return }
+        $cols = @($csv[0].PSObject.Properties.Name)
+        Write-Host "  Columns: $($cols -join ', ')"
+        $col = Read-Host "  Which column holds the computer name? (default '$($cols[0])')"
+        if ([string]::IsNullOrWhiteSpace($col)) { $col = $cols[0] }
+        if ($cols -notcontains $col) { Write-Host '  No such column.' -ForegroundColor Red; return }
+        $names = @($csv | ForEach-Object { ([string]$_.$col).Trim() } | Where-Object { $_ })
+    } else {
+        $names = @(Get-Content -Path $path | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    & $AddEntry $names
+    Write-Host "  Imported $($names.Count) computer(s)." -ForegroundColor Green
+}
+
+# Read-only actions delegate to the existing handlers, which read the store's rows.
+$consoleActions.EventShowAvailableUpdates  = { & $eventShowAvailableUpdates }
+$consoleActions.EventShowInstalledUpdates  = { & $eventShowInstalledUpdates }
+$consoleActions.EventShowUpdateHistory     = { & $eventShowUpdateHistory }
+$consoleActions.EventAuditWSUSUpdates      = { & $eventAuditWSUSUpdates }
+$consoleActions.EventSaveComputerList      = { & $eventSaveComputerList }
+$consoleActions.EventSaveConfig            = { & $eventSaveConfig }
+$consoleActions.EventLoadConfig            = { & $eventLoadConfig }
+$consoleActions.EventSetDomainCredentials  = { & $eventSetDomainCredentials }
+$consoleActions.GetErrors                  = { & $GetErrors }
+
+$consoleActions.EventWUServiceActionInteractive = {
+    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Target computer(s) for the service action?')
+    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    $act = Read-Host '  Action: (s)tart, (t)op, or (r)estart'
+    $map = @{ 's' = 'Start'; 't' = 'Stop'; 'r' = 'Restart' }
+    $key = $act.Trim().ToLowerInvariant()
+    if (-not $map.ContainsKey($key)) { Write-Host '  Invalid action.' -ForegroundColor Yellow; return }
+    foreach ($r in $rows) { & $eventWUServiceAction $map[$key] $r }
+}
+#endregion Console action layer
+
 
 #region Job scheduler timer
 # Hand the shared app state to Wuu.WindowsUpdate (job/phase functions read $script:WuuCtx).
@@ -4172,151 +3602,60 @@ $wuuContext = @{
     InstallUpdates              = $InstallUpdates
     RestartComputer             = $RestartComputer
     BackgroundProcessing        = $global:backgroundProcessing
-    CredDialogXamlPath          = Join-Path $WuuRoot 'ui\CredentialDialog.xaml'
     # Console edition: the state store worker runspaces write progress into.
     StateStore                  = $stateStore
 }
 Initialize-WuuWindowsUpdateContext -Context $wuuContext
 
-# Starts pending update checks from the UI thread without ever blocking it
-$uiHash.JobTimer = New-Object System.Windows.Threading.DispatcherTimer
-$uiHash.JobTimer.Interval = [TimeSpan]::FromSeconds(1)
-$uiHash.JobTimer.Add_Tick({
+# Console edition: NO DispatcherTimer. The GUI could use one because ShowDialog() pumps a
+# WPF message loop, so a UI-thread timer fired while the app waited for input. A console
+# blocked in Read-Host has no message loop and a runspace-affine scriptblock timer cannot fire
+# while the runspace is inside the prompt - so a timer would silently never tick and the
+# auto-flow / Phase-E retries would stall (the same failure shape as the old auto-download
+# bug). Instead the console loop polls the keyboard non-blockingly and calls this once per
+# tick, on the same runspace. See Wuu.Console.psm1's module header.
+$drainScheduler = {
     try {
         Start-PendingUpdateCheck
     } catch {
         Write-ErrorLog "Job scheduler tick failed: $($_.Exception.Message)"
     }
-})
-$uiHash.JobTimer.Start()
+}
 #endregion Job scheduler timer
 
-#region Start the GUI with error handling
+#region Start the console shell
 try {
-    Write-InfoLog "Starting GUI initialization"
-    
-    # Test that essential controls exist
-    $requiredControls = @('AutoDownloadCheckBox', 'AutoInstallCheckBox', 'AutoRebootCheckBox', 'Listview')
-    foreach ($control in $requiredControls) {
-        if (-not $uiHash.$control) {
-            Write-Warning "Control '$control' not found in XAML"
-            Write-WarningLog "Control '$control' not found in XAML"
-        } else {
-            Write-InfoLog "Found control: $control"
-        }
-    }
-    
-    Write-InfoLog "Showing GUI dialog"
-    
-    # Initialize ListView ObservableCollection before showing GUI to prevent binding errors
-    Write-InfoLog "Initializing ListView ObservableCollection"
-    $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-    $uiHash.ListView.ItemsSource = $uiHash.clientObservable
+    Write-InfoLog "Starting console shell"
 
-    # Ensure errors during GUI startup are caught and handled
-    try {
-        Write-InfoLog "Attempting to show GUI - Thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
-        Write-InfoLog "GUI Window exists: $($null -ne $uiHash.Window)"
-        Write-InfoLog "GUI Window type: $($uiHash.Window.GetType().FullName)"
-        Write-InfoLog "clientObservable exists: $($null -ne $uiHash.clientObservable)"
-        Write-InfoLog "ListView exists: $($null -ne $uiHash.ListView)"
-        Write-InfoLog "ListView ItemsSource set: $($null -ne $uiHash.ListView.ItemsSource)"
-        
-        # Check if window is already shown
-        if ($uiHash.Window.IsVisible) {
-            Write-WarningLog "Window is already visible, this might cause issues"
-        }
-        
-        Write-InfoLog "Calling ShowDialog() now..."
-        
-        # Additional checks for MethodInvocationException
-        Write-InfoLog "Pre-ShowDialog dispatcher check - CheckAccess: $($uiHash.Window.Dispatcher.CheckAccess())"
-        Write-InfoLog "Pre-ShowDialog dispatcher check - HasShutdownStarted: $($uiHash.Window.Dispatcher.HasShutdownStarted)"
-        Write-InfoLog "Pre-ShowDialog dispatcher check - HasShutdownFinished: $($uiHash.Window.Dispatcher.HasShutdownFinished)"
-        
-        # Add additional protection against scope conflicts
-        try {
-            # Ensure we're on the main thread and no runspace conflicts exist
-            $result = $uiHash.Window.ShowDialog()
-            Write-InfoLog "GUI closed with result: $result"
-        } catch [System.Management.Automation.SessionStateUnauthorizedAccessException] {
-            Write-ErrorLog "Global scope conflict detected - attempting recovery"
-            # Try to dispose any problematic runspaces
-            if ($jobs) {
-                foreach ($job in $jobs) {
-                    if ($job.PowerShell) {
-                        try {
-                            $job.PowerShell.Dispose()
-                        } catch { }
-                    }
-                }
-            }
-            # Wait a moment and try again
-            Start-Sleep -Seconds 2
-            $result = $uiHash.Window.ShowDialog()
-            Write-InfoLog "GUI closed with result after recovery: $result"
-        }
-    } catch {
-        Write-ErrorLog "CRITICAL ERROR - ShowDialog failed: $($_.Exception.Message)"
-        Write-ErrorLog "Error type: $($_.Exception.GetType().FullName)"
-        Write-ErrorLog "Stack trace: $($_.ScriptStackTrace)"
-        Write-ErrorLog "Thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
-        
-        if ($_.Exception.InnerException) {
-            Write-ErrorLog "Inner exception: $($_.Exception.InnerException.Message)"
-            Write-ErrorLog "Inner exception type: $($_.Exception.InnerException.GetType().FullName)"
-        }
-        
-        # Additional diagnostic info
-        Write-ErrorLog "Window state - IsVisible: $($uiHash.Window.IsVisible)"
-        Write-ErrorLog "Window state - IsLoaded: $($uiHash.Window.IsLoaded)"
-        Write-ErrorLog "Window state - WindowState: $($uiHash.Window.WindowState)"
-        
-        [System.Windows.MessageBox]::Show(
-            "An error occurred while launching the GUI: $($_.Exception.Message)`n`nError Type: $($_.Exception.GetType().Name)`n`nThis error suggests a threading or UI initialization issue. Check the debug log for more details.",
-            "GUI Error - Stack Empty",
-            'OK',
-            'Error'
-        )
+    # Load the config-specified computer list if one exists (the GUI did this implicitly via
+    # its ListView init; here it is explicit so the operator sees their list immediately).
+    $startupConfig = Join-Path $WuuRoot 'ComputerList.config'
+    if (Test-Path $startupConfig) {
+        Write-InfoLog "Encrypted computer list present at $startupConfig - press [l] to load it."
     }
-    
-    # Important: DO NOT automatically add any computers on startup
-    # This prevents the binding error that occurs when background processes try to update
-    # computers that haven't been properly added to the ListView
-    
-exit
-} catch {
-    Write-Error "Failed to start GUI: $($_.Exception.Message)"
-    Write-ErrorLog "CRITICAL ERROR - Failed to start GUI: $($_.Exception.Message)"
-    Write-ErrorLog "Error details: $($_.Exception.GetType().FullName)"
+
+    Write-Host ''
+    Write-Host '  WUU2-CLI - Windows Update Utility (console edition)' -ForegroundColor White
+    Write-Host '  Press ? for help, t to toggle auto download/install/reboot, q to quit.' -ForegroundColor DarkGray
+
+    Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions
+}
+catch {
+    Write-ErrorLog "CRITICAL ERROR - console shell failed: $($_.Exception.Message)"
+    Write-ErrorLog "Error type: $($_.Exception.GetType().FullName)"
     Write-ErrorLog "Stack trace: $($_.ScriptStackTrace)"
-    
     if ($_.Exception.InnerException) {
         Write-ErrorLog "Inner exception: $($_.Exception.InnerException.Message)"
     }
-    
-    Write-Host "Common causes:" -ForegroundColor Yellow
-    Write-Host "  - Missing or corrupted XAML file" -ForegroundColor Cyan
-    Write-Host "  - WPF not properly installed" -ForegroundColor Cyan
-    Write-Host "  - .NET Framework issues" -ForegroundColor Cyan
-    Write-Host "  - PowerShell execution policy restrictions" -ForegroundColor Cyan
-    
-    Read-Host "Press Enter to exit"
-    exit
-} finally {
+    Write-Host ''
+    Write-Host "  Fatal error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host '  See the debug log for details.' -ForegroundColor Red
+    Read-Host '  Press Enter to exit'
+}
+finally {
     # Comprehensive cleanup on exit
     Write-InfoLog "Starting application shutdown cleanup..."
-    
-    # Stop job timer
-    if ($uiHash.JobTimer) {
-        try {
-            $uiHash.JobTimer.Stop()
-            Write-InfoLog "Job timer stopped"
-        } catch {
-            Write-WarningLog "Failed to stop job timer: $($_.Exception.Message)"
-        }
-    }
-    
+
     # Stop and dispose all running jobs
     if ($jobs) {
         Write-InfoLog "Cleaning up $($jobs.Count) background jobs"
@@ -4332,11 +3671,12 @@ exit
         }
         $jobs.Clear()
     }
-    
-    # Close and dispose all runspaces
-    if ($uiHash.Listview.Items) {
-        Write-InfoLog "Cleaning up computer runspaces"
-        foreach ($computer in $uiHash.Listview.Items) {
+
+    # Close and dispose all computer runspaces (rows live in the store now, not a ListView)
+    $cleanupRows = @(Get-WuuComputerRow -Store $stateStore)
+    if ($cleanupRows.Count) {
+        Write-InfoLog "Cleaning up $($cleanupRows.Count) computer runspace(s)"
+        foreach ($computer in $cleanupRows) {
             if ($computer.Runspace) {
                 try {
                     $computer.Runspace.Close()
@@ -4347,13 +3687,13 @@ exit
             }
         }
     }
-    
+
     # Clear synchronized hashtables
     $updatesHash.Clear()
     $performanceHash.Clear()
     $errorSuggestionsHash.Clear()
     $global:CredentialCache.Clear()
-    
+
     # Dispose job cleanup runspace
     if ($jobCleanup.Flag) {
         Write-InfoLog "Cleaning up job cleanup runspace"
@@ -4374,12 +3714,11 @@ exit
             }
         }
     }
-    
+
     Write-InfoLog "Application shutdown cleanup complete"
     Write-InfoLog "Windows Update Utility has been closed"
 }
-#endregion Start the GUI
+#endregion Start the console shell
 }
 
 Export-ModuleMember -Function @('Import-WuuModules','Start-WuuApplication')
-
