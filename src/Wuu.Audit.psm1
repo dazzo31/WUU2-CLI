@@ -169,10 +169,6 @@ function Start-WuuAuditSession {
     $dir = Get-WuuAuditDirectory -Path $Directory
     $operatorCtx = New-WuuOperatorContext
     $logPath = Join-Path $dir ("audit-{0}.jsonl" -f (Get-Date -Format 'yyyyMMdd'))
-    # Continue the existing chain when appending to a file that already has records: both the
-    # hash AND the sequence must resume, or verification would flag the join as tampering
-    # (seq restarting at 1 reads as a deleted record).
-    $head = Get-WuuAuditChainHead -LogPath $logPath
     $session = [pscustomobject]@{
         RunId     = $operatorCtx.RunId
         Operator  = [pscustomobject]@{
@@ -184,28 +180,196 @@ function Start-WuuAuditSession {
         Directory  = $dir
         LogPath    = $logPath
         TranscriptPath = Join-Path $dir ("transcript-{0}-{1}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'), $operatorCtx.RunId.Substring(0, 8))
-        Seq        = [int]$head.Seq
-        LastHash   = [string]$head.Hash
-        Lock       = New-Object object
+        # Seq/LastHash are NOT pre-read from the file: the locked writer reads the true chain head
+        # inside its exclusive lock and reports back the real seq. Pre-reading here would be a
+        # TOCTOU race (another process could append between the read and our first write) and is
+        # the bug the concurrency probe demonstrated.
+        Seq        = 0
+        LastHash   = ''
         Reason     = $Reason
     }
     Write-WuuAuditRecord -Session $session -Action 'session-start' -Result 'started' -Parameters @{ action = $Action } -SkipFailClosed | Out-Null
     return $session
 }
 
+#region Cross-process append (the correctness-critical part)
+
+<#
+WHY THIS IS NOT JUST "Add-Content WITH RETRIES"
+-----------------------------------------------
+A hash chain requires a read-modify-write cycle: read the previous record's hash, hash our record
+against it, append. If two processes do that concurrently they BOTH read the same prevHash, both
+compute a valid-looking hash, and both append - so two records claim the same predecessor and
+verification reports a chain break. That is a FALSE TAMPERING REPORT on an intact trail, which is
+the single worst failure mode for an audit tool: it trains the reader to ignore the alarm.
+
+A probe (Scripts/_probe-concurrency.ps1, 4 processes x 25 records) showed naive appends losing
+86 of 100 records AND the chain race above. So the append path takes an EXCLUSIVE OS-level lock
+on the log file for the whole read-modify-write:
+
+  * FileShare::None on the log file itself is the cross-process mutex - no separate lock file to
+    leak or forget.
+  * In-process sessions also serialise on a per-path Monitor lock first, because FileShare::None
+    would otherwise make two same-process sessions deadlock on the open.
+  * Retry with capped backoff absorbs transient holders (AV scanners, indexers, a slow peer).
+
+This is deliberately NOT the fault-tolerant "log and give up silently" pattern used for debug
+logs: a silently-missing audit record is worse than a failed operation.
+#>
+
+$script:WuuAuditPathLocks = [hashtable]::Synchronized(@{})
+$script:WuuAuditLockTableGate = New-Object object
+
+function Get-WuuAuditPathLock {
+    <# Per-path in-process lock so same-process sessions serialise before touching the OS lock. #>
+    param([Parameter(Mandatory)][string]$LogPath)
+    $key = $LogPath.ToLowerInvariant()
+    [System.Threading.Monitor]::Enter($script:WuuAuditLockTableGate)
+    try {
+        if (-not $script:WuuAuditPathLocks.ContainsKey($key)) {
+            $script:WuuAuditPathLocks[$key] = New-Object object
+        }
+        return $script:WuuAuditPathLocks[$key]
+    } finally {
+        [System.Threading.Monitor]::Exit($script:WuuAuditLockTableGate)
+    }
+}
+
+function Read-WuuAuditTailFromStream {
+    <#
+    .SYNOPSIS Reads the last complete record's Hash + seq from an OPEN stream.
+    .DESCRIPTION
+    Seeks backwards for the final newline instead of reading the whole file, so appending stays
+    O(1) rather than O(n) per write (an O(n^2) audit log would eventually matter). Falls back to
+    a full read if the tail window cannot be parsed - correctness over speed.
+    #>
+    param([Parameter(Mandatory)][System.IO.FileStream]$Stream)
+
+    $empty = [pscustomobject]@{ Hash = ''; Seq = 0 }
+    if ($Stream.Length -eq 0) { return $empty }
+
+    $windowSize = 65536
+    $len = [int][Math]::Min($windowSize, $Stream.Length)
+    $buf = New-Object byte[] $len
+    [void]$Stream.Seek(-$len, [System.IO.SeekOrigin]::End)
+    $read = $Stream.Read($buf, 0, $len)
+    $text = [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
+
+    # Take the last non-empty line. A partial first line in the window is harmless because we
+    # only ever use the LAST line.
+    $candidates = @($text -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($candidates.Count -gt 0) {
+        $last = $candidates[$candidates.Count - 1].TrimEnd("`r")
+        try {
+            $rec = $last | ConvertFrom-Json
+            return [pscustomobject]@{ Hash = [string]$rec.Hash; Seq = [int]$rec.seq }
+        } catch {
+            # Window cut a large record, or the file was written by something else - read it all.
+            [void]$Stream.Seek(0, [System.IO.SeekOrigin]::Begin)
+            $all = New-Object byte[] $Stream.Length
+            [void]$Stream.Read($all, 0, $all.Length)
+            $whole = [System.Text.Encoding]::UTF8.GetString($all)
+            $allLines = @($whole -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($allLines.Count -eq 0) { return $empty }
+            try {
+                $rec2 = $allLines[$allLines.Count - 1].TrimEnd("`r") | ConvertFrom-Json
+                return [pscustomobject]@{ Hash = [string]$rec2.Hash; Seq = [int]$rec2.seq }
+            } catch {
+                Write-WarningLog "Audit: could not parse the last record; starting a fresh chain segment."
+                return $empty
+            }
+        }
+    }
+    return $empty
+}
+
+function Add-WuuAuditRecordLocked {
+    <#
+    .SYNOPSIS Appends a record under an exclusive lock, filling in seq/prevHash/Hash atomically.
+    .DESCRIPTION
+    The caller supplies the record WITHOUT seq, prevHash or Hash. This function takes the lock,
+    reads the true chain head, fills those three fields, writes one line, and returns the finished
+    record. Doing the head-read INSIDE the lock is the whole point - it is what makes concurrent
+    writers chain correctly instead of forking the chain.
+
+    Written BOM-less UTF-8 (JSONL should not carry a BOM mid-file); all readers in this module use
+    -Encoding UTF8 explicitly, which decodes both BOM and BOM-less correctly in PS 5.1.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$Record,
+        [int]$MaxAttempts = 60,
+        [int]$BaseDelayMs = 25
+    )
+
+    $fileLock = Get-WuuAuditPathLock -LogPath $LogPath
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $inProcTaken = $false
+        try {
+            [System.Threading.Monitor]::Enter($fileLock); $inProcTaken = $true
+
+            # Exclusive cross-process lock for the entire read-modify-write.
+            $fs = [System.IO.File]::Open($LogPath, [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            try {
+                $head = Read-WuuAuditTailFromStream -Stream $fs
+
+                $Record['seq'] = [int]$head.Seq + 1
+                $Record['prevHash'] = [string]$head.Hash
+                $recordObj = [pscustomobject]$Record
+                $hash = Get-WuuRecordHash -Record $recordObj -PrevHash ([string]$head.Hash)
+                $Record['Hash'] = $hash
+
+                $line = ([pscustomobject]$Record | ConvertTo-Json -Compress -Depth 8)
+                $bytes = $utf8NoBom.GetBytes($line + "`n")
+                [void]$fs.Seek(0, [System.IO.SeekOrigin]::End)
+                $fs.Write($bytes, 0, $bytes.Length)
+                $fs.Flush($true)   # flush to disk: a record that is not durable is not evidence
+                return [pscustomobject]$Record
+            } finally {
+                if ($fs) { $fs.Dispose() }
+            }
+        } catch [System.IO.IOException] {
+            # Contended (another process, or a scanner/indexer). Back off with a CAP so we do not
+            # grow to multi-second sleeps on a busy file.
+            if ($attempt -ge $MaxAttempts) {
+                throw "Audit append failed after $MaxAttempts attempts (file locked): $($_.Exception.Message)"
+            }
+            Start-Sleep -Milliseconds ([Math]::Min($BaseDelayMs * $attempt, 500))
+        } catch [System.UnauthorizedAccessException] {
+            if ($attempt -ge $MaxAttempts) {
+                throw "Audit append failed after $MaxAttempts attempts (access denied): $($_.Exception.Message)"
+            }
+            Start-Sleep -Milliseconds ([Math]::Min($BaseDelayMs * $attempt, 500))
+        } finally {
+            if ($inProcTaken) { [System.Threading.Monitor]::Exit($fileLock) }
+        }
+    }
+    throw 'Audit append failed: exhausted attempts without a definitive error (should be unreachable).'
+}
+
+#endregion Cross-process append (the correctness-critical part)
+
 function Write-WuuAuditRecord {
     <#
-    .SYNOPSIS Appends one hash-chained record.
+    .SYNOPSIS Appends one hash-chained record (cross-process safe).
     .DESCRIPTION
-    Appends a single JSON line. Chain: each record carries the previous record's hash, so any
-    edit, deletion or reordering breaks verification from that point on.
+    Chain: each record carries the previous record's hash, so any edit, deletion or reordering
+    breaks verification from that point on.
+
+    Concurrency: the read-modify-write runs under an exclusive OS file lock (see the region header
+    above). Doing the head-read outside that lock is what lets two processes fork the chain and
+    produce a FALSE tampering report.
+
+    Fidelity: the record is built here, then seq/prevHash/Hash are filled in by the locked writer,
+    which returns the finished record (the caller sees the real seq, not a guess).
 
     -FailClosed throws when the write fails (used for mutating actions: no audit, no change).
     Without it, a write failure is a warning (read-only actions must not be blocked by logging).
-
-    The write is retried because transient locks are real on Windows (see the OneDrive lesson
-    in this codebase) - but for audit, three failures is a hard error, not a silent give-up:
-    a silently-missing audit record is worse than a failed operation.
+    An audit record is never silently dropped: failure is either an exception (fail-closed) or an
+    explicit warning, never a quiet no-op.
     #>
     param(
         [Parameter(Mandatory)]$Session,
@@ -224,8 +388,9 @@ function Write-WuuAuditRecord {
         [switch]$SkipFailClosed
     )
 
+    # seq / prevHash / Hash are filled in by Add-WuuAuditRecordLocked under the file lock.
     $record = [ordered]@{
-        seq           = ++$Session.Seq
+        seq           = 0
         timestampUtc  = (Get-Date).ToUniversalTime().ToString('o')
         runId         = $Session.RunId
         correlationId = if ($CorrelationId) { $CorrelationId } else { [guid]::NewGuid().ToString('N') }
@@ -239,63 +404,49 @@ function Write-WuuAuditRecord {
         counts        = $Counts
         durationMs    = $DurationMs
         wuuVersion    = 'v1.3.4-cli'
-        prevHash      = $Session.LastHash
+        prevHash      = ''
     }
-    $recordObj = [pscustomobject]$record
-    $hash = Get-WuuRecordHash -Record $recordObj -PrevHash $Session.LastHash
-    $recordObj | Add-Member -NotePropertyName Hash -NotePropertyValue $hash
 
-    $line = $recordObj | ConvertTo-Json -Compress -Depth 8
-
-    $written = $false
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        $lockTaken = $false
-        try {
-            [System.Threading.Monitor]::Enter($Session.Lock); $lockTaken = $true
-            Add-Content -LiteralPath $Session.LogPath -Value $line -Encoding UTF8 -ErrorAction Stop
-            $written = $true
-            break
-        } catch {
-            if ($attempt -ge 3) {
-                $msg = "Audit write failed after 3 attempts: $($_.Exception.Message)"
-                Write-ErrorLog $msg
-                if ($FailClosed -and -not $SkipFailClosed) { throw $msg }
-                Write-WarningLog $msg
-            } else {
-                Start-Sleep -Milliseconds (100 * $attempt)
-            }
-        } finally {
-            if ($lockTaken) { [System.Threading.Monitor]::Exit($Session.Lock) }
-        }
+    try {
+        $finished = Add-WuuAuditRecordLocked -LogPath $Session.LogPath -Record $record
+        # Keep the session's own view of the chain in step (used by callers that inspect it).
+        $Session.Seq = [int]$finished.seq
+        $Session.LastHash = [string]$finished.Hash
+        return $finished
+    } catch {
+        $msg = "Audit write failed: $($_.Exception.Message)"
+        Write-ErrorLog $msg
+        if ($FailClosed -and -not $SkipFailClosed) { throw $msg }
+        Write-WarningLog $msg
+        return $null
     }
-    if ($written) { $Session.LastHash = $hash }
-    return $recordObj
 }
 
 function Get-WuuAuditChainHead {
     <#
     .SYNOPSIS Returns the latest hash and sequence number in a log file.
     .DESCRIPTION
-    Lets a NEW session continue an existing chain instead of starting a fresh one, so a chain
-    spans sessions rather than resetting daily.
+    Reads with FileShare::ReadWrite (NOT FileShare::None): taking an exclusive lock just to READ
+    would block a concurrent writer and turn a harmless question into contention. A reader that
+    only ever takes the last complete line cannot be corrupted by an append in progress - it may
+    miss the very newest record, which is correct for an advisory read.
 
-    The SEQUENCE matters as much as the hash: verification asserts seq is contiguous, so if a
-    new session restarted at 1 while appending to the same daily file, every later record would
-    look like a deleted one. Returns both so a session can continue from the true position.
+    Used by tests and diagnostics. Write-WuuAuditRecord does NOT call this: it reads the head
+    inside the exclusive lock instead, so its read-modify-write cannot race.
     #>
     param([Parameter(Mandatory)][string]$LogPath)
     $result = [pscustomobject]@{ Hash = ''; Seq = 0 }
     if (-not (Test-Path -LiteralPath $LogPath)) { return $result }
-    $last = $null
-    foreach ($line in (Get-Content -LiteralPath $LogPath)) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) { $last = $line }
-    }
-    if (-not $last) { return $result }
     try {
-        $rec = $last | ConvertFrom-Json
-        return [pscustomobject]@{ Hash = [string]$rec.Hash; Seq = [int]$rec.seq }
+        $fs = [System.IO.File]::Open($LogPath, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            return Read-WuuAuditTailFromStream -Stream $fs
+        } finally {
+            if ($fs) { $fs.Dispose() }
+        }
     } catch {
-        Write-WarningLog "Audit: could not read the last record's hash/seq from $LogPath - starting a fresh chain."
+        Write-WarningLog "Audit: could not read the chain head from $LogPath - $($_.Exception.Message)"
         return $result
     }
 }

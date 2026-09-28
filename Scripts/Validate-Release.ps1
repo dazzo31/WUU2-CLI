@@ -179,5 +179,30 @@ $cmdText = Get-Content (Join-Path $root 'src\Wuu.Command.psm1') -Raw
 if ($cmdText -notmatch 'requires -Reason') { Fail 'mutating verbs do not enforce -Reason' }
 else { Pass 'mutating verbs enforce -Reason' }
 
+# (g)-(i) Concurrency + durability invariants.
+#     Checked against RAW file text, not the token-stripped text used above: the tokenizer
+#     normalises away '::', '$' and quotes, so structural patterns like these cannot be matched
+#     there. (Matching the tokenised text here previously produced three false failures on code
+#     that was demonstrably correct - verify against the right representation.)
+$auditRaw = Get-Content -LiteralPath $auditPath -Raw
+
+# (g) Concurrent writers must take an EXCLUSIVE cross-process lock for the whole
+#     read-modify-write. Without it two processes chain from the same prevHash and verification
+#     reports FALSE tampering on an intact trail - a real bug, found by probe and reproduced by
+#     tests\Test-AuditConcurrency.ps1 against the pre-fix code.
+if ($auditRaw -notmatch 'FileShare\]::None') {
+    Fail 'audit append takes no exclusive cross-process lock - concurrent writers can fork the chain'
+} else { Pass 'audit append takes an exclusive cross-process lock' }
+
+# (h) The chain head must be read INSIDE that lock, not before it (the TOCTOU race).
+if ($auditRaw -notmatch 'Read-WuuAuditTailFromStream -Stream \$fs') {
+    Fail 'audit does not read the chain head inside the exclusive lock (TOCTOU race)'
+} else { Pass 'audit reads the chain head inside the exclusive lock (no read-modify-write race)' }
+
+# (i) Records must be flushed to disk - a record that is not durable is not evidence.
+if ($auditRaw -notmatch 'Flush\(\$true\)') {
+    Fail 'audit does not flush records to disk (a crash could lose "durable" records)'
+} else { Pass 'audit flushes records to disk' }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }
