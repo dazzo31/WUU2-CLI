@@ -12,8 +12,9 @@ function Import-WuuModules {
     param([Parameter(Mandatory)][string]$WuuRoot)
     # Wuu.State first: Wuu.Core's startup creates the state store via New-WuuStateStore, and
     # worker runspaces receive it. Wuu.Console is the presentation layer; Wuu.Command the
-    # scriptable verb layer. Order otherwise matters only for readability - all -Global.
-    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Command')) {
+    # scriptable verb layer; Wuu.Audit the tamper-evident trail. Order otherwise matters only
+    # for readability - all -Global.
+    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Audit','Wuu.Command')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
@@ -3697,7 +3698,8 @@ try {
                 -Path $parsed.Options['Path'] -Column $parsed.Options['Column'] `
                 -Set $(if ($parsed.Options['Set']) { [int]$parsed.Options['Set'] } else { 0 }) `
                 -ServiceAction $parsed.SubVerb `
-                -SubVerb $parsed.SubVerb -Json:$parsed.Options['Json'] -WhatIf:$parsed.Options['WhatIf']
+                -SubVerb $parsed.SubVerb -Reason $parsed.Options['Reason'] `
+                -Json:$parsed.Options['Json'] -WhatIf:$parsed.Options['WhatIf']
 
             # Give queued background work a bounded chance to run, then report state. A one-shot
             # command must not return before the operation it started has had an opportunity to
@@ -3732,7 +3734,22 @@ try {
         Write-Host '  Press ? for help, t to toggle auto download/install/reboot, q to quit.' -ForegroundColor DarkGray
         Write-Host '  Run with -Help for scriptable commands (wuu check -All, wuu install -Computer X).' -ForegroundColor DarkGray
 
-        Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions
+        # The interactive menu is audited too: mutating actions ask for a reason and go through
+        # the same fail-closed choke point as the command surface. Without this a human could
+        # change remote hosts with nothing recorded, which would make the trail misleading
+        # (it would look like the only changes ever made were scripted ones).
+        $auditSession = Start-WuuAuditSession -Action 'interactive-menu'
+        Write-InfoLog "Audit session $($auditSession.RunId) -> $($auditSession.LogPath)"
+        $auditHook = {
+            param([string]$ActionName, [string]$Reason, [scriptblock]$Body)
+            Invoke-WuuAuditedAction -Session $auditSession -Action $ActionName -Reason $Reason -Body $Body
+        }.GetNewClosure()
+
+        try {
+            Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions -AuditHook $auditHook
+        } finally {
+            try { Write-WuuAuditRecord -Session $auditSession -Action 'session-end' -Result 'info' | Out-Null } catch { }
+        }
     }
 }
 catch {

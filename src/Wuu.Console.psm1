@@ -163,17 +163,28 @@ function Start-WuuConsoleLoop {
     Polls the keyboard non-blockingly so the job scheduler can be drained on every tick
     (see the module header for why a timer cannot work here). The scheduler call is supplied
     by the caller as a scriptblock so this module does not depend on Wuu.WindowsUpdate.
+
+    -AuditHook is an OPTIONAL scriptblock the caller supplies to audit mutating menu actions:
+        param($ActionName, $Reason, $Body) -> result
+    It is injected rather than called directly so Wuu.Console keeps no dependency on Wuu.Audit,
+    and so a build without auditing still runs. When absent, mutating actions run unaudited and
+    a warning is printed once - an unaudited change should never be silent.
+
+    Menu actions that mutate are marked Mutating=$true in Get-WuuMenuActions; the loop asks for a
+    reason (interactive) and passes it to the hook, matching the command surface's -Reason.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Store,
         [Parameter(Mandatory)][scriptblock]$DrainScheduler,
         [Parameter(Mandatory)][hashtable]$Actions,
+        [scriptblock]$AuditHook,
         [int]$TickMilliseconds = 250
     )
     Write-WuuStatusTable -Store $Store
     Write-WuuStatusLine -Store $Store
     Write-WuuMenu -Store $Store
 
+    $warnedNoAudit = $false
     $actions = Get-WuuMenuActions
     while (-not $Actions.Quit) {
         # Drain queued work (auto-flow, retries) before waiting for input, then keep draining
@@ -209,7 +220,22 @@ function Start-WuuConsoleLoop {
         Write-Host ''
         Write-Host ("  > {0}" -f $chosen.Label) -ForegroundColor White
         try {
-            & $chosen.Run $Actions
+            if ($chosen.Mutating -and $AuditHook) {
+                # Ask WHY before a change - the same information the command surface requires
+                # via -Reason, so the two surfaces produce comparable audit records.
+                $reason = Read-WuuAnswer -Prompt '  Reason for this change (recorded in the audit trail)' -Default ''
+                if ([string]::IsNullOrWhiteSpace([string]$reason)) {
+                    Write-Host '  A reason is required for audited changes - operation cancelled.' -ForegroundColor Yellow
+                } else {
+                    & $AuditHook $chosen.Label $reason $chosen.Run | Out-Null
+                }
+            } elseif ($chosen.Mutating -and -not $warnedNoAudit) {
+                $warnedNoAudit = $true
+                Write-Host '  WARNING: auditing is not active, so this change will not be recorded.' -ForegroundColor Yellow
+                & $chosen.Run $Actions
+            } else {
+                & $chosen.Run $Actions
+            }
         } catch {
             Write-Host ("  Operation failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
             Write-ErrorLog "$($chosen.Label) failed: $($_.Exception.Message)"

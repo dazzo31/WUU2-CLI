@@ -42,6 +42,87 @@ VERB MAP (mirrors the menu in Wuu.Console.psm1 Get-WuuMenuActions 1:1)
   export / config save|load / credentials set    -> EventSave* / EventLoadConfig / …
 #>
 
+function Invoke-WuuAuditCommand {
+    <#
+    .SYNOPSIS The local audit-trail verbs: verify / show / export.
+    .DESCRIPTION
+    These inspect the audit log itself (Phase 4), not a target's WSUS state (that is
+    `audit wsus`). verify exits non-zero on a broken chain so CI can gate on it.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('verify', 'show', 'export')][string]$SubVerb,
+        [string]$Path,
+        [switch]$Json
+    )
+
+    $logPath = $Path
+    if (-not $logPath) {
+        $dir = Get-WuuAuditDirectory
+        # Newest daily log, if any.
+        $candidates = @(Get-ChildItem -LiteralPath $dir -Filter 'audit-*.jsonl' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending)
+        if ($candidates.Count -eq 0) {
+            Write-Host ("  No audit log found in {0}." -f $dir) -ForegroundColor Yellow
+            return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = 'no audit log' }
+        }
+        $logPath = $candidates[0].FullName
+    }
+
+    switch ($SubVerb) {
+        'verify' {
+            Write-Host ("  Verifying {0}" -f $logPath) -ForegroundColor Gray
+            $v = Test-WuuAuditChain -LogPath $logPath -Quiet
+            if ($Json) {
+                [pscustomobject]@{ Command = 'audit verify'; LogPath = $logPath; Ok = $v.Ok; Checked = $v.Checked; FirstBreak = $v.FirstBreak; Problems = $v.Problems } | ConvertTo-Json -Depth 5
+            } elseif ($v.Ok) {
+                Write-Host ("  Chain intact: {0} record(s) verified." -f $v.Checked) -ForegroundColor Green
+            } else {
+                Write-Host ("  CHAIN BROKEN at line {0} of {1}:" -f $v.FirstBreak, $v.Checked) -ForegroundColor Red
+                foreach ($p in $v.Problems) { Write-Host "    $p" -ForegroundColor Red }
+            }
+            # Non-zero exit on a broken chain so a pipeline can gate on it.
+            if (-not $v.Ok) { $script:CommandExitCode = 1 }
+            return [pscustomobject]@{ Ok = $v.Ok; Verb = 'audit'; SubVerb = $SubVerb; Checked = $v.Checked; FirstBreak = $v.FirstBreak }
+        }
+        'show' {
+            $recs = @(Get-Content -LiteralPath $logPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { $_ | ConvertFrom-Json })
+            if ($Json) {
+                [pscustomobject]@{ Command = 'audit show'; LogPath = $logPath; Count = $recs.Count; Records = $recs } | ConvertTo-Json -Depth 8
+            } else {
+                Write-Host ("  {0}  ({1} record(s))" -f $logPath, $recs.Count) -ForegroundColor White
+                $fmt = "  {0,5} {1,-21} {2,-13} {3,-10} {4,-18} {5}"
+                Write-Host ($fmt -f 'seq', 'timestampUtc', 'action', 'result', 'targets', 'reason') -ForegroundColor DarkCyan
+                foreach ($r in $recs) {
+                    Write-Host ($fmt -f $r.seq, $r.timestampUtc, $r.action, $r.result, (($r.targets) -join ','), $r.reason)
+                }
+            }
+            return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Count = $recs.Count }
+        }
+        'export' {
+            # Bundle the log (and the matching transcript, if present) into one file for a
+            # compliance handoff. Deliberately a copy, never a re-encode: the exported file must
+            # be byte-identical to the log or `audit verify` on the copy would be meaningless.
+            $outPath = if ($Path) { "$Path.export.zip" } else { Join-Path (Split-Path $logPath -Parent) ("audit-export-{0}.zip" -f (Get-Date -Format 'yyyyMMdd_HHmmss')) }
+            $staging = Join-Path $env:TEMP ("wuu_audit_export_{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+            New-Item -ItemType Directory -Path $staging -Force | Out-Null
+            Copy-Item -LiteralPath $logPath -Destination $staging -Force
+            $dirOfLog = Split-Path $logPath -Parent
+            foreach ($t in @(Get-ChildItem -LiteralPath $dirOfLog -Filter 'transcript-*.log' -File -ErrorAction SilentlyContinue)) {
+                Copy-Item -LiteralPath $t.FullName -Destination $staging -Force
+            }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            if (Test-Path -LiteralPath $outPath) { Remove-Item -LiteralPath $outPath -Force }
+            [IO.Compression.ZipFile]::CreateFromDirectory($staging, $outPath)
+            Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host ("  Exported audit bundle: {0}" -f $outPath) -ForegroundColor Green
+            Write-Host '  NOTE: the bundle carries the hash chain but NO external anchor, so it is' -ForegroundColor DarkGray
+            Write-Host '        tamper-EVIDENT, not non-repudiable. See docs/CLI_AUDIT_PLAN.md 5.6.' -ForegroundColor DarkGray
+            return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Path = $outPath }
+        }
+    }
+}
+
 function Get-WuuCommandTable {
     <#
     .SYNOPSIS The verb table: name -> action handler, mutating flag, and answer-builder.
@@ -113,7 +194,7 @@ function Get-WuuCommandTable {
         'audit' = @{
             Action = 'EventAuditWSUSUpdates'; Mutating = $false
             Answers = { param($p) , $p.Computer }
-            Help = 'Audit WSUS:  wuu audit wsus -Computer SRV01'
+            Help = 'Audit:  wuu audit wsus [-Computer SRV01]  |  wuu audit verify|show|export'
         }
         'logs' = @{
             Action = 'EventViewUpdateLog'; Mutating = $false
@@ -174,14 +255,22 @@ function Get-WuuCommandHelp {
     Write-Host '  COMMON OPTIONS' -ForegroundColor Cyan
     Write-Host '    -Computer <names>   comma-separated names, or "all"'
     Write-Host '    -All                shortcut for -Computer all'
+    Write-Host '    -Reason <text>      why this change was made (recorded in the audit trail)'
     Write-Host '    -Json               machine-readable output (read verbs)'
     Write-Host '    -WhatIf             report what would happen; change nothing'
     Write-Host '    -Help               this help, or per-verb help with a verb'
+    Write-Host ''
+    Write-Host '  AUDIT TRAIL' -ForegroundColor Cyan
+    Write-Host '    wuu audit verify                  check the hash chain; non-zero exit if broken'
+    Write-Host '    wuu audit show [-Json]            list audit records'
+    Write-Host '    wuu audit export                  bundle log + transcripts for handoff'
+    Write-Host '    wuu audit wsus -Computer SRV01    audit a TARGET host (not the local trail)'
     Write-Host ''
     Write-Host '  EXAMPLES' -ForegroundColor Cyan
     Write-Host '    wuu check -All'
     Write-Host '    wuu show available -Computer SRV01 -Json'
     Write-Host '    wuu install -Computer SRV01 -WhatIf'
+    Write-Host '    wuu install -Computer SRV01 -Reason "CHG-1041 security patches"'
     Write-Host '    wuu add -Computer SRV01,SRV02'
     Write-Host ''
 }
@@ -207,6 +296,9 @@ function Invoke-WuuCommand {
         [ValidateRange(0, 5)][int]$Set = 0,
         [ValidateSet('', 'start', 'stop', 'restart')][string]$ServiceAction,
         [string]$SubVerb,
+        # Required for mutating verbs once audit is active (Phase 4): records WHY the change was
+        # made. Interactive mode prompts; non-interactive mode fails without it.
+        [string]$Reason = '',
         [switch]$Json,
         [switch]$WhatIf
     )
@@ -238,7 +330,15 @@ function Invoke-WuuCommand {
         else { return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu config needs save or load' } }
     }
     elseif ($Verb -eq 'audit') {
-        if ($SubVerb -ne 'wsus') { return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu audit needs the subverb wsus' } }
+        # 'wsus' audits a TARGET's WSUS state. verify/show/export inspect the LOCAL audit
+        # trail itself (Phase 4) and are handled before the action lookup, since they are not
+        # $consoleActions operations.
+        if ($SubVerb -in @('verify', 'show', 'export')) {
+            return Invoke-WuuAuditCommand -SubVerb $SubVerb -Path $Path -Json:$Json
+        }
+        if ($SubVerb -ne 'wsus') {
+            return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu audit needs one of: wsus, verify, show, export' }
+        }
     }
 
     if (-not $actionName -or -not $Actions.ContainsKey($actionName)) {
@@ -267,9 +367,34 @@ function Invoke-WuuCommand {
 
     $answers = if ($entry.Answers) { @(& $entry.Answers $p) } else { @() }
 
+    # Mutating actions require a reason once auditing is on: an audit record that says "someone
+    # changed 12 servers" without saying why has limited value in a change review. Fail BEFORE
+    # running anything, and before the fail-closed intent record, so nothing happens at all.
+    if ($entry.Mutating -and -not $Reason) {
+        $msg = "Mutating action '$Verb' requires -Reason (e.g. -Reason ""CHG-1041 security patches"")."
+        Write-Host "  $msg" -ForegroundColor Yellow
+        return [pscustomobject]@{ Ok = $false; Verb = $Verb; Action = $actionName; Error = $msg; NeedsReason = $true }
+    }
+
     $prev = Get-WuuInputMode
+    $targets = if ($All) { @('all') } elseif ($Computer) { @($Computer -split '[,;]' | ForEach-Object { $_.Trim() }) } else { @() }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         Initialize-WuuInputMode -NonInteractive -Answers $answers
+        if ($entry.Mutating) {
+            # Mutating verbs go through the audited choke point: intent is recorded BEFORE the
+            # handler runs and FAIL-CLOSED, so if the audit sink is unwritable the change does
+            # not happen. An unlogged remote change is worse than a refused one.
+            $session = Start-WuuAuditSession -Action $Verb -Reason $Reason
+            $audited = Invoke-WuuAuditedAction -Session $session -Action $Verb -Targets $targets `
+                -Parameters @{ computer = $p.Computer; serviceAction = $p.ServiceAction; set = $p.Set; json = $p.Json } `
+                -Reason $Reason -Body { & $Actions[$actionName] }
+            $sw.Stop()
+            if (-not $audited.Ok) {
+                return [pscustomobject]@{ Ok = $false; Verb = $Verb; Action = $actionName; Error = $audited.Error; CorrelationId = $audited.CorrelationId }
+            }
+            return [pscustomobject]@{ Ok = $true; Verb = $Verb; Action = $actionName; CorrelationId = $audited.CorrelationId; Audited = $true }
+        }
         & $Actions[$actionName]
         return [pscustomobject]@{ Ok = $true; Verb = $Verb; Action = $actionName }
     } catch {
@@ -296,7 +421,7 @@ function ConvertTo-WuuCommandLine {
     $known = @{
         '-computer' = 'Computer'; '-all' = 'All'; '-json' = 'Json'; '-whatif' = 'WhatIf'
         '-path' = 'Path'; '-column' = 'Column'; '-set' = 'Set'; '-help' = 'Help'
-        '-reboot' = 'Reboot'; '-yes' = 'Yes'
+        '-reason' = 'Reason'
     }
     # Verbs that take a subverb as their second positional token.
     $subVerbVerbs = @('show', 'config', 'audit', 'service')
@@ -313,7 +438,7 @@ function ConvertTo-WuuCommandLine {
             $key = $a.ToLowerInvariant()
             if (-not $known.ContainsKey($key)) { [void]$result.Unknown.Add($a); $i++; continue }
             $name = $known[$key]
-            if ($name -in @('Computer', 'Path', 'Column', 'Set')) {
+            if ($name -in @('Computer', 'Path', 'Column', 'Set', 'Reason')) {
                 if ($i + 1 -ge $Arguments.Count) { [void]$result.Unknown.Add("$a (missing value)"); $i++; continue }
                 $result.Options[$name] = $Arguments[$i + 1]; $i += 2; continue
             }

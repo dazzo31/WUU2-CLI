@@ -135,5 +135,49 @@ foreach ($f in $files) {
 if ($bomMissing.Count) { Fail ('non-ASCII file(s) missing the UTF-8 BOM (PS 5.1 will mis-read these): ' + (($bomMissing | Select-Object -Unique) -join ', ')) }
 else { Pass 'every file with non-ASCII bytes carries the UTF-8 BOM' }
 
+# --- 9. Audit invariants (Phase 4) --------------------------------------------------------
+# These are the properties the trail exists to guarantee. Asserting them structurally beats
+# trusting that a future edit preserves them.
+#
+# Evaluate against COMMENT-STRIPPED code. An earlier version matched raw text and flagged the
+# module's own explanatory comments ("OneDrive-synced tree caused ... failures") as a synced-folder
+# path - the same false-positive class the headless test hit. Strip comments via the tokenizer.
+$auditPath = Join-Path $root 'src\Wuu.Audit.psm1'
+$auditCode = Get-WuuCodeWithoutComments -Path $auditPath
+
+# (a) The canonical form must distinguish an array from a string. A collision here means two
+#     different records hash identically - fatal for a hash chain, and easy to reintroduce by
+#     "simplifying" the serialiser.
+if ($auditCode -notmatch 'Array\s*/\s*list' -and $auditCode -notmatch 'IEnumerable') {
+    Fail 'Wuu.Audit has no array branch in its canonical serialiser (array/string collision risk)'
+} else { Pass 'audit canonical serialiser handles arrays separately from strings' }
+
+# (b) The hash must include prevHash, or removing/reordering a record would not break the chain.
+#     NOTE: the token-stripped text has runs of whitespace AND loses '$' and quotes - `$canonical
+#     + '|' + $PrevHash` appears as `canonical + | + PrevHash`. Verified by dumping the text
+#     rather than guessing the pattern (guessing cost three failed attempts).
+$auditFlat = ($auditCode -replace '\s+', ' ')
+if ($auditFlat -notlike '*material = canonical + | + PrevHash*') {
+    Fail 'audit hash does not mix in prevHash - the chain would not detect removal/reordering'
+} else { Pass 'audit hash mixes in prevHash (removal/reordering is detectable)' }
+
+# (c) Mutating actions must be able to fail closed.
+if ($auditCode -notmatch 'FailClosed') { Fail 'Wuu.Audit has no fail-closed path; an unlogged mutation would be possible' }
+else { Pass 'audit supports fail-closed writes for mutating actions' }
+
+# (d) The log must be append-only: no rewrite/truncate/overwrite of an existing file.
+if ($auditCode -match 'Set-Content.*LogPath|Out-File.*LogPath|WriteAllText.*LogPath|FileMode\]::Create') {
+    Fail 'Wuu.Audit appears to rewrite the log file (must be append-only)'
+} else { Pass 'audit writes are append-only (no rewrite path found)' }
+
+# (e) The trail must not live in a cloud-synced folder (a real, repeated failure mode here).
+if ($auditCode -match 'OneDrive') { Fail 'audit path appears to reference a synced folder' }
+elseif ($auditCode -notmatch 'Get-WuuAuditDirectory') { Fail 'audit has no dedicated directory resolver' }
+else { Pass 'audit resolves its own directory (not a synced path)' }
+# (f) Mutating command verbs must require a reason.
+$cmdText = Get-Content (Join-Path $root 'src\Wuu.Command.psm1') -Raw
+if ($cmdText -notmatch 'requires -Reason') { Fail 'mutating verbs do not enforce -Reason' }
+else { Pass 'mutating verbs enforce -Reason' }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }
