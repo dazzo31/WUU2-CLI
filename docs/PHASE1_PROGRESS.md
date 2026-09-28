@@ -18,7 +18,76 @@
 | `stateStore` injected into worker + jobCleanup runspaces + context | **DONE** |
 | `Wuu.Core.psm1` payloads → store | **DONE - no payload path touches WPF** |
 | Headless payload harness (`Test-HeadlessEngine.ps1`) | **DONE, 11/11 PASS** |
-| Delete `ui/` + XAML load path | NOT STARTED (removes the remaining GUI-chrome refs) |
+| Delete `ui/` + XAML load path | **DONE - Phase 1 complete** |
+
+## Increment 5 - Phase 1 COMPLETE: GUI removed, console shell in place
+
+`ui/` deleted, every XAML load path gone, and a console shell replaces the WPF one.
+**Wuu.Core.psm1: 4688 → 3724 lines. Commit `cb26f1a`, net −1,199 lines.**
+
+### Removed
+| Gone | Was | Now |
+|---|---|---|
+| `ui/` (3 XAML files) + all load paths | MainWindow / CredentialDialog / OUSelector | `Wuu.Console.psm1` renders the store |
+| GUI startup loop + FindName resolution | columns resize, `PART_HeaderGripper` visual-tree walk, `eventWindowInit/Close`, `eventKeyDown`, `eventRightClick`, ~45 `Add_Click` wire-ups | `$consoleActions` (23 handlers) + `Start-WuuConsoleLoop` |
+| 3 WPF credential dialogs (425 lines) | `Show-PasswordPrompt`, `Show-CustomCredentialDialog`, `Show-CredentialConfigDialog` | console prompts; `Wuu.Credentials.psm1` 689 → 403 |
+| OU-picker TreeView (293 lines) | `$eventAddAD` built a WPF tree | numbered OU list + LDAP path prompt |
+| Worker credential dialog (104 lines) | WPF dialog inside worker runspaces | returns `$null` (documented below) |
+| 5 `Out-GridView` calls | WPF-only cmdlet | `Show-WuuObjectTable` console tables |
+
+### Added
+- **`src/Wuu.Console.psm1` (281 lines)** - status table renderer, the numbered interactive menu
+  (1:1 with the GUI operations), selection helpers (name / comma list / unambiguous prefix /
+  `all`), and the input loop.
+- **`$consoleActions`** - 23 handlers that resolve targets from the store then call the *same*
+  payloads the GUI handlers used. One implementation per operation; only selection and
+  confirmation differ.
+
+### Design note - why the scheduler is POLLED, not a timer
+The GUI used a `DispatcherTimer`, which worked because `ShowDialog()` pumps a WPF message loop.
+A console blocked in `Read-Host` has **no message loop**, and a runspace-affine scriptblock timer
+cannot fire while the runspace is inside the prompt - so a timer would silently never tick and the
+auto-flow / Phase-E retries would stall (the same failure shape as the old auto-download bug).
+The loop polls `[Console]::KeyAvailable` and calls `Start-PendingUpdateCheck` once per tick on the
+same runspace.
+
+**Worker credential dialogs must return `$null`.** A worker runspace that owned the console would
+race the main session's input loop and interleave prompts into an unrelated menu action.
+Interactive entry happens in the main session *before* the worker starts.
+
+### Five real bugs found during the removal
+All found by verification, none by inspection:
+1. A leftover `clientObservable` removal in `$removeEntry` (survived the earlier mechanical pass)
+   would silently no-op with the ListView gone - leaving unreachable rows in the list.
+2. Six colour blocks still nested inside dead `if($listViewItem)` conditionals; `ContainerFromItem`
+   never returns an object now, so the row colour would never have applied.
+3. `$eventShowUpdateHistory` / `$eventShowAvailableUpdates` / WSUS audit still read
+   `$uiHash.Listview.SelectedItems`.
+4. **Missing UTF-8 BOM on `Wuu.Core.psm1`.** `Set-Content -Encoding UTF8` under PS 7 writes
+   BOM-less; PS 5.1 then reads it as ANSI, the 51 multi-byte emoji bytes ate a quote, and the
+   error surfaced misleadingly downstream as *"Unexpected token 'MB'"*. Fix:
+   `[Text.UTF8Encoding]::new($true)`. (Already in repo memory - it recurred anyway.)
+5. **The validator's own comment stripper** (`$_ -replace '#.*$',''`) removed the `#` inside
+   subexpressions like `$([math]::Round($x/1MB))`, fabricating syntax errors on a valid file.
+   Fixed by tokenizing and rebuilding text from non-comment tokens.
+
+### Verification
+`Validate-Release.ps1` rewritten for the console edition - **5/5 PASS**:
+
+```
+PASS: all 18 shipped PowerShell files parse under the PS 5.1 engine
+PASS: no WPF/XAML/ui references in shipped code
+PASS: all src/ modules import via Import-WuuModules
+PASS: importing the engine loads no WPF assembly
+PASS: all 23 menu handlers are defined in the action layer
+```
+
+Tests: `Test-StateStore` 19/19, `Test-HeadlessEngine` 11/11, `Test-ModuleImport`,
+`Test-PendingDrain`, `Test-CrossModuleResolution` - all PASS under PS 5.1.
+
+**Next: Phase 2 is effectively seeded** (the console shell exists). Remaining Phase 2 work is the
+command surface (`wuu check|download|install ...`), then Phase 3 audit. See
+[CLI_AUDIT_PLAN.md](CLI_AUDIT_PLAN.md) §6.
 
 ## Increment 4 - the decisive gate: the engine runs with NO WPF
 
