@@ -321,6 +321,41 @@ else { Pass "menu action audited with its reason (intent+outcome)" }
 $v5 = Test-WuuAuditChain -LogPath $s5.LogPath -Quiet
 if (-not $v5.Ok) { Fail "menu-hook chain broken: $($v5.Problems[0])" } else { Pass 'menu-hook chain verifies' }
 
+# ---------------------------------------------------------------------------------------
+# 11. Session transcript: captured when available, never fatal, and only stopped if we started it
+# ---------------------------------------------------------------------------------------
+$s6 = Start-WuuAuditSession -Action 'transcript-test'
+$started = Start-WuuAuditTranscript -Session $s6
+if ($started) {
+    Pass 'transcript started'
+    Write-Host '  (transcript capture active - marker line)'
+    Stop-WuuAuditTranscript -Session $s6
+    if (-not (Test-Path -LiteralPath $s6.TranscriptPath)) {
+        Fail 'transcript reported started but no file was produced'
+    } else {
+        $tLen = (Get-Item -LiteralPath $s6.TranscriptPath).Length
+        if ($tLen -le 0) { Fail 'transcript file is empty' }
+        else { Pass "transcript captured $tLen bytes" }
+    }
+    # Second stop must be a harmless no-op (idempotent), not a throw.
+    $threwStop = $false
+    try { Stop-WuuAuditTranscript -Session $s6 } catch { $threwStop = $true }
+    if ($threwStop) { Fail 'second Stop-WuuAuditTranscript threw (not idempotent)' }
+    else { Pass 'Stop-WuuAuditTranscript is idempotent' }
+} else {
+    # Not a failure: some hosts cannot start a transcript, and the design says that must be
+    # non-fatal. Assert the contract (returns false, does not throw, session marked inactive).
+    if ($s6.TranscriptActive) { Fail 'transcript reported unavailable but the session is marked active' }
+    else { Pass 'transcript unavailable in this host: returned $false without throwing (non-fatal by design)' }
+}
+
+# Stop on a session that never started a transcript must be a silent no-op.
+$s7 = Start-WuuAuditSession -Action 'no-transcript'
+$threwNoStart = $false
+try { Stop-WuuAuditTranscript -Session $s7 } catch { $threwNoStart = $true }
+if ($threwNoStart) { Fail 'Stop on a session with no transcript threw' }
+else { Pass 'Stop on a session with no transcript is a no-op' }
+
 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 if ($fail) { Write-Host 'SOME CHECKS FAILED' -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS' -ForegroundColor Cyan }

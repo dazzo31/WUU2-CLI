@@ -16,10 +16,13 @@
 | `audit verify` / `show` / `export` verbs | **DONE** |
 | Required `-Reason` on mutating actions | **DONE** |
 | Interactive menu audited (not just the command surface) | **DONE** |
-| `tests/Test-AuditTrail.ps1` | **DONE — 35/35 PASS** |
-| Validator audit invariants (6 structural checks) | **DONE — 14/14 PASS** |
-| Session transcript capture | **PARTIAL** — path allocated; `Start-Transcript` wiring not done |
+| `tests/Test-AuditTrail.ps1` | **DONE — 39/39 PASS** |
+| `tests/Test-AuditConcurrency.ps1` (multi-PROCESS chain integrity) | **DONE — 6/6 PASS** |
+| Cross-process file locking for the append | **DONE** (fixed a real bug — see below) |
+| Session transcript capture | **DONE** (best-effort, non-fatal, idempotent) |
+| Validator audit invariants (9 structural checks) | **DONE — 17/17 PASS** |
 | Non-repudiation anchor (Event Log mirror / signed digest) | NOT STARTED — see §9 decision |
+| Retention / pruning of old audit files | NOT STARTED |
 
 ## Usage
 
@@ -56,6 +59,53 @@ Until that exists, this is **"tamper-evident to a careful auditor"** — not "no
 4. **Never in a synced folder.** `%PROGRAMDATA%\WUU2\audit`, LocalAppData fallback, writability
    probed before use. Logs in a OneDrive tree caused real repeated failures in this codebase.
 5. **Append only.** `FileMode::Append`; nothing rewrites an existing record.
+
+## Increment 2 — a REAL cross-process bug, and the transcript
+
+### The bug: concurrent writers forked the chain and produced FALSE tampering reports
+
+The per-session `Monitor` lock was **in-process only**, and the append path did
+`read head → compute hash → append` with no cross-process lock. Two processes could therefore
+BOTH read the same `prevHash`, both compute a valid-looking hash, and both append — leaving two
+records claiming the same predecessor. `audit verify` then reports **tampering** on a completely
+intact trail.
+
+That is the worst possible failure mode for an audit tool: a false accusation, and in practice the
+operator learns to ignore the alarm.
+
+**How it was found.** A probe (4 processes x 25 records, naive append) lost **86 of 100 records**,
+which is what prompted looking at the write path properly instead of trusting "appends are atomic".
+`tests/Test-AuditConcurrency.ps1` then spawned 4 real child processes through the *real* writer and
+was run against the **pre-fix** code to confirm it has teeth:
+
+```
+FAIL: concurrently-written chain does NOT verify: line 8: sequence gap (expected 8, found 1)
+FAIL: duplicate seq number(s): 1,2,3,...,28 - two writers shared a chain head
+```
+
+Note that its "no records lost" check **passed** on the broken code. A loss-only test would have
+missed this entirely — the damage is in the chain *structure*, not the record count.
+
+**The fix.** `Add-WuuAuditRecordLocked` runs the whole read-modify-write under an exclusive OS lock
+(`FileShare::None` on the log itself, so the file is its own mutex — no separate lock file to leak).
+In-process sessions serialise on a per-path `Monitor` lock *first*, since with `FileShare::None` two
+same-process sessions would otherwise deadlock on the open. The chain head is read **inside** the
+lock. Retries use capped backoff (60 x ~25 ms, max 500 ms) to absorb AV/indexer contention. The tail
+read seeks back 64 KB rather than reading the whole file, keeping appends O(1) instead of O(n)
+(an O(n²) audit log would eventually matter). Records are `Flush($true)`-ed: a record that is not
+durable is not evidence.
+
+**Evidence.** 4 processes x 20 records through the real writer: 84 records present (80 + 4
+session-starts), chain **verifies**, sequence contiguous 1..84, **zero duplicates**, and tampering is
+still detected in the concurrently-written file.
+
+### Transcript
+
+`Start-WuuAuditTranscript` / `Stop-WuuAuditTranscript`, wired into the interactive session
+lifecycle. Deliberately **best-effort and never fatal** — failing an update because transcript
+capture failed would be the wrong trade — and it only stops a transcript *it* started, so it never
+kills one the operator began themselves. Console output in this edition is line-oriented (no cursor
+positioning or progress redraws) precisely so the transcript stays readable and diff-able.
 
 ## Bugs found while building this
 

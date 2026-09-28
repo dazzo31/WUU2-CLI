@@ -3740,6 +3740,9 @@ try {
         # (it would look like the only changes ever made were scripted ones).
         $auditSession = Start-WuuAuditSession -Action 'interactive-menu'
         Write-InfoLog "Audit session $($auditSession.RunId) -> $($auditSession.LogPath)"
+        # Capture what the operator SAW (best-effort, never fatal): the JSONL says what was done,
+        # the transcript is what answers "why did they think that was right?".
+        [void](Start-WuuAuditTranscript -Session $auditSession)
         $auditHook = {
             param([string]$ActionName, [string]$Reason, [scriptblock]$Body)
             Invoke-WuuAuditedAction -Session $auditSession -Action $ActionName -Reason $Reason -Body $Body
@@ -3749,6 +3752,7 @@ try {
             Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions -AuditHook $auditHook
         } finally {
             try { Write-WuuAuditRecord -Session $auditSession -Action 'session-end' -Result 'info' | Out-Null } catch { }
+            Stop-WuuAuditTranscript -Session $auditSession
         }
     }
 }

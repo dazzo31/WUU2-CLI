@@ -76,6 +76,64 @@ function Get-WuuAuditDirectory {
 
 #endregion Paths
 
+#region Session transcript
+
+function Start-WuuAuditTranscript {
+    <#
+    .SYNOPSIS Starts capturing the session's console output to the transcript file.
+    .DESCRIPTION
+    The JSONL trail records WHAT was done as structured data; the transcript records what the
+    operator SAW, which is what answers "why did they think that was the right thing to do?".
+
+    This is deliberately best-effort and OPT-IN:
+      * it never throws (a transcript failure must not stop an operation), and
+      * the caller says whether to use it.
+    Reason: Start-Transcript captures the host's output stream, which is broad and can interact
+    with a redirection the operator set up themselves. Failing an update because transcript
+    capture failed would be the wrong trade.
+
+    Console output in this edition is line-oriented (no cursor positioning or progress redraws)
+    precisely so the transcript stays readable and diff-able - see docs/CLI_AUDIT_PLAN.md 5.3.
+    #>
+    param(
+        [Parameter(Mandatory)]$Session,
+        [switch]$Force
+    )
+    if (-not $Session.TranscriptPath) { return $false }
+    if ($Session.PSObject.Properties['TranscriptActive'] -and $Session.TranscriptActive) { return $true }
+    try {
+        # -Force appends to an existing file if one is already open; harmless for a fresh path.
+        Start-Transcript -LiteralPath $Session.TranscriptPath -Append -Force -ErrorAction Stop | Out-Null
+        $Session | Add-Member -NotePropertyName TranscriptActive -NotePropertyValue $true -Force
+        Write-InfoLog "Audit transcript started: $($Session.TranscriptPath)"
+        return $true
+    } catch {
+        # Expected in some hosts (e.g. already transcribing, or a constrained host). Not fatal.
+        Write-DebugLog "Audit transcript unavailable ($($_.Exception.Message)) - continuing without it." -Level 'WARN'
+        $Session | Add-Member -NotePropertyName TranscriptActive -NotePropertyValue $false -Force
+        return $false
+    }
+}
+
+function Stop-WuuAuditTranscript {
+    <#
+    .SYNOPSIS Stops transcript capture if this session started it.
+    .DESCRIPTION Only stops what this session started, so WUU never kills a transcript the operator
+    started themselves for their own reasons.
+    #>
+    param([Parameter(Mandatory)]$Session)
+    if (-not ($Session.PSObject.Properties['TranscriptActive'] -and $Session.TranscriptActive)) { return }
+    try {
+        Stop-Transcript -ErrorAction Stop | Out-Null
+        Write-InfoLog 'Audit transcript stopped.'
+    } catch {
+        Write-DebugLog "Audit transcript stop failed: $($_.Exception.Message)" -Level 'WARN'
+    }
+    $Session.TranscriptActive = $false
+}
+
+#endregion Session transcript
+
 #region Canonical serialisation (the hash input)
 
 function Get-WuuCanonicalJson {
@@ -588,9 +646,12 @@ Export-ModuleMember -Function @(
     'Get-WuuAuditDirectory'
     'Get-WuuCanonicalJson'
     'Get-WuuRecordHash'
+    'Add-WuuAuditRecordLocked'
     'Start-WuuAuditSession'
     'Write-WuuAuditRecord'
     'Get-WuuAuditChainHead'
     'Test-WuuAuditChain'
     'Invoke-WuuAuditedAction'
+    'Start-WuuAuditTranscript'
+    'Stop-WuuAuditTranscript'
 )
