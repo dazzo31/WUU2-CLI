@@ -105,33 +105,40 @@ function Write-WuuStatusLine {
 function Get-WuuMenuActions {
     <# The operation surface, mirroring the GUI context menu 1:1 (see
        docs/CLI_AUDIT_PLAN.md section 4 for the parity table). Mutating actions are flagged
-       so the audit layer (Phase 4) can require a reason for them. #>
+       so the audit layer (Phase 4) can require a reason for them.
+
+       `Handler` names the $consoleActions key this entry invokes. It is carried as DATA (not just
+       closed over inside Run) so the guided workflow - and any test - can dispatch by name, verify
+       that every entry points at a handler that actually exists, and route mutating entries
+       through the audit choke point. A menu entry whose Run referenced a missing action used to be
+       silently unreachable; with Handler present it is a detectable defect. #>
     @(
-        @{ Key = '1';  Label = 'Check for updates';            Mutating = $false; Run = { param($ctx) & $ctx.EventGetUpdates } }
-        @{ Key = '2';  Label = 'Download updates';            Mutating = $true;  Run = { param($ctx) & $ctx.EventDownloadUpdates } }
-        @{ Key = '3';  Label = 'Install updates';             Mutating = $true;  Run = { param($ctx) & $ctx.EventInstallUpdates } }
-        @{ Key = '4';  Label = 'Restart computer(s)';         Mutating = $true;  Run = { param($ctx) & $ctx.EventRestartComputer } }
-        @{ Key = '5';  Label = 'Show available updates';      Mutating = $false; Run = { param($ctx) & $ctx.EventShowAvailableUpdates } }
-        @{ Key = '6';  Label = 'Show installed updates';      Mutating = $false; Run = { param($ctx) & $ctx.EventShowInstalledUpdates } }
-        @{ Key = '7';  Label = 'Update history';              Mutating = $false; Run = { param($ctx) & $ctx.EventShowUpdateHistory } }
-        @{ Key = '8';  Label = 'Audit WSUS updates';          Mutating = $false; Run = { param($ctx) & $ctx.EventAuditWSUSUpdates } }
-        @{ Key = '9';  Label = 'Add computer(s) manually';    Mutating = $false; Run = { param($ctx) & $ctx.EventAddComputer } }
-        @{ Key = 'a';  Label = 'Add from file (CSV/TXT)';     Mutating = $false; Run = { param($ctx) & $ctx.EventAddFile } }
-        @{ Key = 's';  Label = 'Show computers in a phase';   Mutating = $false; Run = { param($ctx) & $ctx.EventShowByPhase } }
-        @{ Key = 'p';  Label = 'Assign phase to selection';   Mutating = $false; Run = { param($ctx) & $ctx.EventAssignPhaseInteractive } }
-        @{ Key = 'r';  Label = 'Remove computer(s)';          Mutating = $false; Run = { param($ctx) & $ctx.EventRemoveSelected } }
-        @{ Key = 'c';  Label = 'Clear computer list';         Mutating = $false; Run = { param($ctx) & $ctx.ClearComputerList } }
-        @{ Key = 'x';  Label = 'Export list to file';         Mutating = $false; Run = { param($ctx) & $ctx.EventSaveComputerList } }
-        @{ Key = 'v';  Label = 'Save encrypted config';       Mutating = $false; Run = { param($ctx) & $ctx.EventSaveConfig } }
-        @{ Key = 'l';  Label = 'Load encrypted config';       Mutating = $false; Run = { param($ctx) & $ctx.EventLoadConfig } }
-        @{ Key = 'd';  Label = 'Set domain credentials';      Mutating = $false; Run = { param($ctx) & $ctx.EventSetDomainCredentials } }
-        @{ Key = 'o';  Label = 'Remove offline computers';    Mutating = $false; Run = { param($ctx) & $ctx.EventRemoveOfflineComputer } }
-        @{ Key = 'e';  Label = 'Show errors';                 Mutating = $false; Run = { param($ctx) & $ctx.GetErrors } }
-        @{ Key = 'g';  Label = 'View Windows Update log';     Mutating = $false; Run = { param($ctx) & $ctx.EventViewUpdateLog } }
-        @{ Key = 'w';  Label = 'Windows Update service';      Mutating = $true;  Run = { param($ctx) & $ctx.EventWUServiceActionInteractive } }
-        @{ Key = 't';  Label = 'Toggle auto download/install/reboot'; Mutating = $false; Run = { param($ctx) & $ctx.EventToggleSettings } }
-        @{ Key = '?';  Label = 'Help';                        Mutating = $false; Run = { param($ctx) & $ctx.ShowHelp } }
-        @{ Key = 'q';  Label = 'Quit';                        Mutating = $false; Run = { param($ctx) $ctx.Quit = $true } }
+        @{ Key = '1';  Label = 'Check for updates';            Mutating = $false; Handler = 'EventGetUpdates';                   Run = { param($ctx) & $ctx.EventGetUpdates } }
+        @{ Key = '2';  Label = 'Download updates';            Mutating = $true;  Handler = 'EventDownloadUpdates';              Run = { param($ctx) & $ctx.EventDownloadUpdates } }
+        @{ Key = '3';  Label = 'Install updates';             Mutating = $true;  Handler = 'EventInstallUpdates';               Run = { param($ctx) & $ctx.EventInstallUpdates } }
+        @{ Key = '4';  Label = 'Restart computer(s)';         Mutating = $true;  Handler = 'EventRestartComputer';              Run = { param($ctx) & $ctx.EventRestartComputer } }
+        @{ Key = '5';  Label = 'Show available updates';      Mutating = $false; Handler = 'EventShowAvailableUpdates';         Run = { param($ctx) & $ctx.EventShowAvailableUpdates } }
+        @{ Key = '6';  Label = 'Show installed updates';      Mutating = $false; Handler = 'EventShowInstalledUpdates';         Run = { param($ctx) & $ctx.EventShowInstalledUpdates } }
+        @{ Key = '7';  Label = 'Update history';              Mutating = $false; Handler = 'EventShowUpdateHistory';            Run = { param($ctx) & $ctx.EventShowUpdateHistory } }
+        @{ Key = '8';  Label = 'Audit WSUS updates';          Mutating = $false; Handler = 'EventAuditWSUSUpdates';            Run = { param($ctx) & $ctx.EventAuditWSUSUpdates } }
+        @{ Key = '9';  Label = 'Add computer(s) manually';    Mutating = $false; Handler = 'EventAddComputer';                 Run = { param($ctx) & $ctx.EventAddComputer } }
+        @{ Key = 'a';  Label = 'Add from file (CSV/TXT)';     Mutating = $false; Handler = 'EventAddFile';                     Run = { param($ctx) & $ctx.EventAddFile } }
+        @{ Key = 's';  Label = 'Show computers in a phase';   Mutating = $false; Handler = 'EventShowByPhase';                  Run = { param($ctx) & $ctx.EventShowByPhase } }
+        @{ Key = 'p';  Label = 'Assign phase to selection';   Mutating = $false; Handler = 'EventAssignPhaseInteractive';       Run = { param($ctx) & $ctx.EventAssignPhaseInteractive } }
+        @{ Key = 'r';  Label = 'Remove computer(s)';          Mutating = $false; Handler = 'EventRemoveSelected';               Run = { param($ctx) & $ctx.EventRemoveSelected } }
+        @{ Key = 'c';  Label = 'Clear computer list';         Mutating = $false; Handler = 'ClearComputerList';                 Run = { param($ctx) & $ctx.ClearComputerList } }
+        @{ Key = 'x';  Label = 'Export list to file';         Mutating = $false; Handler = 'EventSaveComputerList';             Run = { param($ctx) & $ctx.EventSaveComputerList } }
+        @{ Key = 'v';  Label = 'Save encrypted config';       Mutating = $false; Handler = 'EventSaveConfig';                   Run = { param($ctx) & $ctx.EventSaveConfig } }
+        @{ Key = 'l';  Label = 'Load encrypted config';       Mutating = $false; Handler = 'EventLoadConfig';                   Run = { param($ctx) & $ctx.EventLoadConfig } }
+        @{ Key = 'd';  Label = 'Set domain credentials';      Mutating = $false; Handler = 'EventSetDomainCredentials';         Run = { param($ctx) & $ctx.EventSetDomainCredentials } }
+        @{ Key = 'o';  Label = 'Remove offline computers';    Mutating = $false; Handler = 'EventRemoveOfflineComputer';        Run = { param($ctx) & $ctx.EventRemoveOfflineComputer } }
+        @{ Key = 'e';  Label = 'Show errors';                 Mutating = $false; Handler = 'GetErrors';                        Run = { param($ctx) & $ctx.GetErrors } }
+        @{ Key = 'g';  Label = 'View Windows Update log';     Mutating = $false; Handler = 'EventViewUpdateLog';                Run = { param($ctx) & $ctx.EventViewUpdateLog } }
+        @{ Key = 'w';  Label = 'Windows Update service';      Mutating = $true;  Handler = 'EventWUServiceActionInteractive';   Run = { param($ctx) & $ctx.EventWUServiceActionInteractive } }
+        @{ Key = 'n';  Label = 'Add computers from Active Directory'; Mutating = $false; Handler = 'EventAddAD';                 Run = { param($ctx) & $ctx.EventAddAD } }
+        @{ Key = 't';  Label = 'Toggle auto download/install/reboot'; Mutating = $false; Handler = 'EventToggleSettings';        Run = { param($ctx) & $ctx.EventToggleSettings } }
+        @{ Key = '?';  Label = 'Help';                        Mutating = $false; Handler = 'ShowHelp';                         Run = { param($ctx) & $ctx.ShowHelp } }
+        @{ Key = 'q';  Label = 'Quit';                        Mutating = $false; Handler = '';                                 Run = { param($ctx) $ctx.Quit = $true } }
     )
 }
 

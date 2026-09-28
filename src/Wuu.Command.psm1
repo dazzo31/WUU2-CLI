@@ -351,7 +351,10 @@ function Invoke-WuuCommand {
         # made. Interactive mode prompts; non-interactive mode fails without it.
         [string]$Reason = '',
         [switch]$Json,
-        [switch]$WhatIf
+        [switch]$WhatIf,
+        # Selects the pre-redesign flat interactive menu. Consumed by the caller; kept out of the
+        # unknown-option report so `wuu --flat-menu` is not mistaken for a typo.
+        [switch]$FlatMenu
     )
 
     $table = Get-WuuCommandTable
@@ -504,6 +507,8 @@ function ConvertTo-WuuCommandLine {
         '-computer' = 'Computer'; '-all' = 'All'; '-json' = 'Json'; '-whatif' = 'WhatIf'
         '-path' = 'Path'; '-column' = 'Column'; '-set' = 'Set'; '-help' = 'Help'
         '-reason' = 'Reason'; '-logpath' = 'LogPath'
+        # Interactive-mode switch, consumed by Start-WuuApplication (not a verb option).
+        '--flat-menu' = 'FlatMenu'
     }
     # Verbs that take a subverb as their second positional token.
     $subVerbVerbs = @('show', 'config', 'audit', 'service')
@@ -548,4 +553,9 @@ Export-ModuleMember -Function @(
     'Get-WuuCommandHelp'
     'Invoke-WuuCommand'
     'ConvertTo-WuuCommandLine'
+    # Exported because the guided UI's Reports/audit category (spec 20) invokes the audit verbs
+    # directly. It was previously module-private, which made those menu entries fail at runtime
+    # with "not recognized" - the same class of silent dead entry as the unwired EventAddAD
+    # handler, and caught by the same static check in tests\Test-Navigation.ps1.
+    'Invoke-WuuAuditCommand'
 )

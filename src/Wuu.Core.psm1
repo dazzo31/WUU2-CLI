@@ -12,9 +12,11 @@ function Import-WuuModules {
     param([Parameter(Mandatory)][string]$WuuRoot)
     # Wuu.State first: Wuu.Core's startup creates the state store via New-WuuStateStore, and
     # worker runspaces receive it. Wuu.Console is the presentation layer; Wuu.Command the
-    # scriptable verb layer; Wuu.Audit the tamper-evident trail. Order otherwise matters only
-    # for readability - all -Global.
-    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Audit','Wuu.Command')) {
+    # scriptable verb layer; Wuu.Audit the tamper-evident trail. Wuu.Session models the computer
+    # set as a first-class object and Wuu.Navigate owns the guided interactive workflow - both sit
+    # ABOVE the engine and only read/delegate to it. Order otherwise matters only for readability
+    # - all -Global.
+    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Session','Wuu.Audit','Wuu.Command','Wuu.Navigate')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
@@ -3556,6 +3558,25 @@ $consoleActions.EventRemoveSelected = {
 
 $consoleActions.ClearComputerList = { & $clearComputerList }
 
+# NOTE for tests: $consoleActions is assembled inside Start-WuuApplication, so it does NOT exist
+# from a bare `Import-Module Wuu.Core` - a test that needs the real wiring must either run the app
+# or verify handler names statically (see tests\Test-Navigation.ps1 and the validator's
+# "menu handler resolves" gate). Do not paper over this by having tests build their own action
+# map and call it verification: a hand-built map cannot fail the way the real one can, which is
+# precisely how the $eventAddAD handler stayed unwired and unreachable without any test noticing.
+
+# Active Directory acquisition.
+#
+# This adapter is what makes `EventAddAD` reachable. The $eventAddAD handler was written for the
+# console edition but was NEVER wired into $consoleActions, the flat menu, or the verb table - so
+# AD import was dead code: fully implemented, completely unreachable, and invisible to every test
+# because nothing could invoke it. Surfaced while implementing spec 4.3 (Active Directory
+# acquisition) in docs/INTERACTIVE_UI_SPEC.md, which needed it to exist.
+#
+# The release validator now fails the build if any menu entry names a handler with no adapter, so
+# this class of "implemented but unreachable" defect cannot recur silently.
+$consoleActions.EventAddAD = { & $eventAddAD }
+
 $consoleActions.EventAddComputer = {
     $ans = Read-WuuAnswer -Prompt '  Computer name(s), comma or semicolon separated' -Default ''
     if ([string]::IsNullOrWhiteSpace($ans)) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
@@ -3809,7 +3830,25 @@ try {
         }.GetNewClosure()
 
         try {
-            Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions -AuditHook $auditHook -DenialHook $denialHook
+            # The GUIDED workflow is the default interactive experience (docs/INTERACTIVE_UI_SPEC.md).
+            # It establishes a computer set before exposing any update operation, groups operations
+            # into categories, and dispatches every leaf through the SAME $consoleActions handlers
+            # the flat menu and the command surface use - so no operation is reimplemented and the
+            # audit hooks apply identically.
+            #
+            # `wuu --flat-menu` restores the previous flat 25-operation loop. It is a COMMAND-LINE
+            # OPTION rather than an environment variable on purpose: WUU relaunches itself elevated,
+            # and UAC gives the child a fresh environment (the parent's WUU2_FLAT_MENU would simply
+            # be absent in the elevated process, so the switch would silently do nothing). Arguments
+            # ARE forwarded across that hop - see the elevation block above.
+            $useFlatMenu = ($CommandArguments -contains '--flat-menu')
+            if ($useFlatMenu) {
+                Write-InfoLog 'Interactive mode: flat menu (--flat-menu)'
+                Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions -AuditHook $auditHook -DenialHook $denialHook
+            } else {
+                Write-InfoLog 'Interactive mode: guided workflow'
+                Start-WuuGuidedWorkflow -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions -AuditHook $auditHook -DenialHook $denialHook
+            }
         } finally {
             try { Write-WuuAuditRecord -Session $auditSession -Action 'session-end' -Result 'info' -Category 'session' | Out-Null } catch { }
             Stop-WuuAuditTranscript -Session $auditSession
