@@ -301,8 +301,13 @@ Get-ChildItem .\tests\Test-*.ps1 | ForEach-Object {
 }
 ```
 
-> `tests\Test-ColumnResize.ps1` and `tests\Test-DragResize.ps1` are stale — they load
-> `PresentationFramework` (GUI-edition leftovers) and will hang. They are not part of the suite.
+> `tests\Test-ColumnResize.ps1` and `tests\Test-DragResize.ps1` are GUI-edition leftovers — they
+> exercise WPF column drag-resize, which does not exist in this edition. ColumnResize fails on
+> its missing WPF assemblies; **DragResize hangs** (blocking dispatcher pump). Both should be
+> deleted. They are excluded from the task above.
+>
+> The other suites all run here: `Test-PendingDrain` passes, `Test-RemoteTask` skips politely
+> when not elevated, and `Test-CredentialTyping` fails against the GUI-era credential dialog.
 
 Build a release zip:
 

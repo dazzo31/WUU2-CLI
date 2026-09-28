@@ -1,0 +1,38 @@
+{
+    // WUU2-CLI workspace settings.
+    //
+    // This repo is the console/PowerShell edition. It is a SEPARATE GIT REPOSITORY from the GUI
+    // edition (dazzo31/WUU2) which sits alongside it at ..\WUU2 - the two share history but have
+    // diverged, so open the one you intend to work on as its own workspace rather than mixing
+    // them in one multi-root window. Mixing them makes it easy to commit a change to the wrong
+    // repo, and their release validation and test suites are not interchangeable.
+    "files.encoding": "utf8",
+    "files.eol": "\r\n",
+
+    // The release validator enforces a UTF-8 BOM on every shipped file that contains non-ASCII
+    // bytes. PS7's Set-Content -Encoding UTF8 writes BOM-LESS, and PowerShell 5.1 then reads the
+    // file as ANSI - a multi-byte character eats a quote and the parse error appears far away from
+    // the cause. This has broken this project three times, so it is gated in Validate-Release.ps1;
+    // do not set files.encoding to anything else.
+    "powershell.scriptAnalysis.enable": true,
+    "powershell.codeFormatting.preset": "OTBS",
+
+    // Markdown and PowerShell only - there is no build system, no package manager, no JS toolchain.
+    "files.exclude": {
+        "dist/": true
+    },
+    "search.exclude": {
+        "dist/": true
+    },
+
+    // The GUI edition's backups and packaged output must never be treated as current behaviour.
+    "files.associations": {
+        "*.psm1": "powershell",
+        "*.ps1": "powershell"
+    },
+    "[powershell]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.rulers": [100]
+    }
+}

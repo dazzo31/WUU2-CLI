@@ -1,0 +1,63 @@
+{
+    "version": "0.2.0",
+    "tasks": [
+        {
+            "label": "Validate release",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}\\Scripts\\Validate-Release.ps1"
+            ],
+            "group": { "kind": "test", "isDefault": true },
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run all test suites",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass",
+                "-Command",
+                "# Excludes only the two GUI-edition WPF suites, which cannot run in this edition: ColumnResize uses the WPF assemblies, DragResize HANGS on a blocking dispatcher pump. Measured, not assumed: Test-PendingDrain and Test-RemoteTask DO run here (PASS / SKIP-without-admin). Get-ChildItem '${workspaceFolder}\\tests\\Test-*.ps1' | Where-Object { $_.Name -notin @('Test-ColumnResize.ps1','Test-DragResize.ps1') } | ForEach-Object { Write-Host ('=== ' + $_.Name) -ForegroundColor Cyan; & powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File $_.FullName }"
+            ],
+            "group": "test",
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run app (interactive, elevates)",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA",
+                "-File", "${workspaceFolder}\\WUU.ps1"
+            ],
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run app (flat menu fallback)",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA",
+                "-File", "${workspaceFolder}\\WUU.ps1", "--flat-menu"
+            ],
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": []
+        },
+        {
+            "label": "Package release zip",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}\\Scripts\\Package-WUU2.ps1"
+            ],
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": []
+        }
+    ]
+}
