@@ -398,5 +398,42 @@ if ($cmdRaw -notmatch "'-logpath'") {
     Fail "-LogPath is not registered as a known option (audit export cannot name its input log)"
 } else { Pass '-LogPath is a registered option' }
 
+# (k) NO FUNCTION MAY REASSIGN ITS OWN PARAMETER.
+#     PowerShell variable names are CASE-INSENSITIVE, so a local named `$actions` IS the
+#     `$Actions` parameter - and since a parameter's declared type is enforced on every
+#     assignment, `$actions = Get-WuuMenuActions` (an Object[]) tried to coerce into the
+#     [hashtable]$Actions parameter and threw
+#         Cannot convert the "System.Object[]" value of type "System.Object[]" to
+#         type "System.Collections.Hashtable"
+#     That killed the console shell the instant the menu was drawn, making the interactive
+#     edition completely unusable - while every non-interactive test suite stayed green, because
+#     none of them draw the menu. This class has now bitten this project three times ($host,
+#     $pid, and this), so it is gated.
+$reassign = @()
+foreach ($modFile in @(Get-ChildItem -Path (Join-Path $root 'src') -Filter '*.psm1' -File)) {
+    $modErrs = $null
+    $modAst = [System.Management.Automation.Language.Parser]::ParseFile($modFile.FullName, [ref]$null, [ref]$modErrs)
+    if (-not $modAst) { continue }
+    foreach ($fn in $modAst.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        if (-not $fn.Body.ParamBlock) { continue }
+        $paramNames = @($fn.Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        if ($paramNames.Count -eq 0) { continue }
+        $assigned = @($fn.Body.FindAll({
+            $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $args[0].Left -is [System.Management.Automation.Language.VariableExpressionAst]
+        }, $true) | ForEach-Object { $_.Left.VariablePath.UserPath })
+        # NOTE: compared with -contains on UserPath, which is already case-insensitive for the
+        # comparison operators used here. Matching on the AST (not raw text) means comments
+        # cannot produce false positives - the same lesson as the RAW-vs-tokenised rule.
+        foreach ($a in $assigned) {
+            if ($paramNames -contains $a) { $reassign += "$($modFile.Name)::$($fn.Name) reassigns `$$a" }
+        }
+    }
+}
+$reassign = @($reassign | Sort-Object -Unique)
+if ($reassign.Count -gt 0) {
+    Fail "function(s) reassign their own parameter (case-insensitive collision - type coercion can throw): $($reassign -join '; ')"
+} else { Pass 'no function reassigns its own parameter (no case-insensitive collisions)' }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

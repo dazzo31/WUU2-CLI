@@ -143,8 +143,10 @@ function Write-WuuMenu {
     Write-Host ''
     Write-Host ("  Auto download: $dl   Auto install: $il   Auto reboot: $rb") -ForegroundColor DarkGray
     Write-Host '  ------------------------------------------------------------------' -ForegroundColor DarkGray
-    $actions = Get-WuuMenuActions
-    foreach ($a in $actions) {
+    # Named $menuActions, not $actions: case-insensitive naming means `$actions` would become a
+    # trap for anyone later adding a $Actions parameter to this function (see the collision gate).
+    $menuActions = Get-WuuMenuActions
+    foreach ($a in $menuActions) {
         $mark = if ($a.Mutating) { '*' } else { ' ' }
         Write-Host ("  [{0}] {1} {2}" -f $a.Key.PadLeft(2), $mark, $a.Label)
     }
@@ -193,7 +195,12 @@ function Start-WuuConsoleLoop {
     Write-WuuMenu -Store $Store
 
     $warnedNoAudit = $false
-    $actions = Get-WuuMenuActions
+    # NOT `$actions`: PowerShell variable names are CASE-INSENSITIVE, so `$actions` IS the
+    # `$Actions` parameter. Assigning the menu array to it tried to coerce Object[] into the
+    # declared [hashtable] and threw "Cannot convert the System.Object[] ... to Hashtable" -
+    # which killed the shell the moment the menu was drawn, making the interactive edition
+    # completely unusable. See the validator's case-insensitive-collision gate.
+    $menuActions = Get-WuuMenuActions
     while (-not $Actions.Quit) {
         # Drain queued work (auto-flow, retries) before waiting for input, then keep draining
         # while waiting - this is the replacement for the GUI's DispatcherTimer.
@@ -201,7 +208,14 @@ function Start-WuuConsoleLoop {
 
         $pressed = $null
         try {
-            if ([Console]::KeyAvailable) {
+            # Honour non-interactive mode: without this the menu keypress is the ONLY menu input
+            # that bypasses the Phase 2 input choke point. A test driving the menu, a redirected
+            # stdin, or any scripted run would then block forever inside ReadKey on a terminal
+            # nobody is typing into - the loop is unreachable, and the crash this check guards
+            # against could never be caught by a test.
+            if ((Get-WuuInputMode).NonInteractive) {
+                $pressed = [string](Read-WuuAnswer -Prompt 'Select' -Default 'q')
+            } elseif ([Console]::KeyAvailable) {
                 $key = [Console]::ReadKey($true)
                 $pressed = [string]$key.KeyChar
             }
@@ -217,7 +231,7 @@ function Start-WuuConsoleLoop {
         if ([string]::IsNullOrWhiteSpace($pressed)) { continue }
 
         $chosen = $null
-        foreach ($a in $actions) { if ($a.Key -eq $pressed.ToLowerInvariant()) { $chosen = $a; break } }
+        foreach ($a in $menuActions) { if ($a.Key -eq $pressed.ToLowerInvariant()) { $chosen = $a; break } }
         if (-not $chosen) {
             Write-Host "  Unknown selection '$pressed' - press ? for help." -ForegroundColor Yellow
             continue

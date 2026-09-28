@@ -95,7 +95,7 @@ Enhanced Version - 2025-07-08
 # across modules. Previously the banner and the audit records each hardcoded their own string,
 # so a release could ship with the log claiming one version and the audit trail recording
 # another - a genuine compliance problem for a field an ISO 27001 review relies on.
-$global:WuuVersion = 'v1.4.0-cli'
+$global:WuuVersion = 'v1.4.1-cli'
 
 # Toggle debug logging. Set to $true to enable detailed logging (performance impact).
 # WARNING: Enabling this creates large log files and reduces performance.

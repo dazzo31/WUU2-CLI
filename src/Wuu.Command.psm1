@@ -67,9 +67,9 @@ function Invoke-WuuAuditCommand {
     )
 
     # Resolve the log to READ. Never derived from -Path on export (that is the destination).
-    $logPath = $LogPath
-    if (-not $logPath -and $SubVerb -ne 'export' -and $Path) { $logPath = $Path }
-    if (-not $logPath) {
+    $resolvedLog = $LogPath
+    if (-not $resolvedLog -and $SubVerb -ne 'export' -and $Path) { $resolvedLog = $Path }
+    if (-not $resolvedLog) {
         $dir = Get-WuuAuditDirectory
         # Newest daily log, if any.
         $candidates = @(Get-ChildItem -LiteralPath $dir -Filter 'audit-*.jsonl' -File -ErrorAction SilentlyContinue |
@@ -78,19 +78,19 @@ function Invoke-WuuAuditCommand {
             Write-Host ("  No audit log found in {0}." -f $dir) -ForegroundColor Yellow
             return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = 'no audit log' }
         }
-        $logPath = $candidates[0].FullName
+        $resolvedLog = $candidates[0].FullName
     }
-    if (-not (Test-Path -LiteralPath $logPath)) {
-        Write-Host ("  Audit log not found: {0}" -f $logPath) -ForegroundColor Red
-        return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = "audit log not found: $logPath" }
+    if (-not (Test-Path -LiteralPath $resolvedLog)) {
+        Write-Host ("  Audit log not found: {0}" -f $resolvedLog) -ForegroundColor Red
+        return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = "audit log not found: $resolvedLog" }
     }
 
     switch ($SubVerb) {
         'verify' {
-            Write-Host ("  Verifying {0}" -f $logPath) -ForegroundColor Gray
-            $v = Test-WuuAuditChain -LogPath $logPath -Quiet
+            Write-Host ("  Verifying {0}" -f $resolvedLog) -ForegroundColor Gray
+            $v = Test-WuuAuditChain -LogPath $resolvedLog -Quiet
             if ($Json) {
-                [pscustomobject]@{ Command = 'audit verify'; LogPath = $logPath; Ok = $v.Ok; Checked = $v.Checked; FirstBreak = $v.FirstBreak; Problems = $v.Problems } | ConvertTo-Json -Depth 5
+                [pscustomobject]@{ Command = 'audit verify'; LogPath = $resolvedLog; Ok = $v.Ok; Checked = $v.Checked; FirstBreak = $v.FirstBreak; Problems = $v.Problems } | ConvertTo-Json -Depth 5
             } elseif ($v.Ok) {
                 Write-Host ("  Chain intact: {0} record(s) verified." -f $v.Checked) -ForegroundColor Green
             } else {
@@ -102,12 +102,12 @@ function Invoke-WuuAuditCommand {
             return [pscustomobject]@{ Ok = $v.Ok; Verb = 'audit'; SubVerb = $SubVerb; Checked = $v.Checked; FirstBreak = $v.FirstBreak }
         }
         'show' {
-            $recs = @(Get-Content -LiteralPath $logPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            $recs = @(Get-Content -LiteralPath $resolvedLog | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
                 ForEach-Object { $_ | ConvertFrom-Json })
             if ($Json) {
-                [pscustomobject]@{ Command = 'audit show'; LogPath = $logPath; Count = $recs.Count; Records = $recs } | ConvertTo-Json -Depth 8
+                [pscustomobject]@{ Command = 'audit show'; LogPath = $resolvedLog; Count = $recs.Count; Records = $recs } | ConvertTo-Json -Depth 8
             } else {
-                Write-Host ("  {0}  ({1} record(s))" -f $logPath, $recs.Count) -ForegroundColor White
+                Write-Host ("  {0}  ({1} record(s))" -f $resolvedLog, $recs.Count) -ForegroundColor White
                 $fmt = "  {0,5} {1,-21} {2,-13} {3,-10} {4,-18} {5}"
                 Write-Host ($fmt -f 'seq', 'timestampUtc', 'action', 'result', 'targets', 'reason') -ForegroundColor DarkCyan
                 foreach ($r in $recs) {
@@ -120,7 +120,7 @@ function Invoke-WuuAuditCommand {
             # Bundle the log (and the matching transcript, if present) into one file for a
             # compliance handoff. Deliberately a copy, never a re-encode: the exported file must
             # be byte-identical to the log or `audit verify` on the copy would be meaningless.
-            $outPath = if ($Path) { "$Path.export.zip" } else { Join-Path (Split-Path $logPath -Parent) ("audit-export-{0}.zip" -f (Get-Date -Format 'yyyyMMdd_HHmmss')) }
+            $outPath = if ($Path) { "$Path.export.zip" } else { Join-Path (Split-Path $resolvedLog -Parent) ("audit-export-{0}.zip" -f (Get-Date -Format 'yyyyMMdd_HHmmss')) }
             # Create the destination directory when -Path names one that does not exist yet.
             # Otherwise ZipFile::CreateFromDirectory throws ItemNotFoundException, which escaped
             # as a "CRITICAL ERROR - console shell failed" for what is really just a mistyped path.
@@ -130,8 +130,8 @@ function Invoke-WuuAuditCommand {
             }
             $staging = Join-Path $env:TEMP ("wuu_audit_export_{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
             New-Item -ItemType Directory -Path $staging -Force | Out-Null
-            Copy-Item -LiteralPath $logPath -Destination $staging -Force
-            $dirOfLog = Split-Path $logPath -Parent
+            Copy-Item -LiteralPath $resolvedLog -Destination $staging -Force
+            $dirOfLog = Split-Path $resolvedLog -Parent
             foreach ($t in @(Get-ChildItem -LiteralPath $dirOfLog -Filter 'transcript-*.log' -File -ErrorAction SilentlyContinue)) {
                 Copy-Item -LiteralPath $t.FullName -Destination $staging -Force
             }

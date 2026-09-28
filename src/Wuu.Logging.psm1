@@ -27,19 +27,26 @@ function Write-WuuLogEntry {
     )
     
     if (-not $LogPath) { return }
-    if (-not $LogLock) { $LogLock = New-Object System.Object }
-    
+    # Assign to a LOCAL, never back to $LogLock. PowerShell variable names are case-insensitive,
+    # so `$LogLock = ...` inside this function assigns its own [object]$LogLock parameter. That
+    # happens to work (the types match today) but it is the same pattern that made the console
+    # shell unusable in Wuu.Console (a local named `$actions` overwrote a [hashtable]$Actions
+    # parameter and threw on the type coercion). Type the local explicitly so the intent is clear
+    # and a future change to the parameter's type cannot turn this into a crash.
+    $effectiveLock = $LogLock
+    if (-not $effectiveLock) { $effectiveLock = New-Object System.Object }
+
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         $lockTaken = $false
         try {
-            [System.Threading.Monitor]::Enter($LogLock); $lockTaken = $true
+            [System.Threading.Monitor]::Enter($effectiveLock); $lockTaken = $true
             Add-Content -Path $LogPath -Value $Message -Force
             return
         } catch {
             if ($attempt -ge $MaxAttempts) { return }   # give up silently
             Start-Sleep -Milliseconds (100 * $attempt)   # brief backoff
         } finally {
-            if ($lockTaken) { [System.Threading.Monitor]::Exit($LogLock) }
+            if ($lockTaken) { [System.Threading.Monitor]::Exit($effectiveLock) }
         }
     }
 }
