@@ -1,4 +1,4 @@
-# Release validation (console edition).
+﻿# Release validation (console edition).
 #
 # The GUI checks (XAML load + FindName control resolution) no longer apply: ui/ was removed and
 # the shell renders the state store instead. What CAN still break the app at startup, and is
@@ -85,6 +85,55 @@ foreach ($handler in $menuHandlers) {
 }
 if ($missing.Count) { Fail ('menu references undefined action handler(s): ' + ($missing -join ', ')) }
 else { Pass "all $($menuHandlers.Count) menu handlers are defined in the action layer" }
+
+# --- 6. Command verbs map to action handlers --------------------------------------------
+# A verb naming a handler the action layer does not define would fail only when an operator
+# typed it, which is exactly the kind of gap a release check should catch instead.
+$cmdCode = Get-Content (Join-Path $root 'src\Wuu.Command.psm1') -Raw
+$verbActions = [regex]::Matches($cmdCode, "Action\s*=\s*'([A-Za-z]+)'") |
+    ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+$missingVerb = @()
+foreach ($va in $verbActions) {
+    if ($coreCode -notmatch ('\$consoleActions\.' + [regex]::Escape($va) + '\s*=')) { $missingVerb += $va }
+}
+if ($missingVerb.Count) { Fail ('command verbs reference undefined action handler(s): ' + ($missingVerb -join ', ')) }
+else { Pass "all $($verbActions.Count) command verb handlers are defined in the action layer" }
+
+# Sub-dispatched verbs (show/config/audit) name their handlers inside a hashtable literal.
+foreach ($sub in 'EventShowAvailableUpdates', 'EventShowInstalledUpdates', 'EventShowUpdateHistory', 'EventSaveConfig', 'EventLoadConfig') {
+    if ($cmdCode -match [regex]::Escape($sub) -and $coreCode -notmatch ('\$consoleActions\.' + [regex]::Escape($sub) + '\s*=')) {
+        Fail "sub-dispatched handler '$sub' is not defined in the action layer"
+    }
+}
+if (-not $failed) { Pass 'sub-dispatched verb handlers resolved' }
+
+# --- 7. Every verb in the table has help text and an Answers builder ---------------------
+$verbKeys = [regex]::Matches($cmdCode, "(?m)^\s*'([a-z-]+)'\s*=\s*@\{\s*$") | ForEach-Object { $_.Groups[1].Value }
+$noHelp = @()
+foreach ($k in $verbKeys) {
+    if ($cmdCode -notmatch ("'$([regex]::Escape($k))'\s*=\s*@\{[\s\S]{0,400}?Help\s*=")) { $noHelp += $k }
+}
+if ($noHelp.Count) { Fail ('verb(s) missing Help text: ' + ($noHelp -join ', ')) }
+else { Pass "all $($verbKeys.Count) verbs have Help text" }
+
+# --- 8. UTF-8 BOM on every file containing non-ASCII bytes -------------------------------
+# PS 5.1 reads a BOM-less file as ANSI. Multi-byte characters (the status emoji in Wuu.Core,
+# for example) then consume a following quote and the parse error surfaces far from the cause
+# ("Unexpected token 'MB'"). This has now recurred three times, so it is a release check rather
+# than a memory note. `Set-Content -Encoding UTF8` under PS 7 writes BOM-less - use
+# [Text.UTF8Encoding]::new($true) instead.
+$bomMissing = @()
+foreach ($f in $files) {
+    $bytes = [IO.File]::ReadAllBytes($f.FullName)
+    $hasNonAscii = $false
+    foreach ($byte in $bytes) { if ($byte -gt 127) { $hasNonAscii = $true; break } }
+    if ($hasNonAscii) {
+        $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+        if (-not $hasBom) { $bomMissing += $f.Name }
+    }
+}
+if ($bomMissing.Count) { Fail ('non-ASCII file(s) missing the UTF-8 BOM (PS 5.1 will mis-read these): ' + (($bomMissing | Select-Object -Unique) -join ', ')) }
+else { Pass 'every file with non-ASCII bytes carries the UTF-8 BOM' }
 
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

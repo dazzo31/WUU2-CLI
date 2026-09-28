@@ -11,15 +11,23 @@ function Import-WuuModules {
     # startup and tests/Test-PendingDrain.ps1 use this single import path.
     param([Parameter(Mandatory)][string]$WuuRoot)
     # Wuu.State first: Wuu.Core's startup creates the state store via New-WuuStateStore, and
-    # worker runspaces receive it. Wuu.Console provides the presentation layer the shell uses.
-    # Order otherwise matters only for readability - all are imported -Global.
-    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console')) {
+    # worker runspaces receive it. Wuu.Console is the presentation layer; Wuu.Command the
+    # scriptable verb layer. Order otherwise matters only for readability - all -Global.
+    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Command')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
 
 function Start-WuuApplication {
-    param([Parameter(Mandatory)][string]$WuuRoot)
+    param(
+        [Parameter(Mandatory)][string]$WuuRoot,
+        # Phase 2 command mode: when supplied, run ONE operation and exit instead of showing
+        # the interactive menu. Raw argv tokens (parsed by Wuu.Command).
+        [string[]]$CommandArguments = @(),
+        # Bounded wait for queued background work in command mode (seconds). A one-shot command
+        # must let the operation it started make progress before reporting.
+        [int]$CommandWaitSeconds = 120
+    )
 
     Import-WuuModules -WuuRoot $WuuRoot
 
@@ -2344,7 +2352,7 @@ $eventAddAD = { #Add computers from Active Directory (console edition)
         Write-Host "  Organizational Units:" -ForegroundColor White
         for ($n = 0; $n -lt $ous.Count; $n++) { Write-Host ("  [{0,3}] {1}" -f ($n + 1), $ous[$n]) }
         Write-Host "  [  0] (type an LDAP path manually)" -ForegroundColor DarkGray
-        $pick = Read-Host "  Choose an OU by number (Enter to cancel)"
+        $pick = Read-WuuAnswer -Prompt '  Choose an OU by number (Enter to cancel)' -Default ''
         if ([string]::IsNullOrWhiteSpace($pick)) { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
         if ($pick -match "^\d+$") {
             $idx = [int]$pick
@@ -2352,7 +2360,7 @@ $eventAddAD = { #Add computers from Active Directory (console edition)
         }
     }
     if (-not $chosenOu) {
-        $chosenOu = Read-Host "  LDAP path of the OU (e.g. OU=Workstations,DC=contoso,DC=com)"
+        $chosenOu = Read-WuuAnswer -Prompt '  LDAP path of the OU (e.g. OU=Workstations,DC=contoso,DC=com)' -Default ''
         if ([string]::IsNullOrWhiteSpace($chosenOu)) { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
     }
 
@@ -3489,7 +3497,7 @@ $consoleActions.EventRemoveOfflineComputer = {
 $consoleActions.EventAssignPhaseInteractive = {
     $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Assign a phase to which computers?')
     if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
-    $phase = Read-Host '  Phase (1-5)'
+    $phase = Read-WuuAnswer -Prompt '  Phase (1-5)' -Default ''
     if ($phase -notmatch '^[1-5]$') { Write-Host '  Invalid phase.' -ForegroundColor Yellow; return }
     foreach ($r in $rows) { $r.Phase = "Phase $phase" }
     if ($stateStore) { $stateStore.Touch() }
@@ -3513,7 +3521,7 @@ $consoleActions.EventRemoveSelected = {
 $consoleActions.ClearComputerList = { & $clearComputerList }
 
 $consoleActions.EventAddComputer = {
-    $ans = Read-Host '  Computer name(s), comma or semicolon separated'
+    $ans = Read-WuuAnswer -Prompt '  Computer name(s), comma or semicolon separated' -Default ''
     if ([string]::IsNullOrWhiteSpace($ans)) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
     $names = @($ans -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     & $AddEntry $names
@@ -3521,7 +3529,7 @@ $consoleActions.EventAddComputer = {
 }
 
 $consoleActions.EventAddFile = {
-    $path = Read-Host '  Path to CSV/TXT file'
+    $path = Read-WuuAnswer -Prompt '  Path to CSV/TXT file' -Default ''
     if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
         Write-Host '  File not found.' -ForegroundColor Red; return
     }
@@ -3531,7 +3539,7 @@ $consoleActions.EventAddFile = {
         if (-not $csv -or $csv.Count -eq 0) { Write-Host '  File contained no rows.' -ForegroundColor Yellow; return }
         $cols = @($csv[0].PSObject.Properties.Name)
         Write-Host "  Columns: $($cols -join ', ')"
-        $col = Read-Host "  Which column holds the computer name? (default '$($cols[0])')"
+        $col = Read-WuuAnswer -Prompt "  Which column holds the computer name? (default '$($cols[0])')" -Default ''
         if ([string]::IsNullOrWhiteSpace($col)) { $col = $cols[0] }
         if ($cols -notcontains $col) { Write-Host '  No such column.' -ForegroundColor Red; return }
         $names = @($csv | ForEach-Object { ([string]$_.$col).Trim() } | Where-Object { $_ })
@@ -3547,6 +3555,9 @@ $consoleActions.EventShowAvailableUpdates  = { & $eventShowAvailableUpdates }
 $consoleActions.EventShowInstalledUpdates  = { & $eventShowInstalledUpdates }
 $consoleActions.EventShowUpdateHistory     = { & $eventShowUpdateHistory }
 $consoleActions.EventAuditWSUSUpdates      = { & $eventAuditWSUSUpdates }
+# NOTE: this adapter was missing until the release validator caught the verb table pointing at a
+# nonexistent handler - the menu had the same gap (no key was bound to it), so nothing noticed.
+$consoleActions.EventViewUpdateLog         = { & $eventViewUpdateLog }
 $consoleActions.EventSaveComputerList      = { & $eventSaveComputerList }
 $consoleActions.EventSaveConfig            = { & $eventSaveConfig }
 $consoleActions.EventLoadConfig            = { & $eventLoadConfig }
@@ -3556,7 +3567,7 @@ $consoleActions.GetErrors                  = { & $GetErrors }
 $consoleActions.EventWUServiceActionInteractive = {
     $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Target computer(s) for the service action?')
     if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
-    $act = Read-Host '  Action: (s)tart, (t)op, or (r)estart'
+    $act = Read-WuuAnswer -Prompt '  Action: (s)tart, (t)op, or (r)estart' -Default ''
     $map = @{ 's' = 'Start'; 't' = 'Stop'; 'r' = 'Restart' }
     $key = $act.Trim().ToLowerInvariant()
     if (-not $map.ContainsKey($key)) { Write-Host '  Invalid action.' -ForegroundColor Yellow; return }
@@ -3634,11 +3645,95 @@ try {
         Write-InfoLog "Encrypted computer list present at $startupConfig - press [l] to load it."
     }
 
-    Write-Host ''
-    Write-Host '  WUU2-CLI - Windows Update Utility (console edition)' -ForegroundColor White
-    Write-Host '  Press ? for help, t to toggle auto download/install/reboot, q to quit.' -ForegroundColor DarkGray
+    if ($CommandArguments -and $CommandArguments.Count -gt 0) {
+        # ---- Phase 2: one-shot command mode ---------------------------------------------
+        # Parsed by Wuu.Command and dispatched to the SAME $consoleActions handlers the menu
+        # uses, with input switched to non-interactive (missing required input fails loudly
+        # instead of prompting). See Wuu.Command.psm1's header for the verb table.
+        $parsed = ConvertTo-WuuCommandLine -Arguments $CommandArguments
 
-    Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions
+        if ($parsed.Unknown.Count -gt 0) {
+            Write-Host ("  Unrecognised option(s): {0}" -f ($parsed.Unknown -join ', ')) -ForegroundColor Yellow
+        }
+        if ($parsed.Options.ContainsKey('Help') -or -not $parsed.Verb) {
+            Get-WuuCommandHelp -Verb $parsed.Verb
+            if (-not $parsed.Verb -and -not $parsed.Options.ContainsKey('Help')) {
+                Write-Host '  No verb given - nothing to do. Use -Help for usage.' -ForegroundColor Yellow
+            }
+        } else {
+            # Load the saved computer list first when one exists, so `wuu check -All` works
+            # against the operator's list without an interactive load step. Without this a
+            # scripted `-All` would find an empty store and silently do nothing.
+            if ((Test-Path $startupConfig) -and $parsed.Verb -ne 'add' -and $parsed.Verb -ne 'add-file') {
+                try {
+                    $credForLoad = $null
+                    if ($parsed.Options['Password']) { $credForLoad = $parsed.Options['Password'] }
+                    if ($parsed.Options['Computer']) { }   # no-op guard (readability)
+                    $loadRes = Import-ComputerListConfig -ConfigPath $startupConfig -Password $credForLoad
+                    if ($loadRes.Success) {
+                        foreach ($compData in $loadRes.Config.Computers) {
+                            $existing = Get-WuuComputerRow -Store $stateStore -Computer $compData.Computer
+                            if ($existing) { continue }
+                            $row = New-WuuComputerRow -Computer $(if ($compData.Computer) { $compData.Computer } else { 'Unknown' }) `
+                                                      -Phase $(if ($compData.Phase) { $compData.Phase } else { 'Phase 1' }) `
+                                                      -StateSource 'CommandMode'
+                            $row.Status = 'Loaded from config. Run `wuu check` to refresh status.'
+                            $row.UpdatesStatus = 'Unknown'
+                            $row.Pending = $false
+                            Add-WuuComputerRow -Store $stateStore -Row $row | Out-Null
+                        }
+                        Write-InfoLog "Command mode: loaded $($stateStore.Rows.Count) computer(s) from config"
+                    } else {
+                        Write-Host ("  Could not load $startupConfig : {0}" -f $loadRes.Error) -ForegroundColor Yellow
+                        Write-Host '  Continuing with an empty list (use `wuu add` to populate it).' -ForegroundColor Yellow
+                    }
+                } catch {
+                    Write-WarningLog "Command mode: config load failed: $($_.Exception.Message)"
+                }
+            }
+
+            $result = Invoke-WuuCommand -Verb $parsed.Verb -Actions $consoleActions -Store $stateStore `
+                -Computer $parsed.Options['Computer'] -All:$parsed.Options['All'] `
+                -Path $parsed.Options['Path'] -Column $parsed.Options['Column'] `
+                -Set $(if ($parsed.Options['Set']) { [int]$parsed.Options['Set'] } else { 0 }) `
+                -ServiceAction $parsed.SubVerb `
+                -SubVerb $parsed.SubVerb -Json:$parsed.Options['Json'] -WhatIf:$parsed.Options['WhatIf']
+
+            # Give queued background work a bounded chance to run, then report state. A one-shot
+            # command must not return before the operation it started has had an opportunity to
+            # make progress, or `wuu check` would exit having done nothing visible.
+            $deadline = (Get-Date).AddSeconds($CommandWaitSeconds)
+            while ((Get-Date) -lt $deadline -and $jobs.Count -gt 0) {
+                try { & $drainScheduler } catch { Write-ErrorLog "Scheduler tick failed: $($_.Exception.Message)" }
+                Start-Sleep -Milliseconds 250
+            }
+
+            if ($parsed.Options['Json']) {
+                $snapshot = @(Get-WuuComputerRow -Store $stateStore | ForEach-Object {
+                    [pscustomobject]@{
+                        Computer = $_.Computer; Phase = $_.Phase; State = $_.State
+                        UpdatesStatus = $_.UpdatesStatus; Available = $_.Available
+                        Downloaded = $_.Downloaded; RebootRequired = $_.RebootRequired
+                        Status = $_.Status
+                    }
+                })
+                [pscustomobject]@{ Command = $parsed.Verb; Ok = $result.Ok; Computers = $snapshot } | ConvertTo-Json -Depth 5
+            } else {
+                Write-WuuStatusTable -Store $stateStore
+                Write-WuuStatusLine -Store $stateStore
+            }
+
+            if (-not $result.Ok) { $script:CommandExitCode = 1 }
+        }
+    }
+    else {
+        Write-Host ''
+        Write-Host '  WUU2-CLI - Windows Update Utility (console edition)' -ForegroundColor White
+        Write-Host '  Press ? for help, t to toggle auto download/install/reboot, q to quit.' -ForegroundColor DarkGray
+        Write-Host '  Run with -Help for scriptable commands (wuu check -All, wuu install -Computer X).' -ForegroundColor DarkGray
+
+        Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions
+    }
 }
 catch {
     Write-ErrorLog "CRITICAL ERROR - console shell failed: $($_.Exception.Message)"
@@ -3717,6 +3812,12 @@ finally {
 
     Write-InfoLog "Application shutdown cleanup complete"
     Write-InfoLog "Windows Update Utility has been closed"
+
+    # Command mode reports failure through the process exit code so a script/CI can branch on it.
+    # Set AFTER cleanup so the code reflects the operation result, not a teardown hiccup.
+    if ($CommandArguments -and $CommandArguments.Count -gt 0) {
+        if ($script:CommandExitCode) { exit $script:CommandExitCode } else { exit 0 }
+    }
 }
 #endregion Start the console shell
 }

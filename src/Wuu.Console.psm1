@@ -127,6 +127,7 @@ function Get-WuuMenuActions {
         @{ Key = 'd';  Label = 'Set domain credentials';      Mutating = $false; Run = { param($ctx) & $ctx.EventSetDomainCredentials } }
         @{ Key = 'o';  Label = 'Remove offline computers';    Mutating = $false; Run = { param($ctx) & $ctx.EventRemoveOfflineComputer } }
         @{ Key = 'e';  Label = 'Show errors';                 Mutating = $false; Run = { param($ctx) & $ctx.GetErrors } }
+        @{ Key = 'g';  Label = 'View Windows Update log';     Mutating = $false; Run = { param($ctx) & $ctx.EventViewUpdateLog } }
         @{ Key = 'w';  Label = 'Windows Update service';      Mutating = $true;  Run = { param($ctx) & $ctx.EventWUServiceActionInteractive } }
         @{ Key = 't';  Label = 'Toggle auto download/install/reboot'; Mutating = $false; Run = { param($ctx) & $ctx.EventToggleSettings } }
         @{ Key = '?';  Label = 'Help';                        Mutating = $false; Run = { param($ctx) & $ctx.ShowHelp } }
@@ -224,20 +225,110 @@ function Start-WuuConsoleLoop {
 
 #endregion Input loop
 
+#region Non-interactive input provider
+
+<#
+WHY THIS EXISTS
+---------------
+Phase 2 needs `wuu check -Computer SRV01` etc. to run the SAME operations as the menu. The
+action handlers obtain input through Read-WuuSelection / Read-WuuYesNo / Read-Host, so rather
+than duplicating 23 handlers for scripted use, this module provides ONE choke point that those
+helpers consult:
+
+  * interactive (default)      -> prompt on the console, as before
+  * non-interactive (command)  -> take the next pre-supplied answer from a queue; if the queue
+                                  is exhausted use the caller's default; if there is no default,
+                                  FAIL LOUDLY ("required input missing") instead of hanging
+
+That last property is the point: a scripted/CI run must never block on a prompt. It is also the
+whole reason the handlers could be reused unchanged - no handler knows it is being scripted.
+#>
+
+$script:WuuNonInteractive = $false
+$script:WuuAnswers = New-Object System.Collections.Queue
+$script:WuuAnswersUsed = 0
+
+function Initialize-WuuInputMode {
+    <#
+    .SYNOPSIS Switches input between interactive prompting and scripted answers.
+    .PARAMETER NonInteractive Enqueue-answers mode; no console reads.
+    .PARAMETER Answers Ordered answers for successive input requests (selection, yes/no, etc.).
+    #>
+    param(
+        [switch]$NonInteractive,
+        [object[]]$Answers = @()
+    )
+    $script:WuuNonInteractive = [bool]$NonInteractive
+    $script:WuuAnswers = New-Object System.Collections.Queue
+    $script:WuuAnswersUsed = 0
+    if ($Answers) { foreach ($a in $Answers) { $script:WuuAnswers.Enqueue($a) } }
+}
+
+function Get-WuuInputMode {
+    [pscustomobject]@{
+        NonInteractive = $script:WuuNonInteractive
+        AnswersQueued  = $script:WuuAnswers.Count
+        AnswersUsed    = $script:WuuAnswersUsed
+    }
+}
+
+function Read-WuuAnswer {
+    <#
+    .SYNOPSIS The single input choke point used by every interactive helper.
+    .DESCRIPTION
+    Interactive: prompts with Read-Host (or Read-Host -AsSecureString).
+    Non-interactive: dequeues the next supplied answer, else returns -Default, else THROWS.
+    The throw is deliberate - a missing required input must fail the command, not hang it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [object]$Default = $null,
+        [switch]$Secure,
+        [switch]$HasDefault
+    )
+    if ($script:WuuNonInteractive) {
+        if ($script:WuuAnswers.Count -gt 0) {
+            $script:WuuAnswersUsed++
+            $a = $script:WuuAnswers.Dequeue()
+            Write-Host ("  {0} => {1}" -f $Prompt.Trim(), $(if ($Secure) { '(supplied)' } else { $a })) -ForegroundColor DarkGray
+            return $a
+        }
+        if ($HasDefault -or $null -ne $Default) {
+            Write-Host ("  {0} => (default) {1}" -f $Prompt.Trim(), $Default) -ForegroundColor DarkGray
+            return $Default
+        }
+        throw "Required input missing in non-interactive mode: '$($Prompt.Trim())'. Supply it as a parameter (e.g. -Computer) or drop -NonInteractive."
+    }
+
+    if ($Secure) {
+        try {
+            $sec = Read-Host -Prompt $Prompt -AsSecureString
+        } catch {
+            Write-ErrorLog "Secure input unavailable: $($_.Exception.Message)"
+            return $null
+        }
+        if ($null -eq $sec -or $sec.Length -eq 0) { return $null }
+        return $sec
+    }
+    return (Read-Host $Prompt)
+}
+
+#endregion Non-interactive input provider
+
 #region Selectors (shared by menu actions)
 
 function Read-WuuSelection {
-    <# Resolves which computers an action applies to. Accepts '*' for all, a comma list of
-       names, or a phase filter - the console equivalent of the GUI's row selection. #>
+<# Resolves which computers an action applies to. Accepts '*' for all, a comma list of
+   names, or a phase filter - the console equivalent of the GUI's row selection. #>
     param(
         [Parameter(Mandatory)][hashtable]$Store,
         [string]$Prompt = 'Computer(s) - name(s), "all", or Enter to cancel'
     )
     $all = @(Get-WuuComputerRow -Store $Store)
     if ($all.Count -eq 0) { Write-Host '  No computers in the list.' -ForegroundColor Yellow; return @() }
-    $ans = Read-Host "  $Prompt"
+    $ans = Read-WuuAnswer -Prompt "  $Prompt" -Default ''
     if ([string]::IsNullOrWhiteSpace($ans)) { return @() }
-    $ans = $ans.Trim()
+    $ans = ([string]$ans).Trim()
     if ($ans -match '^(all|\*)$') { return $all }
     $wanted = $ans -split '[,;]'
     $picked = New-Object System.Collections.ArrayList
@@ -261,9 +352,9 @@ function Read-WuuSelection {
 function Read-WuuYesNo {
     param([string]$Prompt, [bool]$Default = $false)
     $suffix = if ($Default) { '[Y/n]' } else { '[y/N]' }
-    $ans = Read-Host "  $Prompt $suffix"
-    if ([string]::IsNullOrWhiteSpace($ans)) { return $Default }
-    return ($ans.Trim() -match '^(y|yes)$')
+    $ans = Read-WuuAnswer -Prompt "  $Prompt $suffix" -Default '' -HasDefault
+    if ([string]::IsNullOrWhiteSpace([string]$ans)) { return $Default }
+    return (([string]$ans).Trim() -match '^(y|yes)$')
 }
 
 #endregion Selectors
@@ -276,6 +367,9 @@ Export-ModuleMember -Function @(
     'Get-WuuMenuActions'
     'Write-WuuMenu'
     'Start-WuuConsoleLoop'
+    'Initialize-WuuInputMode'
+    'Get-WuuInputMode'
+    'Read-WuuAnswer'
     'Read-WuuSelection'
     'Read-WuuYesNo'
 )

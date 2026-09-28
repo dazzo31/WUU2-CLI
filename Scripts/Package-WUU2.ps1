@@ -1,4 +1,4 @@
-param(
+﻿param(
     # Nested Join-Path keeps Windows PowerShell 5.1 compatibility (3-arg Join-Path is PS7+)
     [string]$OutputDirectory = (Join-Path (Join-Path $PSScriptRoot "..") "dist"),
     [string]$ZipName = ("WUU2_{0}.zip" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
