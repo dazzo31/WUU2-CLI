@@ -104,13 +104,40 @@ else {
     else { Pass "sequence is contiguous 1..$($seqs.Count) with no duplicates" }
 
     # 5. Tampering is still detected in a concurrently-written file.
+    #
+    #    The target line is located by CONTENT, not by a fixed index. This matters: every writer
+    #    calls Start-WuuAuditSession, which appends a 'session-start' record, so the first few
+    #    lines of the file are session-start records whose text contains no data payload. A fixed
+    #    index of 2 therefore edited a line that had nothing to replace: the -replace was a silent
+    #    no-op, the file was untouched, verification correctly reported an intact chain, and the
+    #    test failed claiming "tampering NOT detected" - a false failure that looked like a
+    #    chain-integrity bug. It reproduced roughly one run in three (it depended on which writer
+    #    won the first append). Locate the record by what it contains, and assert the edit landed.
     $tampered = Join-Path $dir 'tampered.jsonl'
     $lines = [System.Collections.ArrayList]@(Get-Content -LiteralPath $logPath)
-    $lines[2] = ($lines[2] -replace '"concurrent-write"', '"INJECTED"')
-    Set-Content -LiteralPath $tampered -Value $lines -Encoding UTF8
-    $tv = Test-WuuAuditChain -LogPath $tampered -Quiet
-    if ($tv.Ok) { Fail 'tampering NOT detected in a concurrently-written log' }
-    else { Pass "tampering still detected at line $($tv.FirstBreak) in the concurrent log" }
+
+    $targetIndex = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '"concurrent-write"') { $targetIndex = $i; break }
+    }
+    if ($targetIndex -lt 0) {
+        Fail "cannot test tamper detection: no 'concurrent-write' record found in the log"
+    } else {
+        # Overwrite the action value. The replacement is a DIFFERENT string so the edit is real.
+        $original = $lines[$targetIndex]
+        $lines[$targetIndex] = $original -replace '"concurrent-write"', '"INJECTED"'
+
+        # Guard against the silent no-op: if the line is unchanged, nothing was tampered with and
+        # a passing/failing verification result would be meaningless either way.
+        if ($lines[$targetIndex] -eq $original) {
+            Fail "tamper edit was a no-op (line $($targetIndex + 1) unchanged) - the check would be vacuous"
+        } else {
+            Set-Content -LiteralPath $tampered -Value $lines -Encoding UTF8
+            $tv = Test-WuuAuditChain -LogPath $tampered -Quiet
+            if ($tv.Ok) { Fail 'tampering NOT detected in a concurrently-written log' }
+            else { Pass "tampering still detected at line $($tv.FirstBreak) in the concurrent log" }
+        }
+    }
 }
 
 Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
