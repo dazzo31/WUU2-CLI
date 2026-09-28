@@ -48,14 +48,27 @@ function Invoke-WuuAuditCommand {
     .DESCRIPTION
     These inspect the audit log itself (Phase 4), not a target's WSUS state (that is
     `audit wsus`). verify exits non-zero on a broken chain so CI can gate on it.
+
+    -Path means different things per subverb and that is deliberate, but it used to be
+    accidental: verify/show read it as the log to INSPECT, export writes it as the
+    DESTINATION. Because -Path was blindly assigned to $logPath first, `audit export -Path D:\out`
+    tried to copy a log from D:\out and threw ItemNotFoundException, surfacing as a
+    "CRITICAL ERROR - console shell failed" for what is just an output path. Use -LogPath to
+    name the log explicitly for any subverb.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('verify', 'show', 'export')][string]$SubVerb,
+        # For verify/show: the log file to inspect. For export: the output destination.
         [string]$Path,
+        # Explicit log to inspect/export. Overrides the default "newest daily log" resolution
+        # and is unambiguous regardless of subverb.
+        [string]$LogPath,
         [switch]$Json
     )
 
-    $logPath = $Path
+    # Resolve the log to READ. Never derived from -Path on export (that is the destination).
+    $logPath = $LogPath
+    if (-not $logPath -and $SubVerb -ne 'export' -and $Path) { $logPath = $Path }
     if (-not $logPath) {
         $dir = Get-WuuAuditDirectory
         # Newest daily log, if any.
@@ -66,6 +79,10 @@ function Invoke-WuuAuditCommand {
             return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = 'no audit log' }
         }
         $logPath = $candidates[0].FullName
+    }
+    if (-not (Test-Path -LiteralPath $logPath)) {
+        Write-Host ("  Audit log not found: {0}" -f $logPath) -ForegroundColor Red
+        return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = "audit log not found: $logPath" }
     }
 
     switch ($SubVerb) {
@@ -104,6 +121,13 @@ function Invoke-WuuAuditCommand {
             # compliance handoff. Deliberately a copy, never a re-encode: the exported file must
             # be byte-identical to the log or `audit verify` on the copy would be meaningless.
             $outPath = if ($Path) { "$Path.export.zip" } else { Join-Path (Split-Path $logPath -Parent) ("audit-export-{0}.zip" -f (Get-Date -Format 'yyyyMMdd_HHmmss')) }
+            # Create the destination directory when -Path names one that does not exist yet.
+            # Otherwise ZipFile::CreateFromDirectory throws ItemNotFoundException, which escaped
+            # as a "CRITICAL ERROR - console shell failed" for what is really just a mistyped path.
+            $outDir = Split-Path $outPath -Parent
+            if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
+                New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+            }
             $staging = Join-Path $env:TEMP ("wuu_audit_export_{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
             New-Item -ItemType Directory -Path $staging -Force | Out-Null
             Copy-Item -LiteralPath $logPath -Destination $staging -Force
@@ -111,14 +135,36 @@ function Invoke-WuuAuditCommand {
             foreach ($t in @(Get-ChildItem -LiteralPath $dirOfLog -Filter 'transcript-*.log' -File -ErrorAction SilentlyContinue)) {
                 Copy-Item -LiteralPath $t.FullName -Destination $staging -Force
             }
+            # Copy the compliance documentation alongside the evidence. An auditor receiving a
+            # bundle needs the control mapping and the retention policy: without them the zip is
+            # just JSONL, and "what am I looking at and how long is it kept?" is unanswerable.
+            $docsDir = Join-Path $PSScriptRoot '..\docs'
+            foreach ($docName in @('ISO_27001_A815_MAPPING.md', 'AUDIT_RETENTION.md', 'CLI_AUDIT_PLAN.md')) {
+                $docPath = Join-Path $docsDir $docName
+                if (Test-Path -LiteralPath $docPath) {
+                    Copy-Item -LiteralPath $docPath -Destination $staging -Force
+                }
+            }
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             if (Test-Path -LiteralPath $outPath) { Remove-Item -LiteralPath $outPath -Force }
             [IO.Compression.ZipFile]::CreateFromDirectory($staging, $outPath)
+            # Verify the bundle before claiming success: a silently-empty or unreadable zip handed
+            # to an auditor is worse than a loud failure here.
+            $entryCount = 0
+            try {
+                $zr = [IO.Compression.ZipFile]::OpenRead($outPath)
+                $entryCount = $zr.Entries.Count
+                $zr.Dispose()
+            } catch {
+                Write-Host ("  Export verification FAILED: {0}" -f $_.Exception.Message) -ForegroundColor Red
+                Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+                return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = "export bundle unreadable: $($_.Exception.Message)" }
+            }
             Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host ("  Exported audit bundle: {0}" -f $outPath) -ForegroundColor Green
+            Write-Host ("  Exported audit bundle: {0} ({1} entries)" -f $outPath, $entryCount) -ForegroundColor Green
             Write-Host '  NOTE: the bundle carries the hash chain but NO external anchor, so it is' -ForegroundColor DarkGray
-            Write-Host '        tamper-EVIDENT, not non-repudiable. See docs/CLI_AUDIT_PLAN.md 5.6.' -ForegroundColor DarkGray
-            return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Path = $outPath }
+            Write-Host '        tamper-EVIDENT, not non-repudiable. See docs/ISO_27001_A815_MAPPING.md 8.' -ForegroundColor DarkGray
+            return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Path = $outPath; Entries = $entryCount }
         }
     }
 }
@@ -256,6 +302,8 @@ function Get-WuuCommandHelp {
     Write-Host '    -Computer <names>   comma-separated names, or "all"'
     Write-Host '    -All                shortcut for -Computer all'
     Write-Host '    -Reason <text>      why this change was made (recorded in the audit trail)'
+    Write-Host '    -Path <file>        audit verify|show: the log to inspect. audit export: the output destination'
+    Write-Host '    -LogPath <file>     audit verify|show|export: the audit log to read (unambiguous)'
     Write-Host '    -Json               machine-readable output (read verbs)'
     Write-Host '    -WhatIf             report what would happen; change nothing'
     Write-Host '    -Help               this help, or per-verb help with a verb'
@@ -296,6 +344,9 @@ function Invoke-WuuCommand {
         [ValidateRange(0, 5)][int]$Set = 0,
         [ValidateSet('', 'start', 'stop', 'restart')][string]$ServiceAction,
         [string]$SubVerb,
+        # The audit log to inspect/export, for `audit verify|show|export`. Distinct from -Path,
+        # which is ambiguous (a log for verify/show, an output destination for export).
+        [string]$LogPath,
         # Required for mutating verbs once audit is active (Phase 4): records WHY the change was
         # made. Interactive mode prompts; non-interactive mode fails without it.
         [string]$Reason = '',
@@ -334,7 +385,7 @@ function Invoke-WuuCommand {
         # trail itself (Phase 4) and are handled before the action lookup, since they are not
         # $consoleActions operations.
         if ($SubVerb -in @('verify', 'show', 'export')) {
-            return Invoke-WuuAuditCommand -SubVerb $SubVerb -Path $Path -Json:$Json
+            return Invoke-WuuAuditCommand -SubVerb $SubVerb -Path $Path -LogPath $LogPath -Json:$Json
         }
         if ($SubVerb -ne 'wsus') {
             return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu audit needs one of: wsus, verify, show, export' }
@@ -452,7 +503,7 @@ function ConvertTo-WuuCommandLine {
     $known = @{
         '-computer' = 'Computer'; '-all' = 'All'; '-json' = 'Json'; '-whatif' = 'WhatIf'
         '-path' = 'Path'; '-column' = 'Column'; '-set' = 'Set'; '-help' = 'Help'
-        '-reason' = 'Reason'
+        '-reason' = 'Reason'; '-logpath' = 'LogPath'
     }
     # Verbs that take a subverb as their second positional token.
     $subVerbVerbs = @('show', 'config', 'audit', 'service')

@@ -538,7 +538,10 @@ function Write-WuuAuditRecord {
         error         = $ErrorMessage
         counts        = $Counts
         durationMs    = $DurationMs
-        wuuVersion    = 'v1.3.4-cli'
+        # Read from the single version constant rather than a literal, so a release cannot ship
+        # with the audit trail claiming a different version than the app actually is. Falls back
+        # only when the module is used standalone (e.g. a unit test importing just Wuu.Audit).
+        wuuVersion    = if ($global:WuuVersion) { [string]$global:WuuVersion } else { 'unknown' }
         prevHash      = ''
     }
 

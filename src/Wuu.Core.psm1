@@ -90,6 +90,13 @@ Enhanced Version - 2025-07-08
 
 #region Configuration
 
+# The CLI edition's version, in ONE place. $global: so Wuu.Logging (banner) and Wuu.Audit
+# (wuuVersion on every audit record) can both read it - module-scoped variables are invisible
+# across modules. Previously the banner and the audit records each hardcoded their own string,
+# so a release could ship with the log claiming one version and the audit trail recording
+# another - a genuine compliance problem for a field an ISO 27001 review relies on.
+$global:WuuVersion = 'v1.4.0-cli'
+
 # Toggle debug logging. Set to $true to enable detailed logging (performance impact).
 # WARNING: Enabling this creates large log files and reduces performance.
 $global:EnableDebugLogging = $true
@@ -189,7 +196,7 @@ $global:LogLock = New-Object System.Object
 
 # Initialize debug log
 if ($global:EnableDebugLogging) {
-    Write-DebugLog "Windows Update Utility v1.3.4 Debug Log Started" -Level 'SUCCESS' -ToConsole
+    Write-DebugLog "Windows Update Utility $global:WuuVersion Debug Log Started" -Level 'SUCCESS' -ToConsole
     Write-DebugLog "Log file: $global:LogPath" -Level 'INFO' -ToConsole
 }
 
@@ -212,72 +219,75 @@ $ErrorActionPreference = 'Stop'
 
 try {
     Write-DebugLog "Starting Windows Update Utility validation" -Level 'INFO'
-    
-    #Validate user is an Administrator
+
+    # Validate user is an Administrator
     Write-DebugLog "Checking Administrator credentials" -Level 'INFO'
-    If (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    $isElevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+
+    if (-not $isElevated) {
+        # ---- Elevation relaunch -----------------------------------------------------------
+        # A non-elevated launch relaunches itself elevated and exits. Two things matter here and
+        # both were previously wrong:
+        #
+        # 1. ARGS MUST BE FORWARDED. WUU is a command-line tool; `WUU.ps1 install -Computer SRV01`
+        #    relaunching into the interactive menu (silently discarding the operator's arguments)
+        #    is a serious, confusing bug. The original code relied on `$args`, which is ALWAYS
+        #    EMPTY inside a param() function - so the forwarding branch never ran. Use the real
+        #    -CommandArguments parameter.
+        # 2. -STA MUST BE PASSED. This host must be STA (see the STA validation block below); a
+        #    relaunch without it triggers a SECOND relaunch, losing the arguments a second time.
         Write-Warning "This script requires Administrator privileges for full functionality!"
-        Write-Host "Attempting to restart as Administrator..." -ForegroundColor Yellow
         Write-DebugLog "Script not running as Administrator - attempting elevation" -Level 'WARN'
-        
+
+        $scriptPath = Join-Path $WuuRoot 'WUU.ps1'
+        if (-not (Test-Path -LiteralPath $scriptPath)) {
+            throw "Cannot locate script file at: $scriptPath"
+        }
+
+        # Quote every forwarded token so values containing spaces (e.g. a computer list or a
+        # -Reason string) survive the process boundary as ONE argument each.
+        $forwardArgs = @()
+        if ($CommandArguments) {
+            $forwardArgs = @($CommandArguments | ForEach-Object { '"{0}"' -f ($_ -replace '"', '\"') })
+        }
+
+        $relaunchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"{0}"' -f $scriptPath))
+        if ($forwardArgs.Count -gt 0) { $relaunchArgs += $forwardArgs }
+
+        Write-Host "Requesting elevation (a UAC prompt may appear)..." -ForegroundColor Yellow
+        Write-DebugLog ("Elevated relaunch: powershell.exe " + ($relaunchArgs -join ' ')) -Level 'INFO'
+
+        $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processStartInfo.FileName = 'powershell.exe'
+        $processStartInfo.Arguments = ($relaunchArgs -join ' ')
+        $processStartInfo.Verb = 'runas'   # triggers UAC
+        # NOT Hidden: this is a console application, and a hidden, non -NoExit window gives the
+        # operator nothing to look at while their work runs. No -NoExit either, so the elevated
+        # window closes when the command finishes.
+        $processStartInfo.UseShellExecute = $true
+        $processStartInfo.WorkingDirectory = Split-Path $scriptPath
+
         try {
-            # Get the current script path - resolved from the app root
-            $scriptPath = Join-Path $WuuRoot 'WUU.ps1'
-            if ([string]::IsNullOrEmpty($scriptPath)) {
-                $scriptPath = Join-Path $WuuRoot 'WUU.ps1'
-            }
-            
-            # If still empty, try to get from the script location
-            if ([string]::IsNullOrEmpty($scriptPath)) {
-                $scriptPath = Join-Path $WuuRoot "WUU.ps1"
-            }
-            
-            Write-DebugLog "Script path resolved to: $scriptPath" -Level 'INFO'
-            
-            # Validate that the script path exists
-            if (-not (Test-Path $scriptPath)) {
-                throw "Cannot locate script file at: $scriptPath"
-            }
-            
-            $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
-            
-            # Add any original arguments that were passed to this script
-            if ($args) {
-                $arguments += " " + ($args -join " ")
-            }
-            
-            # Start PowerShell as Administrator
-            $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
-            $processStartInfo.FileName = "powershell.exe"
-            $processStartInfo.Arguments = $arguments
-            $processStartInfo.Verb = "runas"  # This triggers UAC elevation
-            $processStartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-            $processStartInfo.WorkingDirectory = Split-Path $scriptPath
-            
-            Write-Host "Starting elevated PowerShell session..." -ForegroundColor Green
-            Write-Host "Script path: $scriptPath" -ForegroundColor Gray
             [System.Diagnostics.Process]::Start($processStartInfo) | Out-Null
-            
-            Write-Host "Elevated session started. Closing current session." -ForegroundColor Green
+            Write-Host "Elevated session started. Closing this session." -ForegroundColor Green
             Write-DebugLog "Successfully launched elevated PowerShell session" -Level 'SUCCESS'
-            
-            # Exit the current non-elevated session
             exit 0
-            
         } catch {
-            Write-Error "Failed to restart as Administrator: $($_.Exception.Message)"
-            Write-Host "Please manually run PowerShell as Administrator and execute this script." -ForegroundColor Red
-            Write-DebugLog "Failed to elevate privileges: $($_.Exception.Message)" -Level 'ERROR'
-            
-            # Ask user if they want to continue anyway
-            $continue = Read-Host "Continue with limited functionality? (Y/N)"
-            if ($continue -notmatch '^[Yy]') {
-                Write-Host "Script execution cancelled." -ForegroundColor Yellow
-                exit 1
+            # Two distinct failures with different correct responses:
+            #  - 'The operation was canceled by the user' => the operator DECLINED the UAC prompt.
+            #    That is a deliberate choice, not an error: say so, don't print a stack trace or
+            #    a scary Write-Error.
+            #  - anything else => genuine failure to launch.
+            $cancelled = $_.Exception.Message -match 'canceled by the user|cancelled by the user'
+            if ($cancelled) {
+                Write-Host "Elevation was declined. WUU needs Administrator rights to query and patch remote hosts." -ForegroundColor Yellow
+                Write-DebugLog "User declined the UAC elevation prompt" -Level 'WARN'
+            } else {
+                Write-Host ("Could not start an elevated session: {0}" -f $_.Exception.Message) -ForegroundColor Red
+                Write-Host "Please run PowerShell as Administrator and re-run WUU.ps1." -ForegroundColor Red
+                Write-DebugLog "Failed to elevate privileges: $($_.Exception.Message)" -Level 'ERROR'
             }
-            
-            Write-Warning "Continuing with limited functionality - some features may not work properly!"
-            Write-DebugLog "User chose to continue without Administrator privileges" -Level 'WARN'
+            exit 1
         }
     } else {
         Write-Host "Running with Administrator privileges." -ForegroundColor Green
@@ -296,17 +306,42 @@ try {
 #endregion Working Directory Setup
 
 #region PowerShell STA Mode Validation
-    #Determine if this instance of PowerShell can run WPF (required for GUI)
+    # STA is required because the Windows Update COM APIs and the per-computer runspaces are
+    # apartment-affine. (The original comment said "required for WPF" - that was true of the GUI
+    # edition; this edition has no GUI, but the COM/runspace requirement remains.)
     Write-DebugLog "Checking PowerShell apartment state: $($host.Runspace.ApartmentState)" -Level 'INFO'
-    If ($host.Runspace.ApartmentState -ne 'STA'){
-        Write-Warning "This script must be run in PowerShell started using -STA switch!"
+    if ($host.Runspace.ApartmentState -ne 'STA') {
+        Write-Warning "This script must be run in PowerShell started with the -STA switch!"
         Write-Host "Attempting to restart PowerShell in STA mode..." -ForegroundColor Yellow
+        Write-DebugLog "Host is not STA - attempting STA relaunch" -Level 'WARN'
+
+        # The relaunch MUST forward the command arguments, for the same reason the elevation
+        # relaunch does: dropping them silently turns `WUU.ps1 install -Computer SRV01` into the
+        # interactive menu. The previous version passed neither the args nor -NoExit, so the
+        # operator got a window that flashed and vanished.
+        $staScriptPath = Join-Path $WuuRoot 'WUU.ps1'
+        $staArgs = @()
+        if ($CommandArguments) {
+            $staArgs = @($CommandArguments | ForEach-Object { '"{0}"' -f ($_ -replace '"', '\"') })
+        }
+        $staArgList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"{0}"' -f $staScriptPath)) + $staArgs
+
         try {
-            Start-Process -FilePath "PowerShell.exe" -ArgumentList "-STA -noprofile -WindowStyle Hidden -file `"$WuuRoot\WUU.ps1`""
+            # -NoExit only when there are no arguments: interactive users need the window to stay
+            # open to see output, but a one-shot command should exit cleanly and let the caller
+            # read the exit code.
+            $sp = @{
+                FilePath     = 'powershell.exe'
+                ArgumentList = $staArgList
+                WorkingDirectory = $WuuRoot
+            }
+            if ($staArgs.Count -eq 0) { $sp.Wait = $true }
+            Start-Process @sp
             Write-Host "STA mode PowerShell launch initiated." -ForegroundColor Green
+            Write-DebugLog ("STA relaunch: powershell.exe " + ($staArgList -join ' ')) -Level 'INFO'
         } catch {
             Write-Error "Failed to restart in STA mode: $($_.Exception.Message)"
-            Read-Host "Press Enter to exit"
+            Write-Host "Re-run as: powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WUU.ps1" -ForegroundColor Red
         }
         exit
     }
@@ -3651,6 +3686,14 @@ try {
         # Parsed by Wuu.Command and dispatched to the SAME $consoleActions handlers the menu
         # uses, with input switched to non-interactive (missing required input fails loudly
         # instead of prompting). See Wuu.Command.psm1's header for the verb table.
+        #
+        # Log the invocation before parsing. Without this, command mode leaves NO trace in the
+        # debug log that a command was ever requested - which makes diagnosing "my arguments
+        # were ignored / vanished" impossible after the fact. The audit trail records the verb
+        # (with operator + reason); this records the raw argv, which is what you need when the
+        # parse itself is the suspect.
+        Write-InfoLog ("Command mode: argv = [{0}]" -f ($CommandArguments -join ' '))
+
         $parsed = ConvertTo-WuuCommandLine -Arguments $CommandArguments
 
         if ($parsed.Unknown.Count -gt 0) {
@@ -3693,11 +3736,20 @@ try {
                 }
             }
 
+            # -ServiceAction is the SERVICE action (start|stop|restart) and only means anything for
+            # the 'service' verb. -SubVerb is the sub-dispatch token (show available, config save,
+            # audit verify, service restart). These were once both bound to $parsed.SubVerb, which
+            # worked for `service restart` purely by coincidence (that word happens to be a valid
+            # service action) and hard-threw for every other sub-dispatched verb:
+            #   `wuu audit export` -> ServiceAction='export' -> ValidateSet('','start','stop','restart')
+            #   -> "Cannot validate argument on parameter 'ServiceAction'" -> CRITICAL ERROR.
+            # The failure surfaced as a console-shell crash AFTER the verb had been parsed, so the
+            # verb looked unreachable. Guard it: only pass a service action when the verb is one.
             $result = Invoke-WuuCommand -Verb $parsed.Verb -Actions $consoleActions -Store $stateStore `
                 -Computer $parsed.Options['Computer'] -All:$parsed.Options['All'] `
                 -Path $parsed.Options['Path'] -Column $parsed.Options['Column'] `
                 -Set $(if ($parsed.Options['Set']) { [int]$parsed.Options['Set'] } else { 0 }) `
-                -ServiceAction $parsed.SubVerb `
+                -ServiceAction $(if ($parsed.Verb -eq 'service') { [string]$parsed.SubVerb } else { '' }) `
                 -SubVerb $parsed.SubVerb -Reason $parsed.Options['Reason'] `
                 -Json:$parsed.Options['Json'] -WhatIf:$parsed.Options['WhatIf']
 

@@ -59,6 +59,34 @@ Get-ChildItem -Path $repoRoot -Filter "*.md" -File | ForEach-Object {
     Copy-Item -Path $_.FullName -Destination (Join-Path $staging $_.Name) -Force
 }
 
+# Include docs\ recursively. The top-level copy above misses everything under docs\ (it is not
+# -Recurse), which meant a release zip shipped NO compliance documentation at all - the ISO 27001
+# control mapping and the audit retention policy were silently absent from the package. A
+# release that cannot answer "what are these audit records, and how long are they kept?" is not
+# usable for the purpose it exists. Preserve the docs\ subfolder so the references inside the
+# documents (docs\..., docs/...) still resolve.
+#
+# GUI-edition documents are EXCLUDED: the history was inherited from the GUI repo, so docs\ still
+# contains WPF/ListView/column-resize material that describes an interface this edition does not
+# have. Shipping it in a console package would misdirect a tester in the same way the GUI README
+# does. They remain in the repo as history; they are just not part of a CLI release.
+$docsSrc = Join-Path $repoRoot "docs"
+if (Test-Path $docsSrc) {
+    $docsDst = Join-Path $staging "docs"
+    New-Item -ItemType Directory -Path $docsDst -Force | Out-Null
+    $guiOnlyDocs = @(
+        'GUI_FUNCTIONALITY_ANALYSIS.md'
+        'GUI_HANG_FIX_COMPREHENSIVE.md'
+        'SUGGESTIONS_FOR_GUI.md'
+        'PASSWORD_LAG_FIX.md'
+        'COMPUTER_LIST_CRASH_FIX.md'
+        'TIMEOUT_STATE_MACHINE_PLAN.md'
+    )
+    Get-ChildItem -Path $docsSrc -Filter "*.md" -File |
+        Where-Object { $guiOnlyDocs -notcontains $_.Name } |
+        ForEach-Object { Copy-Item -Path $_.FullName -Destination (Join-Path $docsDst $_.Name) -Force }
+}
+
 $zipPath = Join-Path $OutputDirectory $ZipName
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 

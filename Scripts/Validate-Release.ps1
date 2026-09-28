@@ -317,5 +317,86 @@ if ($deleteHits.Count -gt 0) {
     Fail "audit module contains a delete/truncate path for audit data (violates keep-forever retention): $($deleteHits -join ', ')"
 } else { Pass 'audit module has no delete/truncate path for audit data (retention is structural)' }
 
+# --- 11. Release-readiness invariants (v1.4.0-cli) -----------------------------------------
+#     Each of these encodes a defect that shipped in the pre-release tree and was found by
+#     actually running the entry point, not by reading it. They exist so the same class of
+#     regression fails the build instead of reaching a tester.
+
+$coreRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+$pkgRaw = Get-Content -LiteralPath (Join-Path $root 'Scripts\Package-WUU2.ps1') -Raw
+
+# (a) The elevation relaunch must forward the REAL arguments. The original used `if ($args)`,
+#     which is ALWAYS empty inside a param() function, so `WUU.ps1 install -Computer X` relaunched
+#     into the interactive menu with the operator's arguments silently discarded.
+if ($coreRaw -match '(?m)^\s*if\s*\(\$args\)\s*\{') {
+    Fail "elevation/STA relaunch tests `$args, which is always empty inside a param() function - forwarded arguments would be silently dropped"
+} else { Pass 'no relaunch relies on $args (arguments would not be silently dropped)' }
+
+# (b) Both relaunches must pass -STA. A relaunch without it trips the STA validation and relaunches
+#     a SECOND time, losing the arguments again (the bug that made this a two-hop problem).
+#     Match the argument-array construction lines, identified by the '-NoProfile' string literal.
+#     (Matching on 'powershell.exe' instead also hits `$processStartInfo.FileName = 'powershell.exe'`,
+#     which is a false positive - the gate was probed against the real file before being trusted.)
+$relaunchLines = @($coreRaw -split "`n" | Where-Object { $_ -match "'-NoProfile'" })
+$missingSta = @($relaunchLines | Where-Object { $_ -notmatch "'-STA'" })
+if ($relaunchLines.Count -lt 2) {
+    Fail "expected 2 relaunch argument lists (elevation + STA), found $($relaunchLines.Count)"
+} elseif ($missingSta.Count -gt 0) {
+    Fail "a relaunch does not pass -STA (would trigger a second relaunch and lose arguments): $($missingSta[0].Trim())"
+} else { Pass 'both relaunch paths pass -STA' }
+
+# (c) The elevation relaunch must forward $CommandArguments (the real parameter).
+if ($coreRaw -notmatch '\$forwardArgs') {
+    Fail 'elevation relaunch does not build a forwarded-argument list'
+} else { Pass 'elevation relaunch forwards the real command arguments' }
+
+# (d) A declined UAC prompt must NOT block on input - Read-Host after a cancellation hangs any
+#     unattended/CI invocation forever.
+$elevBlock = [regex]::Match($coreRaw, '(?s)Requesting elevation.*?#endregion Administrator Privilege Check').Value
+if ($elevBlock -match 'Read-Host') {
+    Fail 'elevation failure path calls Read-Host (hangs non-interactive invocations on a declined UAC prompt)'
+} else { Pass 'declined elevation exits without blocking on input' }
+
+# (e) A sub-dispatch token must never be passed to a ValidateSet parameter meant for something
+#     else. Binding $parsed.SubVerb to -ServiceAction hard-threw for every sub-dispatched verb
+#     except `service restart` (whose subverb happens to be a valid service action):
+#       `audit export` -> "Cannot validate argument on parameter 'ServiceAction'" -> CRITICAL ERROR,
+#     which made audit verify/show/export look permanently unreachable.
+if ($coreRaw -match '(?m)^\s*-ServiceAction\s+\$parsed\.SubVerb\s*$') {
+    Fail "-ServiceAction is bound directly to `$parsed.SubVerb - every non-service subverb crashes on the ValidateSet"
+} else { Pass '-ServiceAction is guarded by verb (subverbs cannot crash the ValidateSet)' }
+
+# (f) Command mode must log the raw argv. Without it, command mode leaves NO trace that a command
+#     was requested, making "my arguments were ignored" impossible to diagnose after the fact.
+if ($coreRaw -notmatch 'Command mode: argv') {
+    Fail 'command mode does not log its argv (argument-loss failures are undiagnosable)'
+} else { Pass 'command mode logs its argv' }
+
+# (g) The released version must be single-sourced. The banner and the audit records each hardcoded
+#     their own string, so a release could ship with the log claiming one version and the audit
+#     trail (an ISO 27001 field) recording another.
+if ($coreRaw -notmatch '\$global:WuuVersion\s*=') {
+    Fail 'no $global:WuuVersion constant - the version is not single-sourced'
+} elseif ($auditRaw -match "wuuVersion\s*=\s*'v") {
+    Fail 'Wuu.Audit hardcodes wuuVersion instead of reading $global:WuuVersion'
+} else { Pass 'version is single-sourced ($global:WuuVersion)' }
+
+# (h) The packager must ship docs\ (recursively). A non-recursive top-level *.md copy shipped a
+#     release with NO compliance documentation at all.
+if ($pkgRaw -notmatch "docsSrc") {
+    Fail 'packager does not include docs\ - a release would ship without the ISO/retention docs'
+} else { Pass 'packager includes docs\ (compliance documentation ships)' }
+
+# (i) The packager must not ship GUI-edition documents into a console release.
+if ($pkgRaw -notmatch 'guiOnlyDocs') {
+    Fail 'packager does not exclude GUI-only docs (would misdirect a console-edition tester)'
+} else { Pass 'packager excludes GUI-only docs from the console package' }
+
+# (j) The command help must document -LogPath, since -Path means different things per subverb
+#     (an inspected log for verify/show, an output destination for export).
+if ($cmdRaw -notmatch "'-logpath'") {
+    Fail "-LogPath is not registered as a known option (audit export cannot name its input log)"
+} else { Pass '-LogPath is a registered option' }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }
