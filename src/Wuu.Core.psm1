@@ -3748,10 +3748,18 @@ try {
             Invoke-WuuAuditedAction -Session $auditSession -Action $ActionName -Reason $Reason -Body $Body
         }.GetNewClosure()
 
+        # Refusals are first-class events too (ISO 27001 A.8.15): a menu action cancelled at the
+        # reason prompt is recorded as denied. Best-effort on purpose - the action is already
+        # cancelled, so a logging failure must not turn a cancellation into an error.
+        $denialHook = {
+            param([string]$ActionName, [string]$DenialReason)
+            Write-WuuAuditDenial -Session $auditSession -Action $ActionName -DenialReason $DenialReason
+        }.GetNewClosure()
+
         try {
-            Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions -AuditHook $auditHook
+            Start-WuuConsoleLoop -Store $stateStore -DrainScheduler $drainScheduler -Actions $consoleActions -AuditHook $auditHook -DenialHook $denialHook
         } finally {
-            try { Write-WuuAuditRecord -Session $auditSession -Action 'session-end' -Result 'info' | Out-Null } catch { }
+            try { Write-WuuAuditRecord -Session $auditSession -Action 'session-end' -Result 'info' -Category 'session' | Out-Null } catch { }
             Stop-WuuAuditTranscript -Session $auditSession
         }
     }

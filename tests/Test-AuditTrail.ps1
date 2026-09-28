@@ -258,14 +258,34 @@ else {
     else { Pass "final integration chain verifies ($($vFinal.Checked) records)" }
 }
 
-# A READ-ONLY verb must NOT be routed through the audited choke point (no false 'started' rows).
+# A READ-ONLY verb must NOT be routed through the audited choke point (no false 'started'
+# rows), but it MUST still be recorded (ISO 27001 A.8.15 covers access to information, not
+# just change). So: one record, category 'operational', result 'info', never fail-closed.
 $before = if ($logPath8) { @(Get-Content -LiteralPath $logPath8).Count } else { 0 }
 $r2 = Invoke-WuuCommand -Verb 'check' -Actions $actions -Store $store -Computer 'SRV01'
-if ($r2.Audited) { Fail 'read-only command was audited as a mutation' }
+if ($r2.Audited) { Fail 'read-only command was routed through the mutating choke point' }
 else { Pass 'read-only command is not audited as a mutation' }
+# It must still REPORT that it was logged, so callers can tell "logged best-effort" apart from
+# "not logged at all" - the two are very different under A.8.15.
+if (-not $r2.Logged) { Fail 'read-only command did not report that it was logged' }
+else { Pass 'read-only command reports Logged (best-effort) not Audited (fail-closed)' }
 $afterRead = @(Get-Content -LiteralPath $logPath8).Count
-if ($afterRead -ne $before) { Fail "read-only command wrote audit records ($before -> $afterRead)" }
-else { Pass 'read-only command writes no audit records' }
+if ($afterRead -le $before) { Fail "read-only command wrote no audit record ($before -> $afterRead); A.8.15 requires reads to be logged" }
+else { Pass "read-only command is audited (records $before -> $afterRead)" }
+# The read produces exactly ONE record - the operation itself, with no 'started' intent row.
+# Anything more would mean the read was wrongly routed through the mutating path.
+$newRead = @(Get-Content -LiteralPath $logPath8 | Select-Object -Last ($afterRead - $before) | ForEach-Object { $_ | ConvertFrom-Json })
+$readOp  = @($newRead | Where-Object { $_.action -eq 'check' -and $_.result -ne 'started' })
+$readIntent = @($newRead | Where-Object { $_.action -eq 'check' -and $_.result -eq 'started' })
+if ($readOp.Count -ne 1) { Fail "expected exactly 1 read record for 'check', got $($readOp.Count)" }
+elseif ($readIntent.Count -ne 0) { Fail "read-only command wrote a fail-closed intent record" }
+else { Pass 'read-only command writes exactly one record with no intent row' }
+# A read has no change to justify, so it must land in the read category - not 'data_change'.
+if ($readOp[0].category -ne 'operational') { Fail "read command categorised '$($readOp[0].category)', expected 'operational'" }
+else { Pass 'read-only command categorised operational' }
+# Reads must never be blocked by logging, so no reason is demanded for them.
+if ($r2.NeedsReason) { Fail 'read-only command demanded a -Reason' }
+else { Pass 'read-only command does not require a reason' }
 
 # -WhatIf on the command surface must not audit a mutation or run the action
 $ranLog.Clear()
@@ -281,14 +301,28 @@ else { Pass '-WhatIf writes no mutation records and runs nothing' }
 # ---------------------------------------------------------------------------------------
 # An audit record saying "changed 12 servers" with no reason has little change-review value,
 # so omission must fail before anything runs - including before the fail-closed intent record.
+# The REFUSAL itself is recorded as a first-class denied event (ISO 27001 A.8.15 expects
+# unsuccessful and denied attempts to be logged too), but the ACTION must not run.
 $ranLog.Clear()
 $beforeNoReason = @(Get-Content -LiteralPath $logPath8).Count
 $r4 = Invoke-WuuCommand -Verb 'install' -Actions $actions -Store $store -Computer 'SRV01'   # no -Reason
 if ($r4.Ok) { Fail 'mutating command without -Reason succeeded (should be refused)' }
 elseif (-not $r4.NeedsReason) { Fail 'refusal did not identify the missing reason' }
 elseif ($ranLog.Count -gt 0) { Fail 'action ran despite the missing reason' }
-elseif (@(Get-Content -LiteralPath $logPath8).Count -ne $beforeNoReason) { Fail 'a refused command still wrote audit records' }
-else { Pass 'mutating command without -Reason is refused before running or logging' }
+else { Pass 'mutating command without -Reason runs nothing' }
+# The refusal is recorded - one 'denied' event, and crucially NOT an 'install' that looks like
+# it succeeded. The action name is the verb, the result marks it denied.
+$afterNoReason = @(Get-Content -LiteralPath $logPath8 | Select-Object -Last (@(Get-Content -LiteralPath $logPath8).Count - $beforeNoReason) | ForEach-Object { $_ | ConvertFrom-Json })
+$denials = @($afterNoReason | Where-Object { $_.result -eq 'denied' })
+if ($denials.Count -ne 1) { Fail "expected exactly 1 denied record for the refusal, got $($denials.Count)" }
+elseif ($denials[0].action -ne 'install') { Fail "denial recorded against '$($denials[0].action)', expected 'install'" }
+elseif ($denials[0].error -notmatch 'Reason') { Fail "denial does not state the cause (error='$($denials[0].error)')" }
+else { Pass 'refused command is recorded as a first-class denied event' }
+# An intent record must NOT exist: nothing was attempted, so a 'started' row would falsely
+# suggest the change was initiated.
+$intentAfterRefusal = @($afterNoReason | Where-Object { $_.result -eq 'started' -and $_.action -eq 'install' })
+if ($intentAfterRefusal.Count -gt 0) { Fail 'refused command wrote a fail-closed intent record (implies the change began)' }
+else { Pass 'refused command writes no intent record (the change never began)' }
 
 # ---------------------------------------------------------------------------------------
 # 10. The INTERACTIVE menu is audited too (not just the command surface)

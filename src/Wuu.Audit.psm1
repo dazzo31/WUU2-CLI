@@ -39,6 +39,45 @@ DESIGN DECISIONS
    module edits or deletes an existing record.
 #>
 
+#region ISO 27001 event categories
+
+function Resolve-WuuAuditCategory {
+    <#
+    .SYNOPSIS Maps an action to an ISO 27001 A.8.15 event category.
+    .DESCRIPTION
+    A.8.15 expects activity logging to cover, at minimum: access to systems, changes to
+    configuration and data, and privileged/administrative operations. This maps WUU's actions
+    onto those buckets so a report can be filtered by category without the caller classifying
+    each call site by hand (which would drift).
+
+    Categories used:
+      session              - start/end of a WUU session
+      access               - authentication / credential configuration
+      configuration_change - WUU's own configuration (computer list, save/load, settings)
+      data_change          - changes to the TARGET's state (download/install/restart/service)
+      operational          - read-only operations (checks, views, exports, audits)
+      outcome              - the outcome half of a mutating action (paired by correlationId)
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Action,
+        [string]$Result = 'info',
+        [switch]$Mutating
+    )
+
+    # Session lifecycle is checked first: a session START carries result='started' and must be
+    # categorised as a session event, not as the outcome half of a mutation.
+    if ($Action -match '^session') { return 'session' }
+    # The outcome record of a mutation is categorised the same as its intent, so a filtered
+    # report shows the whole operation under one category rather than splitting it in two.
+    if ($Result -in @('succeeded', 'failed', 'started', 'denied')) { return 'outcome' }
+    if ($Action -match 'credential|access') { return 'access' }
+    if ($Action -match 'config|save|load|export|add|remove|clear|phase') { return 'configuration_change' }
+    if ($Mutating -or $Action -match 'download|install|restart|service') { return 'data_change' }
+    return 'operational'
+}
+
+#endregion ISO 27001 event categories
+
 #region Paths
 
 function Get-WuuAuditDirectory {
@@ -234,7 +273,26 @@ function Start-WuuAuditSession {
             Machine  = $operatorCtx.Machine
             Elevated = $operatorCtx.Elevated
         }
+        # ISO 27001 A.8.15 / 27002 expects each event to answer: WHO did WHAT, to WHICH target,
+        # WHEN, from WHERE, and with WHAT OUTCOME. Host + ProcessId are the "where"; they are
+        # captured on the session so every record inherits them without the caller passing them.
+        HostName  = $operatorCtx.Machine
+        ProcessId = $PID
         StartedUtc = $operatorCtx.StartedUtc
+        # Environment context, captured once and emitted on the session-start record. An auditor
+        # reconstructing a change needs to know which OS/PowerShell build produced it - a
+        # behavioural difference between Windows builds is a common explanation for "why did the
+        # same action have a different outcome".
+        Environment = [pscustomobject]@{
+            OSVersion      = [string][System.Environment]::OSVersion.VersionString
+            OSArchitecture = [string][System.Environment]::Is64BitOperatingSystem
+            PSVersion      = [string]$PSVersionTable.PSVersion
+            PSEdition      = [string]$PSVersionTable.PSEdition
+            ClrVersion     = [string]$PSVersionTable.CLRVersion
+            Culture        = [string][System.Globalization.CultureInfo]::CurrentCulture.Name
+            ComputerName   = [string][System.Environment]::MachineName
+            UserName       = [string][System.Environment]::UserName
+        }
         Directory  = $dir
         LogPath    = $logPath
         TranscriptPath = Join-Path $dir ("transcript-{0}-{1}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'), $operatorCtx.RunId.Substring(0, 8))
@@ -246,7 +304,8 @@ function Start-WuuAuditSession {
         LastHash   = ''
         Reason     = $Reason
     }
-    Write-WuuAuditRecord -Session $session -Action 'session-start' -Result 'started' -Parameters @{ action = $Action } -SkipFailClosed | Out-Null
+    Write-WuuAuditRecord -Session $session -Action 'session-start' -Result 'started' -Category 'session' `
+        -Parameters @{ action = $Action; environment = $session.Environment } -SkipFailClosed | Out-Null
     return $session
 }
 
@@ -433,6 +492,10 @@ function Write-WuuAuditRecord {
         [Parameter(Mandatory)]$Session,
         [Parameter(Mandatory)][string]$Action,
         [string]$Result = 'info',
+        # ISO 27001 groups events by category. Inferred from the action name when not supplied
+        # (see Resolve-WuuAuditCategory) so every call site gets a category without boilerplate.
+        [ValidateSet('', 'session', 'access', 'configuration_change', 'data_change', 'operational', 'outcome')]
+        [string]$Category = '',
         [string[]]$Targets = @(),
         [hashtable]$Parameters = @{},
         [string]$CorrelationId = '',
@@ -442,17 +505,31 @@ function Write-WuuAuditRecord {
         # a parameter of that name cannot be assigned and fails at runtime.
         [string]$ErrorMessage = '',
         [string]$Reason = '',
+        # Marks the record as a state-changing operation for category inference. Callers that
+        # already know the answer should pass -Category explicitly instead.
+        [switch]$Mutating,
         [switch]$FailClosed,
         [switch]$SkipFailClosed
     )
 
     # seq / prevHash / Hash are filled in by Add-WuuAuditRecordLocked under the file lock.
+    #
+    # Field set is shaped for ISO 27001 A.8.15 / 27002 event logging: every record answers WHO
+    # (operator/runId), WHAT (action/category/parameters), WHICH (targets), WHEN (timestampUtc,
+    # and duration for the outcome), WHERE (host/pid), and OUTCOME (result/error/counts). Keep
+    # this complete rather than minimal - the whole point of the change from "tamper-evident" to
+    # "detailed collection" is that an auditor can reconstruct an action without extra context.
     $record = [ordered]@{
         seq           = 0
+        # ISO 8601 with explicit UTC offset ('o' on a UTC DateTime ends in 'Z'), to millisecond
+        # precision. Every timestamp in a record uses this same form.
         timestampUtc  = (Get-Date).ToUniversalTime().ToString('o')
         runId         = $Session.RunId
         correlationId = if ($CorrelationId) { $CorrelationId } else { [guid]::NewGuid().ToString('N') }
         operator      = $Session.Operator
+        host          = [string]$Session.HostName
+        processId     = [int]$Session.ProcessId
+        category      = if ($Category) { $Category } else { Resolve-WuuAuditCategory -Action $Action -Result $Result -Mutating:$Mutating }
         action        = $Action
         targets       = @($Targets)
         parameters    = $Parameters
@@ -605,20 +682,23 @@ function Invoke-WuuAuditedAction {
         [string[]]$Targets = @(),
         [hashtable]$Parameters = @{},
         [string]$Reason = '',
+        [string]$Category = 'data_change',
         [switch]$WhatIf
     )
 
     if ($WhatIf) {
-        Write-WuuAuditRecord -Session $Session -Action $Action -Result 'whatif' -Targets $Targets `
-            -Parameters $Parameters -Reason $Reason | Out-Null
+        # A dry run is still an event an auditor may want to see ("who asked for what"), but it is
+        # distinctly NOT a change, so it gets its own result value rather than 'started'.
+        Write-WuuAuditRecord -Session $Session -Action $Action -Result 'whatif' -Category $Category `
+            -Targets $Targets -Parameters $Parameters -Reason $Reason | Out-Null
         Write-Host ("  [WhatIf] audited intent recorded for '{0}' - action not run." -f $Action) -ForegroundColor Yellow
         return [pscustomobject]@{ Ok = $true; WhatIf = $true }
     }
 
     $correlationId = [guid]::NewGuid().ToString('N')
     # Step 1 - fail-closed intent record.
-    Write-WuuAuditRecord -Session $Session -Action $Action -Result 'started' -Targets $Targets `
-        -Parameters $Parameters -CorrelationId $correlationId -Reason $Reason -FailClosed | Out-Null
+    Write-WuuAuditRecord -Session $Session -Action $Action -Result 'started' -Category $Category `
+        -Targets $Targets -Parameters $Parameters -CorrelationId $correlationId -Reason $Reason -Mutating -FailClosed | Out-Null
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $ok = $false; $errMsg = ''
@@ -632,12 +712,38 @@ function Invoke-WuuAuditedAction {
         $sw.Stop()
         # Step 3 - outcome record. Best-effort here: the action already happened, and throwing
         # now would misreport it as failed.
-        Write-WuuAuditRecord -Session $Session -Action $Action `
-            -Result $(if ($ok) { 'succeeded' } else { 'failed' }) `
-            -Targets $Targets -Parameters $Parameters -CorrelationId $correlationId `
-            -DurationMs ([int]$sw.ElapsedMilliseconds) -ErrorMessage $errMsg -Reason $Reason | Out-Null
+        Write-WuuAuditRecord -Session $Session -Action $Action -Result $(if ($ok) { 'succeeded' } else { 'failed' }) `
+            -Category $Category -Targets $Targets -Parameters $Parameters -CorrelationId $correlationId `
+            -DurationMs ([int]$sw.ElapsedMilliseconds) -ErrorMessage $errMsg -Reason $Reason -Mutating | Out-Null
     }
     return [pscustomobject]@{ Ok = $ok; Error = $errMsg; CorrelationId = $correlationId }
+}
+
+function Write-WuuAuditDenial {
+    <#
+    .SYNOPSIS Records a REFUSED operation as a first-class event.
+    .DESCRIPTION
+    ISO 27001 A.8.15 (and A.8.16 monitoring) expects unsuccessful and denied attempts to be
+    logged, not just successful ones - a run of refusals is exactly the signal an auditor looks
+    for. This is deliberately separate from the fail-closed write path: a refusal MUST be logged,
+    but the refusal itself must never be blocked by a logging problem, otherwise the operator
+    sees a confusing "audit failed" for an action that was already denied.
+
+    Examples of refusals recorded: a mutating command with no -Reason, and a menu action
+    cancelled at the reason prompt.
+    #>
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][string]$DenialReason,
+        [string[]]$Targets = @(),
+        [hashtable]$Parameters = @{},
+        [string]$Reason = ''
+    )
+    $rec = Write-WuuAuditRecord -Session $Session -Action $Action -Result 'denied' -Category 'outcome' `
+        -Targets $Targets -Parameters $Parameters -Reason $Reason -ErrorMessage $DenialReason -Mutating
+    if ($rec) { Write-InfoLog ("Audit: '{0}' DENIED - {1}" -f $Action, $DenialReason) }
+    return $rec
 }
 
 #endregion Audited action wrapper
@@ -652,6 +758,8 @@ Export-ModuleMember -Function @(
     'Get-WuuAuditChainHead'
     'Test-WuuAuditChain'
     'Invoke-WuuAuditedAction'
+    'Write-WuuAuditDenial'
+    'Resolve-WuuAuditCategory'
     'Start-WuuAuditTranscript'
     'Stop-WuuAuditTranscript'
 )

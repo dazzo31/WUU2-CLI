@@ -172,12 +172,20 @@ function Start-WuuConsoleLoop {
 
     Menu actions that mutate are marked Mutating=$true in Get-WuuMenuActions; the loop asks for a
     reason (interactive) and passes it to the hook, matching the command surface's -Reason.
+
+    -DenialHook is an OPTIONAL scriptblock called when a mutating action is REFUSED before it
+    runs - currently the operator cancelling at the reason prompt:
+        param($ActionName, $DenialReason)
+    ISO 27001 A.8.15 expects denied attempts to be recorded, not just successful ones, so a
+    cancellation is an auditable event. It is best-effort: a failure to record the denial must
+    never change the outcome (the operation stays cancelled either way).
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Store,
         [Parameter(Mandatory)][scriptblock]$DrainScheduler,
         [Parameter(Mandatory)][hashtable]$Actions,
         [scriptblock]$AuditHook,
+        [scriptblock]$DenialHook,
         [int]$TickMilliseconds = 250
     )
     Write-WuuStatusTable -Store $Store
@@ -226,6 +234,12 @@ function Start-WuuConsoleLoop {
                 $reason = Read-WuuAnswer -Prompt '  Reason for this change (recorded in the audit trail)' -Default ''
                 if ([string]::IsNullOrWhiteSpace([string]$reason)) {
                     Write-Host '  A reason is required for audited changes - operation cancelled.' -ForegroundColor Yellow
+                    # Record the refusal. Best-effort by design: the action is cancelled either
+                    # way, so a logging failure here must not surface as an operation failure.
+                    if ($DenialHook) {
+                        try { & $DenialHook $chosen.Label 'reason not supplied (cancelled at prompt)' | Out-Null }
+                        catch { Write-WarningLog "Could not record denial for '$($chosen.Label)': $($_.Exception.Message)" }
+                    }
                 } else {
                     & $AuditHook $chosen.Label $reason $chosen.Run | Out-Null
                 }

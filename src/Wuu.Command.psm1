@@ -370,14 +370,30 @@ function Invoke-WuuCommand {
     # Mutating actions require a reason once auditing is on: an audit record that says "someone
     # changed 12 servers" without saying why has limited value in a change review. Fail BEFORE
     # running anything, and before the fail-closed intent record, so nothing happens at all.
+    #
+    # The refusal itself is logged (ISO 27001 A.8.15 expects denied attempts to be recorded, not
+    # just successful ones). It uses a throwaway session and a best-effort write: if logging the
+    # denial fails we still return the refusal, because the operation was already blocked.
     if ($entry.Mutating -and -not $Reason) {
         $msg = "Mutating action '$Verb' requires -Reason (e.g. -Reason ""CHG-1041 security patches"")."
         Write-Host "  $msg" -ForegroundColor Yellow
+        try {
+            $denySession = Start-WuuAuditSession -Action ('denied:{0}' -f $Verb)
+            Write-WuuAuditDenial -Session $denySession -Action $Verb -DenialReason 'missing -Reason' `
+                -Targets $(if ($All) { @('all') } elseif ($Computer) { @($Computer) } else { @() }) `
+                -Parameters @{ computer = $p.Computer; serviceAction = $p.ServiceAction; set = $p.Set } | Out-Null
+        } catch {
+            Write-WarningLog ("Could not record denial for '{0}': {1}" -f $Verb, $_.Exception.Message)
+        }
         return [pscustomobject]@{ Ok = $false; Verb = $Verb; Action = $actionName; Error = $msg; NeedsReason = $true }
     }
 
     $prev = Get-WuuInputMode
     $targets = if ($All) { @('all') } elseif ($Computer) { @($Computer -split '[,;]' | ForEach-Object { $_.Trim() }) } else { @() }
+    # Every command run produces an audit session, mutating or not, so the read-only record below
+    # has a runId/operator/host/pid to inherit. The session-start record itself is best-effort
+    # (its own write is SkipFailClosed) - a failure to open a session must not block a read.
+    $auditSession = Start-WuuAuditSession -Action $Verb -Reason $Reason
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         Initialize-WuuInputMode -NonInteractive -Answers $answers
@@ -385,7 +401,7 @@ function Invoke-WuuCommand {
             # Mutating verbs go through the audited choke point: intent is recorded BEFORE the
             # handler runs and FAIL-CLOSED, so if the audit sink is unwritable the change does
             # not happen. An unlogged remote change is worse than a refused one.
-            $session = Start-WuuAuditSession -Action $Verb -Reason $Reason
+            $session = $auditSession
             $audited = Invoke-WuuAuditedAction -Session $session -Action $Verb -Targets $targets `
                 -Parameters @{ computer = $p.Computer; serviceAction = $p.ServiceAction; set = $p.Set; json = $p.Json } `
                 -Reason $Reason -Body { & $Actions[$actionName] }
@@ -395,8 +411,23 @@ function Invoke-WuuCommand {
             }
             return [pscustomobject]@{ Ok = $true; Verb = $Verb; Action = $actionName; CorrelationId = $audited.CorrelationId; Audited = $true }
         }
+        # READ-ONLY verbs are audited too, but on the opposite footing from mutations: the record
+        # is best-effort and NEVER blocks the operation. ISO 27001 A.8.15 covers access to
+        # information as well as changes to it - "who inspected which hosts' update state, when"
+        # is exactly the question an auditor asks after a breach, and it is unanswerable if only
+        # mutations are logged. The trade-off is deliberate: a viewing action must not fail
+        # because the audit sink is momentarily unwritable.
+        #
+        # No -Reason is required (asking why for a read is noise) and no fail-closed intent record
+        # is written, so reads produce exactly ONE record instead of two.
+        $readCategory = if ($Verb -in @('export', 'save')) { 'configuration_change' } else { 'operational' }
+        Write-WuuAuditRecord -Session $auditSession -Action $Verb -Result 'info' -Category $readCategory `
+            -Targets $targets -Parameters @{ computer = $p.Computer; column = $p.Column; all = [bool]$All; json = $p.Json } -Mutating:$false | Out-Null
         & $Actions[$actionName]
-        return [pscustomobject]@{ Ok = $true; Verb = $Verb; Action = $actionName }
+        # Logged, not Audited: 'Audited' means "went through the mutating choke point (intent +
+        # outcome, fail-closed)". A read takes the best-effort path, so it reports a distinct
+        # flag - conflating the two would make 'Audited' meaningless for callers.
+        return [pscustomobject]@{ Ok = $true; Verb = $Verb; Action = $actionName; Logged = $true }
     } catch {
         Write-ErrorLog "Command '$Verb' failed: $($_.Exception.Message)"
         Write-Host ("  Command failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
