@@ -130,6 +130,35 @@ $global:EndpointProbeTimeoutMs    = 3000
 # More than one, because a single blip used to be enough to evict a healthy server.
 $global:ConnectivityFailuresBeforeRemoval = 2
 
+# SS5: OPERATION-SPECIFIC deadlines (seconds), keyed by the op handed to Start-UpdateCheckJob.
+# WHY PER OP AND NOT ONE NUMBER. The cleanup loop force-stopped every job at a flat 10 minutes
+# (Core, "Job timeout detected"). Windows Update has no single sensible deadline:
+#   * a SEARCH can legitimately take 20+ minutes on a large estate against WSUS, so a flat 10 was
+#     killing healthy work and reporting a false timeout (the "10 minute hard stop" in the findings);
+#   * an INSTALL can take hours (an in-place servicing stack update alone can exceed 10 minutes);
+#   * a restart is the LONGEST - the offline and online waits are 600s + 1800s, so 10 minutes
+#     guaranteed a false timeout on EVERY reboot;
+#   * a SERVICE action that has not returned in 5 minutes is stuck, not slow.
+# A single number cannot express that, and choosing the largest one would mean a genuinely hung
+# service restart occupied a runspace for 45 minutes before anyone noticed.
+#
+# The deadline is recorded per computer (TimeoutExpiresAt/TimeoutSource) when the job is SUBMITTED,
+# so the decision is inspectable while the job is still running and is not recomputed from a
+# start time that a restart could reset.
+$global:OperationTimeoutSeconds = @{
+    'Check'            = 2700   # 45 min - large-estate search + download scan
+    'Download'         = 2700   # 45 min
+    'InstallAndRecheck'= 7200   # 2 h   - servicing-stack installs are genuinely slow
+    'AutoFlow'         = 14400  # 4 h   - full chain, must exceed its own reboot waits
+    'Restart'          = 2700   # 45 min - covers OfflineWait + OnlineWait (600 + 1800) with margin
+    'RemoveOffline'    = 300    # 5 min - a connectivity probe
+    'ServiceAction'    = 300    # 5 min - a hung service control is stuck, not slow
+    'default'          = 1800   # 30 min - anything unrecognised: bounded, but not punishing
+}
+# How often a running job refreshes its heartbeat. The deadline is the BACKSTOP; the heartbeat is
+# what distinguishes "still working" from "hung", and it is what the status line reports.
+$global:OperationHeartbeatSeconds = 30
+
 # Enhanced error handling toggle. Set to $true to enable advanced error handling.
 $global:EnableEnhancedErrorHandling = $true
 
@@ -2155,6 +2184,18 @@ $newRunspace.SessionStateProxy.SetVariable('stateStore',$stateStore)
 $newRunspace.SessionStateProxy.SetVariable('LogPath',$global:LogPath)
 $newRunspace.SessionStateProxy.SetVariable('LogLock',$global:LogLock)
 $newRunspace.SessionStateProxy.SetVariable('backgroundProcessing',$backgroundProcessing)
+# SS5: the per-op deadline table, for the cleanup loop's timeout decision.
+#
+# This is a HASHTABLE, so the loop body can read it directly - a plain SetVariable'd object IS
+# visible to the script body (verified). Only nested SCRIPTBLOCKS fail to bind session state, and
+# that is why the block below is built with [scriptblock]::Create(<string>) rather than written as a
+# literal: a literal { } captures the defining session state and sees NOTHING from SetVariable.
+# Probed on this host, all three forms, to be sure before relying on it:
+#     literal { }                 -> $OperationTimeoutSeconds is $null   (silently wrong)
+#     [scriptblock]::Create(str)  -> binds correctly
+#     .ToString() of a literal    -> binds correctly (which is why the log block already worked)
+$newRunspace.SessionStateProxy.SetVariable('OperationTimeoutSeconds',$global:OperationTimeoutSeconds)
+$newRunspace.SessionStateProxy.SetVariable('OperationHeartbeatSeconds',$global:OperationHeartbeatSeconds)
 # Fault-tolerant log append for the cleanup loop (same lock+retry semantics
 # as WriteWuuLogEntry; takes pre-formatted lines - see Wuu.Logging.psm1)
 $newRunspace.SessionStateProxy.SetVariable('WriteLogFileScript', [scriptblock]::Create({
@@ -2218,6 +2259,12 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                                     $failedRow.Color = 'Error'
                                     $failedRow.OpState = 'Idle'
                                     $failedRow.OpStartedAt = $null
+                                    # SS5: clear the deadline with the lock. A finished row keeping a
+                                    # past deadline would mark the NEXT operation expired immediately.
+                                    if ($failedRow.PSObject.Properties['TimeoutExpiresAt']) { $failedRow.TimeoutExpiresAt = $null }
+                                    if ($failedRow.PSObject.Properties['TimeoutSource']) { $failedRow.TimeoutSource = '' }
+                                    if ($failedRow.PSObject.Properties['OpName']) { $failedRow.OpName = '' }
+                                    if ($failedRow.PSObject.Properties['LastHeartbeatAt']) { $failedRow.LastHeartbeatAt = $null }
                                     $stateStore.Touch()
                                 }
                             }
@@ -2239,16 +2286,85 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                             if ($doneRow -and $doneRow.PSObject.Properties['OpState']) {
                                 $doneRow.OpState = 'Idle'
                                 $doneRow.OpStartedAt = $null
+                                # SS5: the operation is over, so its deadline goes with it. Leaving
+                                # it behind would make the next operation look expired on the first
+                                # cleanup pass (the deadline is read, never recomputed).
+                                if ($doneRow.PSObject.Properties['TimeoutExpiresAt']) { $doneRow.TimeoutExpiresAt = $null }
+                                if ($doneRow.PSObject.Properties['TimeoutSource']) { $doneRow.TimeoutSource = '' }
+                                if ($doneRow.PSObject.Properties['OpName']) { $doneRow.OpName = '' }
                                 $stateStore.Touch()
                             }
                         }
                     } catch { }
                     
                 }
-                # Check for jobs that have been running too long (timeout after 10 minutes)
-                ElseIf ($runspace.StartTime -and ((Get-Date) - $runspace.StartTime).TotalMinutes -gt 10) {
+                # SS5: OPERATION-SPECIFIC DEADLINE - this was a flat "timeout after 10 minutes" for
+                # every op. One number cannot be right for a 5-minute service action, a 45-minute
+                # search and a 4-hour AutoFlow chain whose reboot waits ALONE total 40 minutes:
+                #   * healthy long operations were killed and reported as timeouts;
+                #   * a hung short operation held a runspace for ten minutes before anyone noticed.
+                # The budget now comes from the op recorded at submission (Set-WuuOperationDeadline),
+                # with the job's own start time as a fallback. The deadline is READ, not recomputed,
+                # so the value an operator can inspect is the value enforced here.
+                #
+                # Language constructs and plain property access only: this runs on the cleanup thread,
+                # where no module function resolves. The decision mirrors Test-WuuOperationExpired,
+                # and tests\Test-OperationTimeouts.ps1 compares the two on identical inputs.
+                ElseIf ($runspace.StartTime) {
+                    $nowTs = Get-Date
+                    $hbRow = $null
+                    try {
+                        if ($stateStore) { $hbRow = $stateStore.ByName[[string]$runspace.Computer.ToLowerInvariant()] }
+                    } catch { $hbRow = $null }
+
+                    # Resolve the budget: the op the row was asked to perform, else the default entry.
+                    # Never a literal, so an op added without its own entry is bounded by the table.
+                    $opName = ''
+                    if ($hbRow -and $hbRow.PSObject.Properties['OpName']) { $opName = [string]$hbRow.OpName }
+                    $budget = 1800
+                    if ($OperationTimeoutSeconds) {
+                        if ($opName -and $OperationTimeoutSeconds.ContainsKey($opName)) {
+                            $budget = [int]$OperationTimeoutSeconds[$opName]
+                        } elseif ($OperationTimeoutSeconds.ContainsKey('default')) {
+                            $budget = [int]$OperationTimeoutSeconds['default']
+                        }
+                    }
+
+                    # Prefer the submission-time deadline; fall back to start time + budget.
+                    $expires = $null
+                    $basis = 'start-time-fallback'
+                    if ($hbRow -and $hbRow.PSObject.Properties['TimeoutExpiresAt'] -and $hbRow.TimeoutExpiresAt) {
+                        $expires = $hbRow.TimeoutExpiresAt
+                        $basis = 'row-deadline'
+                    } else {
+                        $expires = $runspace.StartTime.AddSeconds($budget)
+                    }
+                    $elapsedMin = [math]::Round(($nowTs - $runspace.StartTime).TotalMinutes, 2)
+
+                    if (-not ($expires -and $nowTs -gt $expires)) {
+                        # STILL WITHIN ITS DEADLINE - record liveness. The heartbeat is what separates
+                        # "slow" from "stuck" for a human: a deadline alone only says "not finished".
+                        # It deliberately does NOT extend the deadline - a heartbeat proves the thread
+                        # is alive, not that progress is being made, and letting it extend would mean
+                        # a hung operation could never be stopped.
+                        # Written at most once per interval so the store is not touched four times a
+                        # second (each Touch() bumps Revision and triggers a redraw).
+                        $hbEvery = 30
+                        if ($OperationHeartbeatSeconds) { $hbEvery = [int]$OperationHeartbeatSeconds }
+                        $hbDue = $true
+                        if ($hbRow -and $hbRow.PSObject.Properties['LastHeartbeatAt'] -and $hbRow.LastHeartbeatAt -is [datetime]) {
+                            $hbDue = (($nowTs - $hbRow.LastHeartbeatAt).TotalSeconds -ge $hbEvery)
+                        }
+                        if ($hbDue -and $hbRow) {
+                            try {
+                                $hbRow.LastHeartbeatAt = $nowTs
+                                if ($hbRow.PSObject.Properties['Heartbeats']) { $hbRow.Heartbeats = [int]$hbRow.Heartbeats + 1 }
+                                $stateStore.Touch()
+                            } catch { }
+                        }
+                    } else {
                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                    $logEntry = "[$timestamp] [WARN] [$($runspace.Computer)] Job timeout detected for $($runspace.Computer) - running for $([math]::Round(((Get-Date) - $runspace.StartTime).TotalMinutes, 2)) minutes"
+                    $logEntry = "[$timestamp] [WARN] [$($runspace.Computer)] Job timeout detected for $($runspace.Computer) - op '$opName' ran $elapsedMin min against a $(if ($budget -ge 3600) { "$([math]::Round($budget/3600,1))h" } else { "$([math]::Round($budget/60,1))m" }) deadline (basis=$basis, overshoot $([math]::Round(($nowTs - $expires).TotalMinutes,2)) min)"
                     & $WriteLogFileScript $logEntry
 
                     $timedOutComputer = $runspace.Computer
@@ -2284,11 +2400,24 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                     try {
                         $timedOutRow = $stateStore.ByName[$timedOutComputer.ToLowerInvariant()]
                         if ($timedOutRow) {
-                            $timedOutRow.Status = 'Operation timed out after 10 minutes'
+                            # SS5: report WHICH operation and WHICH budget, not a bare "10 minutes".
+                            # "Timed out" without "doing what, after how long" is not actionable -
+                            # the operator cannot tell a genuinely stuck service action from an
+                            # estate-wide search that needs a larger budget.
+                            $budgetLabel = if ($budget -ge 3600) { "$([math]::Round($budget/3600,1))h" } else { "$([math]::Round($budget/60,1))m" }
+                            $opLabel = if ($opName) { $opName } else { 'operation' }
+                            $timedOutRow.Status = "Timed out: $opLabel exceeded its $budgetLabel deadline (ran $elapsedMin min). Still queued; retry or raise the budget."
                             $timedOutRow.UpdatesStatus = 'Timeout'
                             $timedOutRow.State = 'Timeout'
                             # Timeout is recoverable - yellow, matching Set-ComputerTimeout
                             $timedOutRow.Color = 'Timeout'
+                            # Clear the deadline with the lock: a finished row that kept a deadline in
+                            # the past would make the NEXT operation look expired on its first pass,
+                            # i.e. every operation after the first would be killed immediately.
+                            if ($timedOutRow.PSObject.Properties['TimeoutExpiresAt']) { $timedOutRow.TimeoutExpiresAt = $null }
+                            if ($timedOutRow.PSObject.Properties['TimeoutSource']) { $timedOutRow.TimeoutSource = '' }
+                            if ($timedOutRow.PSObject.Properties['OpName']) { $timedOutRow.OpName = '' }
+                            if ($timedOutRow.PSObject.Properties['LastHeartbeatAt']) { $timedOutRow.LastHeartbeatAt = $null }
                             $stateStore.Touch()
                         }
                     } catch {
@@ -2296,6 +2425,7 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [WARN] Timeout row update skipped for ${timedOutComputer}: $($_.Exception.Message)"
                         & $WriteLogFileScript $logEntry
+                    }
                     }
                 }
             }

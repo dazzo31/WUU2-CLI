@@ -484,6 +484,23 @@ function Start-UpdateCheckJob {
             $ComputerItem.OpState = 'Running'
             $ComputerItem.OpStartedAt = Get-Date
         }
+        # SS5: the deadline is recorded HERE, at submission, so it is a property of the INTENT and
+        # not recomputed later from a start time the cleanup loop happens to remember. One source of
+        # truth: the deadline an operator can inspect is the deadline the loop enforces.
+        #
+        # The op name is stored on the row too, because the cleanup loop holds only
+        # (Computer, Runspace, StartTime) - it cannot otherwise know whether it is looking at a
+        # 5-minute service action or a 4-hour AutoFlow chain, which is precisely why the old code
+        # had to use one flat 10-minute number for both.
+        try {
+            $deadline = Set-WuuOperationDeadline -Row $ComputerItem -Op $Op
+            Write-InfoLog ("[{0}] op '{1}' deadline {2} from now ({3})" -f `
+                $ComputerItem.Computer, $Op, (Format-WuuDuration -Seconds (Get-WuuOperationTimeoutSeconds -Op $Op)), $deadline.ToString('HH:mm:ss'))
+        } catch {
+            # A missing deadline is not fatal (the loop falls back to start-time), but it must not be
+            # silent - that fallback is less precise and an operator should know it was used.
+            Write-WarningLog "Could not record the operation deadline for $($ComputerItem.Computer): $($_.Exception.Message)"
+        }
         if ($ctx.StateStore) { $ctx.StateStore.Touch() }
         return $true
     } catch {

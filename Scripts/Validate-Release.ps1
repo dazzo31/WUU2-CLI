@@ -959,5 +959,116 @@ if ($cmdRawE -match '\$script:CommandExitCode\s*=') {
 }
 if (-not $failed) { Pass 'exit codes distinguish completion, timeout, queueing, usage, refusal and audit integrity (SS10)' }
 
+# (ab) OPERATION-SPECIFIC TIMEOUTS (brief SS5). The defect was ONE flat 10-minute stop for every
+#      operation, which is wrong in both directions: it killed healthy long operations (a reboot's own
+#      offline+online waits total 40 minutes!) and let a hung 5-minute service action hold a runspace
+#      for ten minutes. Five properties, because each can fail alone:
+#
+#        1. a per-op budget table exists, keyed by the ops actually accepted, with a default;
+#        2. the budget is recorded on the row AT SUBMISSION (one source of truth);
+#        3. the row carries the op name - without it the cleanup loop cannot know WHICH budget applies,
+#           which is exactly why the old code needed one number for everything;
+#        4. the loop decides from that deadline, retains a bounded fallback, and records a heartbeat;
+#        5. every OpState release CLEARS the deadline. This one is a trap: the deadline is READ, not
+#           recomputed, so a finished row that kept a past deadline would make the NEXT operation look
+#           expired on its first loop pass - every operation after the first killed instantly.
+#
+#      The loop cannot call module functions, so the decision logic exists twice. tests\
+#      Test-OperationTimeouts.ps1 runs both copies on identical inputs and compares verdicts; that
+#      differential is the guard against drift, and this gate asserts the pieces both copies need.
+$coreRawT = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+$stateRawT = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+$wupdRawT = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+
+# 1. the table, and that its numbers are per-op rather than one repeated value
+$tableMatch = [regex]::Match($coreRawT, '\$global:OperationTimeoutSeconds\s*=\s*@\{([\s\S]*?)\}')
+if (-not $tableMatch.Success) {
+    Fail 'the per-op operation timeout table is missing (SS5) - a flat stop would come back'
+} else {
+    $tableBody = $tableMatch.Groups[1].Value
+    if ($tableBody -notmatch "'default'") {
+        Fail 'the operation timeout table has no default entry - an unrecognised op would be unbounded'
+    }
+    $values = @([regex]::Matches($tableBody, '=\s*(\d+)') | ForEach-Object { [int]$_.Groups[1].Value })
+    if (($values | Sort-Object -Unique).Count -lt 3) {
+        Fail "the operation timeout table has only $(($values | Sort-Object -Unique).Count) distinct value(s) - that is not per-op"
+    }
+    # The reboot chain's own waits must fit inside its budget, or the budget guarantees a false timeout.
+    $autoFlow = [regex]::Match($tableBody, "'AutoFlow'\s*=\s*(\d+)")
+    $offline = [regex]::Match($coreRawT, '\$global:OfflineWaitSeconds\s*=\s*(\d+)')
+    $online = [regex]::Match($coreRawT, '\$global:OnlineWaitSeconds\s*=\s*(\d+)')
+    if ($autoFlow.Success -and $offline.Success -and $online.Success) {
+        $needed = [int]$offline.Groups[1].Value + [int]$online.Groups[1].Value
+        if ([int]$autoFlow.Groups[1].Value -le $needed) {
+            Fail "the AutoFlow budget ($($autoFlow.Groups[1].Value)s) is shorter than its own reboot waits ($needed) - every reboot would report a false timeout"
+        }
+    }
+    # Every op Start-UpdateCheckJob accepts must have its own budget.
+    $opSet = [regex]::Match($wupdRawT, "ValidateSet\(([^)]*)\)\]\s*\r?\n\s*\[string\]\`$Op")
+    if ($opSet.Success) {
+        $ops = @($opSet.Groups[1].Value -split ',' | ForEach-Object { $_.Trim().Trim("'") })
+        $missingOps = @($ops | Where-Object { $_ -and $tableBody -notmatch "['""]$_['""]" })
+        if ($missingOps.Count -gt 0) {
+            Fail "op(s) accepted by Start-UpdateCheckJob with no budget entry (they inherit default silently): $($missingOps -join ', ')"
+        }
+    }
+    if (-not $failed) { Pass 'operation timeouts are per-op, complete, and fit inside the reboot waits (SS5)' }
+}
+
+# 2. the row contract must carry what the decision needs
+foreach ($field in @('OpName', 'TimeoutExpiresAt', 'TimeoutSource', 'LastHeartbeatAt', 'Heartbeats')) {
+    if ($stateRawT -notmatch [regex]::Escape($field)) {
+        Fail "the row contract does not carry $field - the per-op deadline decision cannot work (SS5)"
+    }
+}
+if ($stateRawT -notmatch 'function Test-WuuOperationExpired') {
+    Fail 'Test-WuuOperationExpired is missing - the SS5 decision is not testable'
+} elseif ($stateRawT -notmatch "'Test-WuuOperationExpired'") {
+    Fail 'Test-WuuOperationExpired is not exported'
+} elseif (-not $failed) { Pass 'the SS5 row contract and decision function exist (SS5)' }
+
+# 3. the deadline is recorded at submission, and the op name travels with it
+$supBodyT = Get-WuuFunctionBody $wupdRawT 'Start-UpdateCheckJob'
+if (-not $supBodyT) { Fail 'could not locate Start-UpdateCheckJob' }
+elseif ($supBodyT -notmatch 'Set-WuuOperationDeadline') {
+    Fail 'the submission point does not record the operation deadline - the loop would have to guess the budget'
+} elseif (-not $failed) { Pass 'the operation deadline is recorded at submission, with the op name (SS5)' }
+
+# 4. the loop must decide on the deadline, not on a flat elapsed-time threshold
+$loopIdx = $coreRawT.IndexOf('#Routine to handle completed runspaces')
+$loopBodyT = if ($loopIdx -ge 0) { $coreRawT.Substring($loopIdx, [Math]::Min(60000, $coreRawT.Length - $loopIdx)) } else { '' }
+if (-not $loopBodyT) {
+    Fail 'could not locate the job cleanup loop'
+} else {
+    if ($loopBodyT -match 'TotalMinutes -gt 10') {
+        Fail 'the flat 10-minute stop is still present - healthy long operations would be killed (SS5)'
+    }
+    if ($loopBodyT -notmatch 'OperationTimeoutSeconds') {
+        Fail 'the cleanup loop does not consult the per-op budget table'
+    }
+    if ($loopBodyT -notmatch 'TimeoutExpiresAt') {
+        Fail 'the cleanup loop does not read the deadline recorded at submission'
+    }
+    if ($loopBodyT -notmatch 'StartTime\.AddSeconds\(\$budget\)') {
+        Fail 'the cleanup loop has no start-time fallback - work not submitted through the single submission point would be unbounded'
+    }
+    if ($loopBodyT -notmatch 'Heartbeat') {
+        Fail 'the cleanup loop records no heartbeat - slow and stuck would be indistinguishable'
+    }
+    if ($coreRawT -notmatch "SetVariable\('OperationTimeoutSeconds'") {
+        Fail 'the per-op table is not injected into the cleanup runspace - the loop could not resolve any budget'
+    }
+    if (-not $failed) { Pass 'the cleanup loop enforces the per-op deadline with a bounded fallback and a heartbeat (SS5)' }
+}
+
+# 5. the trap: every OpState release must also clear the deadline
+$idleSitesT = ([regex]::Matches($coreRawT, "OpState = 'Idle'")).Count
+$clearSitesT = ([regex]::Matches($coreRawT, "TimeoutExpiresAt'\]\)\s*\{\s*\`$\w+\.TimeoutExpiresAt = \`$null")).Count
+if ($idleSitesT -gt 0 -and $clearSitesT -lt $idleSitesT) {
+    Fail "only $clearSitesT deadline clear site(s) for $idleSitesT OpState release site(s) - a stale deadline would make the NEXT operation expire immediately (SS5)"
+} elseif ($idleSitesT -gt 0) {
+    Pass "the operation deadline is cleared wherever the operation lock is released ($clearSitesT/$idleSitesT) (SS5)"
+}
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

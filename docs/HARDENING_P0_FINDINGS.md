@@ -107,7 +107,7 @@ from evidence rather than the brief's assumptions.
 | --- | --- | --- |
 | §3 one operation per computer | **DONE** | See "Per-computer serialization" below. |
 | §4 unify the scheduling model | **DONE** | Every per-computer operation now goes through `Start-UpdateCheckJob`. The five console handlers that composed their own `[powershell]::Create()` + `BeginInvoke` (check / download / install / restart / remove-offline / service-action) now delegate, so they share the per-computer gate **and** the global `MaxConcurrentJobs` cap. Validator gate (x) enforces it. |
-| §5 operation-specific timeouts | **PARTIAL** | `TimeoutExpiresAt`/`TimeoutSource` are **written and never read** — dead fields, verified by counting uses vs assignments. A blanket 10-minute hard stop applies (in the cleanup loop) and does not distinguish slow from stuck. |
+| §5 operation-specific timeouts | **DONE** | See "§5 — operation-specific timeouts" below. A per-op budget table replaces the flat 10-minute stop; the deadline is recorded at submission and read by the cleanup loop, with a heartbeat separating *slow* from *stuck*. `TimeoutExpiresAt`/`TimeoutSource` were dead fields (written, never read) and are now the read side of the decision. |
 | §6 credential propagation | **NOT VERIFIED** | Needs a per-operation audit. |
 | §7 reboot detection | **DONE** | The reboot wait was `While(Test-Connection ...)` - see below. Reboot STATE was already read correctly (`Microsoft.Update.SystemInfo.RebootRequired`); it was the online/offline TRANSITION that was ICMP-driven. |
 | §8 workflow state vs display state | **PARTIAL** | `State` has a `ValidateSet`, and `OpState` now separates operation state from display state. But `Test-PhaseCompletion` still uses `UpdatesStatus` (a display string) as its predicate. |
@@ -443,3 +443,107 @@ was a **spurious failure in every non-elevated run**, which is how it surfaced h
 with the marker, and the harness matches `(?m)^\s*SKIP:` — anchored, because the earlier unanchored
 `SKIP` match also caught assertion *names* like "the reboot gate **skips** the reboot" and reported
 passing suites as skipped.
+
+---
+
+## §5 — operation-specific timeouts (done)
+
+### The defect
+
+One flat "timeout after 10 minutes" in the job-cleanup loop, applied to every operation. That is wrong
+in **both** directions, which is why it is worth more than a constant tweak:
+
+* **healthy long work was killed and reported as a timeout.** A reboot's own waits are
+  `$OfflineWaitSeconds` (600) + `$OnlineWaitSeconds` (1800) = **40 minutes**, so a flat 10-minute stop
+  guaranteed a false timeout on *every* reboot. A large-estate WSUS search regularly exceeds 10
+  minutes too.
+* **genuinely hung short work was tolerated for 10 minutes.** A service-control call that needs 5
+  seconds held a runspace for ten minutes before anyone noticed, and the global `MaxConcurrentJobs`
+  cap counts runspaces — so a few stuck short operations could stall the whole estate.
+
+`TimeoutExpiresAt`/`TimeoutSource` already existed on the row, written in two places — and **read
+nowhere**. They are the natural home for a per-op deadline, and they were dead fields.
+
+### What replaced it
+
+A per-operation budget table in the config region:
+
+| Op | Budget | Why |
+| --- | --- | --- |
+| `Check` / `Download` | 45 min | large-estate search; a flat 10 killed healthy runs |
+| `InstallAndRecheck` | 2 h | a servicing-stack update alone can exceed 10 minutes |
+| `AutoFlow` | 4 h | must exceed its own reboot waits (600s + 1800s) |
+| `Restart` | 45 min | covers the 40-minute wait pair, with margin |
+| `RemoveOffline` | 5 min | it is a connectivity probe |
+| `ServiceAction` | 5 min | a hung service control is stuck, not slow |
+| `default` | 30 min | anything unrecognised is bounded, but not punishing |
+
+Three properties make this work, and each is enforced by a gate:
+
+1. **The deadline is recorded at SUBMISSION** (`Set-WuuOperationDeadline` in the single submission
+   point), not recomputed by the loop. One source of truth: the deadline an operator can inspect is
+   the deadline enforced. A job entry holds only `(Computer, Runspace, StartTime)`, so the loop cannot
+   otherwise know *which* budget applies — that missing piece is exactly why the old code needed one
+   number for everything. **This is why the row gained `OpName`.**
+2. **The loop reads it, with a bounded fallback.** No deadline on the row (work not submitted through
+   the normal path) → the job's own start time plus the `default` budget. Still bounded, and the basis
+   is reported so an operator can tell the fallback was used.
+3. **A heartbeat distinguishes slow from stuck.** A deadline alone only says "not finished"; the loop
+   records `LastHeartbeatAt`/`Heartbeats` while the job is within its deadline, and the status table
+   shows `[ServiceAction 4m left beat 12s ago]`. The heartbeat deliberately does **not** extend the
+   deadline — it proves the thread is alive, not that progress is being made, and letting it extend
+   would mean a hung operation could never be stopped.
+
+### The trap that had to be handled
+
+The deadline is **read, never recomputed**, so a finished row that kept a deadline in the past would
+make the *next* operation look expired on its first loop pass — i.e. every operation after the first
+would be killed instantly. `Clear-WuuOperationDeadline` is therefore called at **every** place
+`OpState` returns to `Idle` (3 sites: success, EndInvoke failure, timeout). The gate asserts the counts
+match, so a future exit path cannot be added without clearing.
+
+### The runspace-binding discovery this depended on
+
+The cleanup loop runs in an isolated runspace where module functions do not resolve, so the decision
+exists **twice** — once as `Test-WuuOperationExpired` (testable) and once inline in the loop. Injecting
+the table required understanding a subtlety, which I probed on this host rather than assumed:
+
+| Scriptblock form | Sees `SetVariable`'d values? |
+| --- | --- |
+| literal `{ ... }` | **no** — silently `$null` |
+| `[scriptblock]::Create("<string>")` | yes |
+| `.ToString()` of a literal | yes |
+
+A **plain object** (the hashtable) assigned with `SetVariable` *is* visible to the runspace body; only
+*nested literal scriptblocks* fail to bind. That is why the existing log block works (it is built with
+`::Create`) and why a naive literal injection of the table would have silently returned "no budget" for
+every op. Both facts are recorded in the code at the injection site.
+
+### Verification
+
+* `tests\Test-OperationTimeouts.ps1` — the important part is a **differential**: the loop's decision
+  snippet is extracted from the shipped source, injected into a real runspace the way `Wuu.Core`
+  injects it, and run on the same 5 inputs as `Test-WuuOperationExpired`; the verdicts must match.
+  Without it, two copies of one rule drift and the enforced budget silently stops matching the
+  documented one. I verified the differential is not a tautology by breaking the function
+  (`if ($false -and ...)`) and confirming the suite fails (3 failures), then reverting.
+* Gate **(ab)** asserts the five properties above in the release gate, including that the table has
+  **≥3 distinct values** (a table of one repeated number is not per-op) and that `AutoFlow` exceeds its
+  own reboot waits.
+* Live check: a real store + row driven through a real runspace resolved `op=ServiceAction`,
+  `budget=300`, and the recorded deadline — so the wiring works, not just the text.
+* Full suite: **22 pass, 1 skip (elevation-gated), 0 fail.**
+
+### Two harness bugs this work produced (both false failures)
+
+* `Test-WuuOperationExpired` initially read the deadline **only** from the row, so the start-time
+  fallback the loop needs did not exist in it — the two copies could not agree. Fixed by giving the
+  function the same two bases the loop has.
+* The differential check cut the snippet at an `$elapsedMin` line that sits *after* the heartbeat, and
+  at a marker that did not match the source, producing an unbalanced snippet that threw before
+  emitting a verdict ("block produced no verdict") — reported as a *disagreement* rather than an
+  extraction failure. It also tried to inject a fake clock, which cannot work: the snippet calls
+  `Get-Date` itself, so `$nowTs` was overwritten and three "future deadline" cases came back expired.
+  The harness now cuts at the `} else {` that opens the timeout action, asserts the snippet contains
+  the deadline computation, uses real time with ≥5 minutes of margin, and says in a comment why a fake
+  clock is impossible.

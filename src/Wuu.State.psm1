@@ -122,8 +122,23 @@ function New-WuuComputerRow {
         # used to delete the row, after which the computer silently stopped being patched.
         ConnectivityFailures    = 0
         LastConnectivityError   = ''
+        # SS5: per-operation deadline. TimeoutExpiresAt/TimeoutSource were written in TWO places and
+        # READ NOWHERE - dead fields, verified by counting uses against assignments. They are now the
+        # read side of the cleanup loop's decision (see Test-WuuOperationExpired and
+        # Update-WuuOperationHeartbeat below): recorded at submission, consulted by the loop, and
+        # reported by the status line. A flat 10-minute stop ignored them entirely.
         TimeoutExpiresAt = $null
         TimeoutSource   = ''
+        # What the row was actually asked to do ('Check','InstallAndRecheck',...). Without this the
+        # cleanup loop has only Computer + Runspace and cannot know which deadline applies - the
+        # flat 10 minutes was the symptom of exactly that missing piece.
+        OpName          = ''
+        # Heartbeat: refreshed by the job-cleanup loop while the PowerShell instance is still
+        # running. The DEADLINE catches a stuck job; the heartbeat is what lets a human (or the
+        # status line) tell "slow" from "hung" before the deadline fires, and it is the evidence
+        # that the operation is still making progress.
+        LastHeartbeatAt = $null
+        Heartbeats      = 0
         RetryCount      = 0
         RetryAt         = $null
         Color           = 'Default'
@@ -271,6 +286,176 @@ function Get-WuuComputerRow {
     $snapshot = New-Object System.Collections.ArrayList
     foreach ($r in $Store.Rows) { $snapshot.Add($r) | Out-Null }
     return $snapshot
+}
+
+function Get-WuuOperationTimeoutSeconds {
+    <#
+    .SYNOPSIS
+    How long an operation of this kind may run before it is treated as stuck (SS5).
+    .DESCRIPTION
+    Falls back to the 'default' entry rather than to a literal, so an op added to Start-UpdateCheckJob
+    without a deadline gets a bounded-but-not-punishing number instead of either infinity or a
+    number copy-pasted somewhere else. Returns 1800 if the table itself is missing (a partially
+    loaded context), because returning 0 would make every job expire the instant it started.
+    #>
+    [CmdletBinding()]
+    param([string]$Op)
+    $table = $global:OperationTimeoutSeconds
+    if (-not $table) { return 1800 }
+    if ($Op -and $table.ContainsKey($Op)) { return [int]$table[$Op] }
+    if ($table.ContainsKey('default')) { return [int]$table['default'] }
+    return 1800
+}
+
+function Format-WuuDuration {
+    <#
+    .SYNOPSIS
+    '45s' / '12m' / '2h05m' - a deadline expressed so a human can compare it with a clock.
+    #>
+    [CmdletBinding()]
+    param([int]$Seconds)
+    if ($Seconds -lt 60) { return "${Seconds}s" }
+    $m = [math]::Floor($Seconds / 60)
+    if ($m -lt 60) { return "${m}m" }
+    $h = [math]::Floor($m / 60)
+    $rem = $m - ($h * 60)
+    return ('{0}h{1:d2}m' -f $h, $rem)
+}
+
+function Test-WuuOperationExpired {
+    <#
+    .SYNOPSIS
+    Decides whether a running operation has passed its deadline (SS5).
+    .DESCRIPTION
+    Two bases, in priority order:
+
+      1. 'row-deadline' - TimeoutExpiresAt recorded on the row at SUBMISSION. Preferred, because it is
+         the value the operator was shown: one source of truth for "what was promised" and "what is
+         enforced".
+      2. 'start-time-fallback' - no deadline on the row (a legacy row, or work not submitted through
+         Start-UpdateCheckJob), so the job's own start time plus the default budget is used. This is
+         still BETTER than the flat 10 minutes it replaces: it is a named budget, and it is reported
+         as a fallback so an operator can tell the operation was not submitted through the normal path.
+
+    Returns a verdict object rather than a boolean so the caller can log the op, the budget, the basis
+    and the overshoot - "timed out" without "after how long, doing what, on what basis" is not
+    actionable.
+
+    THIS LOGIC IS DUPLICATED IN A RUNSPACE BLOCK in Wuu.Core (the job-cleanup runspace cannot see
+    module functions). tests\Test-OperationTimeouts.ps1 runs BOTH on identical inputs and compares the
+    verdicts, so the two cannot drift apart unnoticed - the duplication is deliberate and guarded.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Row,
+        [datetime]$Now = (Get-Date),
+        # From the job entry. Used only when the row carries no deadline.
+        [AllowNull()][Nullable[datetime]]$StartedAt = $null,
+        # Budget for the fallback basis. Defaults to the table's 'default' entry.
+        [AllowNull()][Nullable[int]]$DefaultBudgetSeconds = $null
+    )
+    $result = [pscustomobject]@{
+        Expired = $false; Basis = 'none'; Source = ''; Op = ''
+        BudgetSeconds = 0; ExpiresAt = $null; OvershootSeconds = 0
+    }
+    if (-not $Row) { return $result }
+
+    $hasDeadline = $false
+    $expires = $null
+    if ($Row.PSObject.Properties['TimeoutExpiresAt'] -and $Row.TimeoutExpiresAt) {
+        $expires = $Row.TimeoutExpiresAt
+        $hasDeadline = $true
+    }
+    if ($Row.PSObject.Properties['TimeoutSource']) { $result.Source = [string]$Row.TimeoutSource }
+    if ($Row.PSObject.Properties['OpName']) { $result.Op = [string]$Row.OpName }
+
+    if ($hasDeadline) {
+        $result.Basis = 'row-deadline'
+        $result.BudgetSeconds = Get-WuuOperationTimeoutSeconds -Op $result.Op
+    } elseif ($StartedAt) {
+        $budget = if ($DefaultBudgetSeconds) { [int]$DefaultBudgetSeconds } else { Get-WuuOperationTimeoutSeconds -Op 'default' }
+        $result.Basis = 'start-time-fallback'
+        $result.BudgetSeconds = $budget
+        $expires = ([datetime]$StartedAt).AddSeconds($budget)
+    } else {
+        return $result
+    }
+
+    $result.ExpiresAt = $expires
+    if ($Now -gt $expires) {
+        $result.Expired = $true
+        $result.OvershootSeconds = [int]($Now - $expires).TotalSeconds
+    }
+    return $result
+}
+
+function Update-WuuOperationHeartbeat {
+    <#
+    .SYNOPSIS
+    Records that a running operation is still alive (SS5).
+    .DESCRIPTION
+    Called on each cleanup-loop pass for a job that has not completed. Refreshes LastHeartbeatAt and
+    counts beats. Deliberately does NOT extend the deadline: a heartbeat proves liveness, not progress,
+    and letting it extend the deadline would mean a genuinely hung operation could never be stopped -
+    the failure mode the deadline exists to prevent.
+
+    This is what separates "slow" from "stuck" for a human: a deadline alone only says "not finished",
+    while a heartbeat that has not moved says the job has stopped making progress.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Row,
+        [datetime]$Now = (Get-Date)
+    )
+    if (-not $Row) { return $false }
+    if (-not $Row.PSObject.Properties['LastHeartbeatAt']) { return $false }
+    $Row.LastHeartbeatAt = $Now
+    if ($Row.PSObject.Properties['Heartbeats']) { $Row.Heartbeats = [int]$Row.Heartbeats + 1 }
+    return $true
+}
+
+function Set-WuuOperationDeadline {
+    <#
+    .SYNOPSIS
+    Records the deadline for an operation on a row, at submission time (SS5).
+    .DESCRIPTION
+    The single place the deadline is computed, so the value the operator sees is the value the
+    cleanup loop enforces. Returns the deadline so the caller can log it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][string]$Op,
+        [datetime]$Now = (Get-Date)
+    )
+    $budget = Get-WuuOperationTimeoutSeconds -Op $Op
+    $expires = $Now.AddSeconds($budget)
+    if ($Row.PSObject.Properties['TimeoutExpiresAt']) { $Row.TimeoutExpiresAt = $expires }
+    if ($Row.PSObject.Properties['TimeoutSource']) { $Row.TimeoutSource = $Op }
+    if ($Row.PSObject.Properties['OpName']) { $Row.OpName = $Op }
+    # A new operation starts a new liveness window: stale beats from a previous op would make an
+    # instantly-hung job look healthy.
+    if ($Row.PSObject.Properties['LastHeartbeatAt']) { $Row.LastHeartbeatAt = $Now }
+    if ($Row.PSObject.Properties['Heartbeats']) { $Row.Heartbeats = 0 }
+    return $expires
+}
+
+function Clear-WuuOperationDeadline {
+    <#
+    .SYNOPSIS
+    Clears the deadline/heartbeat state when an operation ends (SS5).
+    .DESCRIPTION
+    Called wherever OpState returns to 'Idle'. Without it a finished row keeps a deadline in the past,
+    so the NEXT operation would be treated as expired on its first loop pass (the deadline is read,
+    not recomputed) - i.e. every operation after the first would be killed immediately.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()]$Row)
+    if (-not $Row) { return }
+    if ($Row.PSObject.Properties['TimeoutExpiresAt']) { $Row.TimeoutExpiresAt = $null }
+    if ($Row.PSObject.Properties['TimeoutSource']) { $Row.TimeoutSource = '' }
+    if ($Row.PSObject.Properties['OpName']) { $Row.OpName = '' }
+    if ($Row.PSObject.Properties['LastHeartbeatAt']) { $Row.LastHeartbeatAt = $null }
 }
 
 function Set-WuuComputerRowColor {
@@ -546,5 +731,13 @@ Export-ModuleMember -Function @(
     'Test-WuuPhaseFailureBlocks'
     'Set-WuuPhaseFailurePolicy'
     'Update-WuuConnectivityState'
+    # SS5: operation-specific deadlines. Exported because the deadline is recorded at the SUBMISSION
+    # POINT (Wuu.WindowsUpdate) and enforced in the cleanup loop (Wuu.Core), and both need to agree.
+    'Get-WuuOperationTimeoutSeconds'
+    'Format-WuuDuration'
+    'Test-WuuOperationExpired'
+    'Set-WuuOperationDeadline'
+    'Clear-WuuOperationDeadline'
+    'Update-WuuOperationHeartbeat'
     'New-WuuOperatorContext'
 )

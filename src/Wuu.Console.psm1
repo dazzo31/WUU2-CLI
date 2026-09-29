@@ -55,12 +55,29 @@ function Format-WuuTable {
     $fmt = "{0,-$ComputerWidth} {1,-$PhaseWidth} {2,-$StateWidth} {3,-$UpdWidth} {4}"
     [void]$sb.AppendLine(($fmt -f 'COMPUTER', 'PHASE', 'STATE', 'UPDATES', 'STATUS'))
     [void]$sb.AppendLine(('-' * ($ComputerWidth + $PhaseWidth + $StateWidth + $UpdWidth + 4 + 40)))
+    # SS5: while an operation is running, show its budget and how long since the last heartbeat.
+    # This is the difference between "slow" and "stuck": a deadline alone only says "not finished",
+    # whereas "beat 45s ago" says the worker is alive and making its way through a long search. It is
+    # the visibility the timeout plan asked for, and it is why the heartbeat exists at all.
+    $now = Get-Date
     foreach ($r in $Rows) {
         $upd = "A:$($r.Available) D:$($r.Downloaded)"
         if ($r.RebootRequired) { $upd += ' RBT' }
         $name = [string]$r.Computer
         if ($name.Length -gt $ComputerWidth) { $name = $name.Substring(0, $ComputerWidth - 1) + [char]0x2026 }
         $status = [string]$r.Status
+        # Guarded property access: synthetic rows (tests, and any caller building a row by hand) do not
+        # carry these fields, and an unguarded read would turn a status table into an error.
+        $isRunning = $r.PSObject.Properties['OpState'] -and $r.OpState -eq 'Running'
+        if ($isRunning -and $r.PSObject.Properties['TimeoutExpiresAt'] -and $r.TimeoutExpiresAt) {
+            $op = if ($r.PSObject.Properties['OpName'] -and $r.OpName) { [string]$r.OpName } else { 'op' }
+            $left = [int]($r.TimeoutExpiresAt - $now).TotalMinutes
+            $beat = ''
+            if ($r.PSObject.Properties['LastHeartbeatAt'] -and $r.LastHeartbeatAt -is [datetime]) {
+                $beat = " beat $([int]($now - $r.LastHeartbeatAt).TotalSeconds)s ago"
+            }
+            $status = "[$op ${left}m left$beat] $status"
+        }
         if ($status.Length -gt 60) { $status = $status.Substring(0, 59) + [char]0x2026 }
         [void]$sb.AppendLine(($fmt -f $name, $r.Phase, $r.State, $upd, $status))
     }
