@@ -113,7 +113,7 @@ from evidence rather than the brief's assumptions.
 | §8 workflow state vs display state | **DONE** | See "§8 — workflow state vs display state" below. The phase gate no longer decides from `UpdatesStatus` (a display string); it reads a three-state `CheckConcluded` plus the workflow `State`. The display-string read in the settled-failure test was also removed — every site that sets `UpdatesStatus='Error'/'Timeout'` sets the matching `State` on the adjacent line, so it could only add disagreement. |
 | §9 phase failure policy | **DONE** | Explicit policy on the store: `PhaseFailurePolicy` = `BlockOnFailure` (DEFAULT) / `ContinueOnTimeout` / `ContinueOnFailure`, decided by the pure `Test-WuuPhaseFailureBlocks`. The old behaviour `continue`d past failed/timed-out rows, i.e. ContinueOnFailure was hard-coded and unreported. See "Phase failure policy" below. |
 | §10 exit codes | **DONE** | Eight documented codes; `-Async` distinguishes *accepted* from *completed*, so a command that returns with work outstanding exits 3 instead of 0. A dead `$script:CommandExitCode` write in the wrong module scope (which made `audit verify` exit 0 on a **broken chain**) was removed. See "§10 — exit codes" below. |
-| §11 WhatIf | **PARTIAL** | Non-destructive and audited already; reports the planned operation but not the per-computer update breakdown. |
+| §11 WhatIf | **DONE** | See "§11 — WhatIf reports a plan" below. `-WhatIf` now lists every target with the action it would take, and — the part that matters — distinguishes **deferred** from **refused**: a busy computer is *queued* for check/download/install but *skipped* for restart/service, so "would restart 10 servers" can no longer be false for three of them. Also: a per-file **source-encoding gate** was added because this work corrupted a file's BOM (see below). |
 | §12 inventory vs connectivity | **DONE** | `$RemoveOfflineComputer` deleted the row on a single failed `Test-Connection`. Now classified by `Update-WuuConnectivityState` (testable) with a consecutive-failure threshold. See below. |
 | §13 audit integrity | **PARTIAL** | The limitation *is* already documented accurately. No external anchor exists. |
 | §14 remaining GUI debris | **DONE for live reads and submissions** | No live GUI control read remains; no per-computer `BeginInvoke` remains in `Wuu.Core` other than the payload's own bounded sub-pipelines and the cleanup runspace. |
@@ -669,6 +669,118 @@ The propagation matrix was then verified rather than assumed — the gate and th
 * Gate **(ad)** — the same properties in the release gate, including "the credential identity is still
   read from `$global:CredentialConfig.Username`" as an explicit failure.
 * Full suite: **24 pass, 1 skip (elevation-gated), 0 fail.**
+
+---
+
+## §11 — WhatIf reports a plan (done)
+
+### The defect
+
+`-WhatIf` printed one sentence: `would run 'install' against all computers`. Before a production change
+that is not reviewable, and for a **restart** it is wrong in the most expensive possible direction.
+
+The reason is the busy policy, which is not uniform:
+
+| Op | Busy computer |
+| --- | --- |
+| check / download / install | **deferred** — `Pending` + `PendingOp` are set, and the request runs when the current operation finishes |
+| restart | **refused** — never silently deferred (the operator explicitly confirmed it) |
+| service | **refused** — skipped and reported |
+
+So "would restart 10 servers" could be false for three of them, and a change reviewer signing off on
+that sentence has approved something that will not happen.
+
+### What replaced it
+
+`Get-WuuCommandPlan` produces a per-computer plan; `Write-WuuCommandPlan` renders it; `-WhatIf` calls it
+and returns the plan on the result object (`Plan`), with `-Json` emitting the same data for a pipeline:
+
+```
+  would run 'restart' against SRV01,SRV02 - no changes made.
+    COMPUTER               PHASE      ACTION    NOTE
+    SRV01                  Phase 1    run
+    SRV02                  Phase 1    skip      busy (Running) - a confirmed restart is never silently deferred
+  Total: 1 would run now, 1 would be SKIPPED (busy).
+  The skipped computers will NOT be changed by a real run either - re-run when idle.
+```
+
+Three facts per computer, because each changes what a reviewer should conclude:
+
+* **ACTION** — `run`, `queue`, `skip`, or `noop`. A `download` against a computer that already has
+  everything reads `noop`, **using the handler's own condition** (`$r.Available -eq $r.Downloaded`), so
+  "would download to 40 servers" stops being misleading when 12 of them have nothing to do.
+* **BUSY** — including a row that is merely `Pending`, since the scheduler queue is not idle capacity.
+* **UNRESOLVED** — names that match nothing (or are ambiguous) are listed, never silently dropped, so a
+  typo in a change ticket is caught by the dry run rather than by the change.
+
+Resolution **mirrors `Read-WuuSelection` exactly** (case-insensitive exact, then a **unique** prefix
+match; an ambiguous prefix resolves to nothing rather than guessing). The plan and the real run therefore
+cannot disagree about which computers are involved.
+
+### The contract I broke and then restored
+
+I added an audit record for dry runs — the brief's status table says `-WhatIf` is "audited already", and
+ISO 27001 A.8.15 covers denied attempts. `tests\Test-AuditTrail.ps1` failed immediately, because the
+existing contract is the opposite: **`-WhatIf` writes no audit record at all.** That is the better
+design, and my reasoning was wrong on both counts:
+
+* the brief's "audited already" is **not true** — the test measures zero records — so the argument
+  rested on a mistaken premise (the same trap the brief itself warns about: verify, don't trust the
+  prose);
+* a **simulation is not a denied attempt**. Mixing plans into the trail degrades it as evidence: an
+  auditor could no longer distinguish "this system refused to make the change" from "an operator asked
+  what it would do", and `declined` would be actively misleading for the second case.
+
+The audit record was reverted, the test assertion I had written on the false premise was replaced with
+one asserting **no** record, and the §11 gate now guards that contract too — so it has two guards.
+
+### A file-encoding bug I caused, and the gate that now prevents it
+
+While proving the §11 assertions were not tautologies (by temporarily breaking the download handler and
+restoring it), I rewrote `src\Wuu.Core.psm1` with `Set-Content`, which under PS7 writes UTF-8 **without**
+a BOM. That file contains 51 non-ASCII bytes, so the rewrite changed its encoding: git showed line 1 as
+`´╗┐#Requires` (the BOM bytes reinterpreted). Nothing in the suite noticed, because no test checks
+encoding — the failure was caught only by reading the diff.
+
+I restored it with `git checkout --` (which brings the BOM back), but the real fix is a gate. Gate **(af)**
+now enforces the invariant **empirically derived from the tree** rather than assumed:
+
+* 4 shipped files contain non-ASCII bytes, and **all four** have a BOM (`Wuu.Command` 3 bytes,
+  `Wuu.Core` 51, `Wuu.Session` 54, `Package-WUU2` 3);
+* the other 18 have **zero** non-ASCII bytes and no BOM.
+
+So the rule is "non-ASCII implies BOM", checked in that direction only — a BOM on an ASCII-only file is
+harmless and is not a failure. The audit I ran to establish this is in the gate's comment, along with the
+byte counts.
+
+### Verification
+
+* `tests\Test-WhatIfPlan.ps1` — 41 assertions, all through the production path.
+* Gate **(ae)** — including that the plan's busy policy **matches the handlers** (deferring handlers
+  really set `Pending`; the restart handler really does not), that the no-op test matches the handler's
+  condition, that ambiguous prefixes do not guess, that `-WhatIf` never writes an audit record, and that
+  the `-Json` output is returned rather than emitted as a second object.
+* I confirmed the two differential assertions are not tautologies by breaking the download handler's
+  `PendingOp` and watching the suite fail (1 failure), then restoring.
+* Gate **(af)** for source encoding, as above.
+* Full suite: **25 pass, 1 skip (elevation-gated), 0 fail.**
+
+### Three more false failures worth recording
+
+All three were my own test bugs, and all three are the same two mistakes recurring:
+
+* **`$r` interpolated into a double-quoted regex.** `"\$r\.PendingOp = 'Download'"` — PowerShell escapes
+  with a **backtick**, not a backslash, so `$r` interpolated (to a command-result object in the test) and
+  the pattern became junk. Second time in this pass. Patterns containing `$` must be single-quoted.
+* **A literal `\T` in a double-quoted regex** (`"...Result = \`$true; ..."`) threw `Unrecognized escape
+  sequence \T` from the *validator*, which reported as a gate error rather than a validation failure.
+  Replaced with a literal `.Contains()`.
+* **A near-miss that was luck, not design.** Emitting the `-Json` output on the output stream made the
+  call return **two** objects. I expected the exit code to break (a bare string has no `.Ok`, so
+  `-not $result.Ok` is `$true` = failure) — it did not, because PowerShell **member-enumerates across an
+  array**, so `.Ok` found the property on the psobject element and the code stayed 0. That is worth
+  knowing on its own: an array result can mask a missing `Ok`. The JSON is now returned as a property on
+  the single result object, so nothing depends on that behaviour.
 
 ### A test bug worth recording, because it recurred three times
 

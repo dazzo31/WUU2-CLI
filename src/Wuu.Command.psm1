@@ -172,6 +172,202 @@ function Invoke-WuuAuditCommand {
     }
 }
 
+function Get-WuuCommandPlan {
+    <#
+    .SYNOPSIS What a command WOULD do, per computer, without doing any of it (hardening brief SS11).
+    .DESCRIPTION
+    `-WhatIf` reported "would run 'install' against all computers" - a single sentence. For a change
+    being reviewed before it touches production that is not enough: the reviewer needs to know WHICH
+    computers, what each one will actually do, and which requests would NOT take effect. The brief asks
+    for exactly that breakdown.
+
+    Three facts per computer, because each changes what a reviewer should conclude:
+
+      * ACTION  - run now, or something else. A `download` against a computer that already has every
+                  available update downloaded does NOTHING (the handler answers 'Up-to-Date' and moves
+                  on), so "would download to 40 servers" is misleading if 12 of them have nothing to do.
+      * BUSY    - whether an operation is already in flight. This matters because the two policies
+                  differ per verb, and the difference is not cosmetic:
+                    DEFER  (check/download/install) - the row is marked Pending and runs when the
+                           current operation finishes. The request is honoured, later.
+                    REFUSE (restart/service)        - the request is dropped. A restart is never
+                           silently deferred (the operator explicitly confirmed it), and a service
+                           action is skipped and reported.
+                  A dry run that said "would restart 10 servers" when 3 are busy would be wrong in the
+                  most expensive possible direction for a reboot.
+      * UNRESOLVED - names that match nothing (or are ambiguous). These are reported, never silently
+                  dropped: a typo in a change ticket should be caught by the dry run, not by the change.
+
+    Resolution mirrors Read-WuuSelection exactly (exact name case-insensitively, then a UNIQUE prefix
+    match) so the plan lists what would really run rather than a second, divergent interpretation.
+
+    Reads the store's own collections rather than the Wuu.State helpers, so it stays callable wherever
+    the store object exists (including from a test that loads only this module).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Verb,
+        [AllowNull()][hashtable]$Store,
+        [string]$Computer,
+        [switch]$All,
+        [string]$ServiceAction,
+        [int]$Set = 0
+    )
+
+    # Which policy applies when a computer is already busy. Stated as data so the dry run and the
+    # handlers cannot disagree about it in a way nobody notices.
+    $policy = if ($Verb -in @('restart', 'service')) { 'refuse' } else { 'defer' }
+
+    # NOTE: this is $allRows, NOT $all. PowerShell variable names are case-insensitive, so $all IS
+    # the [switch]$All parameter - and `$all = @()` therefore assigns an array to a SwitchParameter,
+    # which fails at the first `+=` with "Cannot convert the System.Object[] to
+    # System.Management.Automation.SwitchParameter". The stack pointed at the assignment, which looks
+    # innocuous. Same family as the $Host / $PID collisions; the parameter name is the trap here.
+    $allRows = @()
+    if ($Store -and $Store.ContainsKey('Rows') -and $Store.Rows) {
+        foreach ($r in $Store.Rows) { $allRows += $r }
+    }
+
+    $wanted = @()
+    $allSelected = $false
+    if ($All) { $allSelected = $true }
+    elseif ($Computer) {
+        foreach ($piece in ($Computer -split '[,;]')) {
+            $n = $piece.Trim()
+            if (-not $n) { continue }
+            if ($n -match '^(all|\*)$') { $allSelected = $true; continue }
+            $wanted += $n
+        }
+    }
+
+    $unresolved = New-Object System.Collections.ArrayList
+    $targets = New-Object System.Collections.ArrayList
+
+    $resolve = {
+        param([string]$Name)
+        foreach ($r in $allRows) { if ([string]$r.Computer -eq $Name) { return $r } }
+        $hits = @()
+        foreach ($r in $allRows) { if ([string]$r.Computer -like "$Name*") { $hits += $r } }
+        if ($hits.Count -eq 1) { return $hits[0] }
+        return $null
+    }
+
+    $chosen = New-Object System.Collections.ArrayList
+    if ($allSelected) {
+        foreach ($r in $allRows) { [void]$chosen.Add($r) }
+    } else {
+        foreach ($n in $wanted) {
+            $row = & $resolve $n
+            if ($row) { [void]$chosen.Add($row) } else { [void]$unresolved.Add($n) }
+        }
+    }
+
+    foreach ($r in $chosen) {
+        $busy = $false
+        $opState = ''
+        if ($r.PSObject.Properties['OpState']) { $opState = [string]$r.OpState }
+        if ($r.PSObject.Properties['Pending']) { $busy = [bool]$r.Pending }
+        if ($opState -eq 'Running') { $busy = $true }
+
+        $action = 'run'
+        $reason = ''
+        if ($busy) {
+            if ($policy -eq 'refuse') {
+                $action = 'skip'
+                $reason = if ($Verb -eq 'restart') { "busy ($opState) - a confirmed restart is never silently deferred" } else { "busy ($opState) - service action is skipped" }
+            } else {
+                $action = 'queue'
+                $reason = "busy ($opState) - queued to run when the current operation finishes"
+            }
+        } elseif ($Verb -eq 'download' -and $r.PSObject.Properties['Available']) {
+            # The handler's own no-op test: `$r.Available -eq $r.Downloaded` answers 'Up-to-Date'.
+            $avail = [int]$r.Available
+            $dl = if ($r.PSObject.Properties['Downloaded']) { [int]$r.Downloaded } else { 0 }
+            if ($avail -eq $dl) {
+                $action = 'noop'
+                $reason = if ($avail -eq 0) { 'no updates available for download' } else { 'all available updates are already downloaded' }
+            }
+        } elseif ($Verb -eq 'install' -and $r.PSObject.Properties['Downloaded']) {
+            $dl = [int]$r.Downloaded
+            if ($dl -eq 0) {
+                $action = 'noop'
+                $reason = 'nothing downloaded to install'
+            }
+        }
+
+        [void]$targets.Add([pscustomobject]@{
+            Computer = [string]$r.Computer
+            Phase    = [string]$r.Phase
+            Action   = $action
+            Reason   = $reason
+            Busy     = $busy
+            OpState  = $opState
+        })
+    }
+
+    $detail = if ($allSelected) { 'all computers' } elseif ($Computer) { $Computer } else { '(unspecified)' }
+    if ($Verb -eq 'service' -and $ServiceAction) { $detail += " (service $ServiceAction)" }
+
+    return [pscustomobject]@{
+        Verb       = $Verb
+        Detail     = "would run '$Verb' against $detail"
+        Policy     = $policy
+        Selected   = $chosen.Count
+        WouldRun   = @($targets | Where-Object { $_.Action -eq 'run' }).Count
+        WouldQueue = @($targets | Where-Object { $_.Action -eq 'queue' }).Count
+        WouldSkip  = @($targets | Where-Object { $_.Action -eq 'skip' }).Count
+        WouldNoOp  = @($targets | Where-Object { $_.Action -eq 'noop' }).Count
+        Unresolved = @($unresolved)
+        Targets    = @($targets)
+    }
+}
+
+function Write-WuuCommandPlan {
+    <#
+    .SYNOPSIS Renders a command plan for a human reviewing a change (SS11).
+    .DESCRIPTION
+    Line-oriented, no cursor movement, so the output survives being pasted into a change record or a
+    ticket - which is where a dry run's value actually lands.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Plan)
+    Write-Host ("  {0} - no changes made." -f $Plan.Detail) -ForegroundColor Yellow
+
+    if ($Plan.Unresolved.Count -gt 0) {
+        Write-Host ("  NOT RESOLVED ({0}) - these would be skipped by a real run:" -f $Plan.Unresolved.Count) -ForegroundColor Red
+        foreach ($n in $Plan.Unresolved) { Write-Host ("    {0}" -f $n) -ForegroundColor Red }
+    }
+
+    if ($Plan.Targets.Count -eq 0) {
+        Write-Host '  (no computers selected)' -ForegroundColor DarkGray
+        return
+    }
+
+    $fmt = "    {0,-22} {1,-10} {2,-9} {3}"
+    Write-Host ($fmt -f 'COMPUTER', 'PHASE', 'ACTION', 'NOTE') -ForegroundColor DarkCyan
+    foreach ($t in $Plan.Targets) {
+        $colour = switch ($t.Action) {
+            'run'   { 'Green' }
+            'queue' { 'Yellow' }
+            'skip'  { 'Red' }
+            'noop'  { 'DarkGray' }
+            default { 'Gray' }
+        }
+        Write-Host ($fmt -f $t.Computer, $t.Phase, $t.Action, $t.Reason) -ForegroundColor $colour
+    }
+
+    # The totals are what a change reviewer signs off on, so they are stated in the same words the
+    # real run uses.
+    $bits = @("$($Plan.WouldRun) would run now")
+    if ($Plan.WouldQueue -gt 0) { $bits += "$($Plan.WouldQueue) queued until idle" }
+    if ($Plan.WouldSkip -gt 0) { $bits += "$($Plan.WouldSkip) would be SKIPPED (busy)" }
+    if ($Plan.WouldNoOp -gt 0) { $bits += "$($Plan.WouldNoOp) have nothing to do" }
+    Write-Host ("  Total: {0}." -f ($bits -join ', ')) -ForegroundColor White
+    if ($Plan.WouldSkip -gt 0 -and $Plan.Policy -eq 'refuse') {
+        Write-Host '  The skipped computers will NOT be changed by a real run either - re-run when idle.' -ForegroundColor Yellow
+    }
+}
+
 function Get-WuuExitCode {
     <#
     .SYNOPSIS The exit-code contract for the command surface (hardening brief SS10).
@@ -479,13 +675,77 @@ function Invoke-WuuCommand {
     }
 
     # -WhatIf: report intent, change nothing. Deliberately BEFORE any handler call.
+    #
+    # SS11: this now produces a PER-COMPUTER plan rather than one sentence. A change being reviewed
+    # before it touches production needs to say which computers, what each will do, and which requests
+    # would not take effect - "would run 'restart' against all computers" is not reviewable, and it is
+    # wrong in the most expensive direction when some of those computers are busy (a restart is refused,
+    # not deferred - see Get-WuuCommandPlan).
     if ($WhatIf -and $entry.Mutating) {
-        $targets = if ($All) { 'all computers' } elseif ($Computer) { $Computer } else { '(unspecified)' }
-        $detail = "would run '$Verb' against $targets"
-        if ($Verb -eq 'service') { $detail += " (service $ServiceAction)" }
-        if ($Verb -eq 'phase') { $detail += " (phase $Set)" }
-        Write-Host ("  [WhatIf] $detail - no changes made.") -ForegroundColor Yellow
-        return [pscustomobject]@{ Ok = $true; Verb = $Verb; WhatIf = $true; Would = $detail }
+        $plan = Get-WuuCommandPlan -Verb $Verb -Store $Store -Computer $Computer -All:$All `
+            -ServiceAction $ServiceAction -Set $Set
+
+        # -Json so a change pipeline can diff the plan against a previous run. This is the first
+        # branch because a caller asking for machine-readable output must not also get prose.
+        #
+        # The JSON is written to the HOST and also returned as a property, rather than emitted on the
+        # output stream.
+        #
+        # WHY: emitting it made this call return TWO objects - the JSON string AND the result object
+        # (measured). Anything consuming the result then has to know which element is which; a caller
+        # piping `Invoke-WuuCommand ... | ConvertFrom-Json` would receive an array of two unrelated
+        # values, and one of the two carries no Ok/Result at all.
+        #
+        # A NEAR-MISS WORTH RECORDING: Core reads `$result.Ok` to choose the exit code. On a bare
+        # string that is $null, and `-not $null` is $true - i.e. a JSON-only return would have exited
+        # 1 for every successful dry run. It did NOT happen here, and the reason is subtle: PowerShell
+        # member-enumerates across an ARRAY, so `$result.Ok` found the Ok on the psobject element and
+        # the exit code stayed 0. Luck, not design. Returning one object removes the dependency on it.
+        $jsonText = $null
+        if ($Json) {
+            $jsonText = [pscustomobject]@{
+                Command        = $Verb
+                WhatIf         = $true
+                Detail         = $plan.Detail
+                Policy         = $plan.Policy
+                Selected       = $plan.Selected
+                WouldRun       = $plan.WouldRun
+                WouldQueue     = $plan.WouldQueue
+                WouldSkip      = $plan.WouldSkip
+                WouldNoOp      = $plan.WouldNoOp
+                Unresolved     = $plan.Unresolved
+                Targets        = $plan.Targets
+                Would          = $plan.Detail
+                Ok             = $true
+            } | ConvertTo-Json -Depth 5
+            Write-Host $jsonText
+        } else {
+            Write-WuuCommandPlan -Plan $plan
+        }
+
+        # NO AUDIT RECORD IS WRITTEN. -WhatIf is side-effect free in the AUDIT TRAIL as well, and that
+        # contract is asserted by tests\Test-AuditTrail.ps1 ("-WhatIf wrote audit records (expected
+        # none)").
+        #
+        # I first added one (session-start + a 'declined' record) on the grounds that ISO 27001 A.8.15
+        # covers denied attempts - and the hardening brief describes -WhatIf as "audited already". Both
+        # were wrong to act on here:
+        #   * the brief's "audited already" is simply not true (the test measures zero records), so it
+        #     was an argument from a mistaken premise;
+        #   * a SIMULATION is not a denied attempt. Mixing plans into the trail degrades it as evidence:
+        #     an auditor reading it cannot distinguish "a change this system refused to make" from "an
+        #     operator asking what a change WOULD do", and 'declined' would be actively misleading for
+        #     the second case (nothing was declined - the caller asked for a report).
+        # A side-effect-free dry run is also more useful than an audited one: it can be run freely,
+        # including repeatedly while preparing a change, without leaving artefacts that need explaining.
+        #
+        # -WhatIf is a SUCCESS: it correctly did what was asked (report the intent, change nothing). It
+        # is never 'Queued' (nothing was accepted for later) and never a failure for having skipped busy
+        # computers - refusing to touch them is the intended behaviour, and the plan says so.
+        return [pscustomobject]@{
+            Ok = $true; Verb = $Verb; WhatIf = $true; Would = $plan.Detail; Result = 'Success'
+            Plan = $plan; Json = $jsonText
+        }
     }
 
     # Build the parameter bag the answer-builder and handlers expect.
@@ -643,6 +903,8 @@ Export-ModuleMember -Function @(
     'Get-WuuCommandHelp'
     'Get-WuuExitCode'
     'Get-WuuExitCodeMeaning'
+    'Get-WuuCommandPlan'
+    'Write-WuuCommandPlan'
     'Invoke-WuuCommand'
     'ConvertTo-WuuCommandLine'
     # Exported because the guided UI's Reports/audit category (spec 20) invokes the audit verbs

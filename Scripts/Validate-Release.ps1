@@ -1239,5 +1239,126 @@ if ($leakFiles.Count -gt 0) {
     Pass 'no log or audit call interpolates a password-shaped expression (SS6)'
 }
 
+# (ae) -WHATIF REPORTS A PER-COMPUTER PLAN (brief SS11). `-WhatIf` printed one sentence ("would run
+#      'install' against all computers"), which is not reviewable before a production change - and for
+#      a RESTART it is wrong in the most expensive direction: a busy computer is NOT deferred for
+#      restart/service (the request is dropped), so "would restart 10 servers" can be false for three
+#      of them.
+#
+#      The plan states three facts per computer (what it would do, whether it is busy, and why), and the
+#      policy must MATCH THE HANDLERS rather than be a second opinion: deferring verbs set Pending so
+#      the request is honoured later, refusing verbs do not.
+$cmdRawP = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Command.psm1') -Raw
+$coreRawP = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+
+if ($cmdRawP -notmatch 'function Get-WuuCommandPlan') {
+    Fail 'Get-WuuCommandPlan is missing - -WhatIf cannot report a per-computer breakdown (SS11)'
+} elseif ($cmdRawP -notmatch "'Get-WuuCommandPlan'") {
+    Fail 'Get-WuuCommandPlan is not exported'
+} elseif ($cmdRawP -notmatch 'function Write-WuuCommandPlan') {
+    Fail 'Write-WuuCommandPlan is missing'
+} elseif ($cmdRawP -notmatch 'Get-WuuCommandPlan -Verb \$Verb') {
+    Fail 'the -WhatIf path does not call the planner - it still prints one sentence (SS11)'
+} elseif (-not $failed) {
+    Pass 'the -WhatIf path produces a per-computer plan (SS11)'
+}
+
+# The policy table, and its agreement with the handlers.
+if ($cmdRawP -match "\`$Verb -in @\('restart', 'service'\)\)\s*\{\s*'refuse'") {
+    Pass 'the plan refuses (rather than defers) for restart and service, matching the handlers (SS11)'
+} else {
+    Fail "the plan's busy policy is not refuse-for-restart/service - it could promise a reboot it will not perform (SS11)"
+}
+# Deferring handlers must actually set Pending, or the plan's 'queue' action is a lie.
+if ($coreRawP -match 'if \(Test-WuuComputerBusy -Row \$r\) \{[^}]*\$r\.Pending = \$true') {
+    Pass 'the deferring handlers really set Pending, so the plan''s queue action is truthful (SS11)'
+} else {
+    Fail "a deferring handler no longer sets Pending - the plan would claim a request is honoured later when it is dropped (SS11)"
+}
+# ...and the restart handler must NOT defer.
+$restartHandlerP = [regex]::Match($coreRawP, '\$consoleActions\.EventRestartComputer = \{[\s\S]*?\n\}').Value
+if ($restartHandlerP -and $restartHandlerP -notmatch '\$r\.Pending = \$true') {
+    Pass 'the restart handler never defers a busy computer, matching the plan (SS11)'
+} else {
+    Fail 'the restart handler defers after all - the plan claims it refuses, and the operator is told the wrong thing (SS11)'
+}
+# The no-op test must be the handler's own condition, not an independent interpretation.
+if ($cmdRawP -match '\$avail -eq \$dl' -and $coreRawP -match 'if \(\$r\.Available -eq \$r\.Downloaded\)') {
+    Pass "the plan's no-op test matches the handler's own condition (SS11)"
+} else {
+    Fail "the plan and the download handler disagree about what 'nothing to do' means (SS11)"
+}
+# Unresolved names must be REPORTED, or a typo in a change ticket becomes a silent no-op.
+if ($cmdRawP -match 'Unresolved = @\(\$unresolved\)' -and $cmdRawP -match 'NOT RESOLVED') {
+    Pass 'names that resolve to nothing are reported rather than silently dropped (SS11)'
+} else {
+    Fail 'unmatched names are not reported - a typo in a change ticket would go unnoticed (SS11)'
+}
+# The resolution must mirror the real selection helper (exact, then UNIQUE prefix). An ambiguous prefix
+# must resolve to nothing: guessing a computer during a dry run is worse than reporting the name.
+if ($cmdRawP -match "\`$hits\.Count -eq 1\) \{ return \`$hits\[0\]") {
+    Pass 'the plan resolves names the way the selection helper does (unique prefix only) (SS11)'
+} else {
+    Fail 'the plan resolves names differently from the real selection helper (SS11)'
+}
+# -WhatIf must stay a Success, and must not claim to have queued anything.
+# Literal match (no regex): the pattern contains '$true', '.', and a ';' - as a regex the unescaped
+# escape sequence '\T' is an ArgumentException, which is how this gate first reported itself.
+if ($cmdRawP.Contains("WhatIf = `$true; Would = `$plan.Detail; Result = 'Success'")) {
+    Pass '-WhatIf still classifies as Success and never as Queued (SS10/SS11)'
+} else {
+    Fail '-WhatIf no longer reports Result=Success'
+}
+# ...and it must write NO audit record. A simulation is not a denied attempt, and mixing plans into the
+# trail would make 'refused to make this change' indistinguishable from 'asked what it would do'. This
+# is also asserted by tests\Test-AuditTrail.ps1, so the contract has two guards.
+$whatIfBody = [regex]::Match($cmdRawP, 'if \(\$WhatIf -and \$entry\.Mutating\) \{[\s\S]*?\n    \}').Value
+if ($whatIfBody -and $whatIfBody -notmatch 'Write-WuuAuditRecord' -and $whatIfBody -notmatch 'Start-WuuAuditSession') {
+    Pass '-WhatIf writes no audit record: the trail records changes, not simulations (SS11)'
+} else {
+    Fail '-WhatIf writes audit records - simulations must not enter the compliance trail (SS11)'
+}
+# The JSON must be RETURNED, not emitted on the output stream. Emitting it made the call return two
+# objects (measured); the exit code survived only because PowerShell member-enumerates across arrays,
+# which is luck rather than design.
+if ($cmdRawP -match '\$jsonText = \$null' -and $cmdRawP -match 'Plan = \$plan; Json = \$jsonText') {
+    Pass 'the -WhatIf -Json output is returned on the result object, not emitted as a second object (SS11)'
+} else {
+    Fail 'the -WhatIf -Json path emits the JSON on the output stream - callers would receive two objects (SS11)'
+}
+
+# (af) SOURCE ENCODING. A shipped file that contains non-ASCII BYTES must carry a UTF-8 BOM.
+#
+#      This gate exists because I broke it while working on SS11: I rewrote Wuu.Core.psm1 with
+#      Set-Content, which under PS7 writes UTF8 WITHOUT a BOM, and the file (which contains 51
+#      non-ASCII bytes - the '-' ellipsis and friends) was corrupted by the encoding change. git showed
+#      the first line as '´╗┐#Requires' - the BOM bytes reinterpreted. Nothing in the test suite noticed,
+#      because none of them check encoding.
+#
+#      The rule is verified against every shipped file, not assumed:
+#        * 4 files contain non-ASCII and ALL FOUR have a BOM (Command, Core, Session, Package-WUU2);
+#        * all 20 remaining files have zero non-ASCII bytes and no BOM.
+#      So the invariant is 'non-ASCII implies BOM', and it is checked in that direction only - a BOM on
+#      an ASCII-only file is harmless and is not treated as a failure.
+$encodingFiles = @()
+$encodingFiles += @(Get-ChildItem -Path (Join-Path $root 'src') -Filter '*.psm1' -File)
+$encodingFiles += @(Get-ChildItem -Path $root -Filter '*.ps1' -File)
+$encodingFiles += @(Get-ChildItem -Path (Join-Path $root 'Scripts') -Filter '*.ps1' -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notlike '_*' })
+$encodingOffenders = @()
+foreach ($ef in $encodingFiles) {
+    $bytes = [System.IO.File]::ReadAllBytes($ef.FullName)
+    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    if ($hasBom) { continue }
+    $nonAscii = 0
+    for ($i = 0; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -ge 0x80) { $nonAscii++ } }
+    if ($nonAscii -gt 0) { $encodingOffenders += "$($ef.Name) ($nonAscii non-ASCII byte(s), no BOM)" }
+}
+if ($encodingOffenders.Count -gt 0) {
+    Fail ("shipped file(s) contain non-ASCII bytes WITHOUT a UTF-8 BOM - their text is encoding-dependent and a rewrite will corrupt it: " + ($encodingOffenders -join '; '))
+} else {
+    Pass "every shipped file with non-ASCII bytes carries a UTF-8 BOM ($($encodingFiles.Count) file(s) checked)"
+}
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }
