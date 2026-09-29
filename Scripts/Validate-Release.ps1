@@ -1211,16 +1211,46 @@ $passCount = ([regex]::Matches($coreRawE, "InvokeRemoteTaskScript[\s\S]{0,400}?C
 if ($passCount -lt 2) {
     Fail "only $passCount remote-task call(s) pass the resolved credential - the download/install paths must both pass it (SS6)"
 }
-$guardCount = ([regex]::Matches($coreRawE, "UseCustomCredentials -and \`$Computer\.computer -ne 'localhost' -and \`$Computer\.computer -ne \`$env:COMPUTERNAME")).Count
-if ($guardCount -lt 2) {
-    Fail "only $guardCount local-machine guard(s) - custom credentials could be applied to the local host (SS6)"
-}
+# PHASE 1 replaced the duplicated inline guard with a single rule in the resolver, so the gate now
+# asserts the RULE EXISTS IN ONE PLACE rather than that it is repeated at the call sites. Both are
+# acceptable; what is not acceptable is neither, or a fallback branch reappearing.
+$guardCount = ([regex]::Matches($coreRawE, "UseCustomCredentials -and \`$Computer\.computer -ne 'localhost'")).Count
 $wupdRawC = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+$resolverHasLocalRule = [bool]($wupdRawC -match "\`$isLocal = \(\`$ComputerName -eq 'localhost' -or \`$ComputerName -eq \`$env:COMPUTERNAME\)")
+if ($guardCount -eq 0 -and -not $resolverHasLocalRule) {
+    Fail 'the local-machine rule is neither centralised in the resolver nor present at the call sites - custom credentials could be applied to the local host (SS6)'
+}
 if ($wupdRawC -notmatch '\[pscredential\]\$Cred') {
     Fail 'the credential probe is not typed [pscredential] - a plain-string password could be used as one (SS6)'
 }
-if ($wupdRawC -notmatch "CredentialCache\[\`$ComputerName\] = \`$null") {
-    Fail 'the runspace resolver does not cache the default-credentials outcome as an explicit null entry (SS6)'
+# PHASE 1 INVERSION. This gate used to REQUIRE a null cache entry ("caches the default-credentials
+# outcome"), i.e. it demanded the very fallback that Phase 1 removes - a gate enforcing a defect. It
+# now forbids the fallback on both sides, which is the property that actually matters.
+$rsResolverC = [regex]::Match($wupdRawC, "SetVariable\('GetRemoteCredentialsScript', \[scriptblock\]::Create\(\{([\s\S]*?)\n        \}\.ToString\(\)\)\)").Groups[1].Value
+$rsCodeC = Get-WuuTextWithoutComments -Text $rsResolverC
+if ($rsCodeC -match "-ArgumentList @\(\`$ComputerName, \`$null\)") {
+    Fail 'the runspace resolver probes the DEFAULT identity again - the silent credential fallback is back (Phase 1)'
+}
+if ($rsCodeC -match "CredentialCache\[\`$ComputerName\] = \`$null") {
+    Fail "the resolver records a 'use default' cache entry again, so a silent fallback can occur (Phase 1)"
+}
+if ($rsCodeC -notmatch 'No fallback is attempted') {
+    Fail 'the runspace resolver does not refuse explicitly when configured custom credentials are unusable (Phase 1)'
+}
+# ...and the module-side resolver must not fall back either: no default probe after a custom failure.
+$credResolveBody = Get-WuuFunctionBody (Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Credentials.psm1') -Raw) 'Resolve-WuuOperationCredential'
+$credResolveCode = Get-WuuTextWithoutComments -Text $credResolveBody
+if ($credResolveCode -match 'Operation ''credential verification \(process identity\)''') {
+    # A process-identity probe is legitimate ONLY on the Default path. It must be unreachable when the
+    # mode is Custom, which is guaranteed by the mode being decided before any probe runs.
+    $modeAt = $credResolveCode.IndexOf("`$mode = if (`$customConfigured")
+    $probeAt = $credResolveCode.IndexOf("credential verification (process identity)")
+    if ($modeAt -lt 0 -or $probeAt -lt 0 -or $modeAt -gt $probeAt) {
+        Fail 'the module-side resolver can probe the process identity after deciding on custom credentials - the fallback shape (Phase 1)'
+    }
+}
+if (-not $failed) {
+    Pass 'credential identity is deterministic: no fallback on either side, and the local-machine rule in one place (Phase 1)'
 }
 
 # 5. No password in the logs or the audit trail. Matches password-shaped EXPRESSIONS, not the word

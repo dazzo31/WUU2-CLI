@@ -144,6 +144,13 @@ function New-WuuComputerRow {
         # Presentation colour name. This is what Format-WuuTable maps to a console colour, and what
         # makes timeout distinguishable from a terminal error.
         Color           = 'Default'
+        # PHASE 1: the credential configuration epoch this row's runspace was built under, and the
+        # identity that runspace is actually using. A runspace captures the credential configuration
+        # at creation, so without the epoch a credential change would leave the next operation on
+        # this computer running under the PREVIOUS identity - silently. Start-UpdateCheckJob compares
+        # these against the global epoch and rebuilds the runspace when they differ.
+        CredentialEpoch    = -1
+        CredentialIdentity = ''
         # SS8: whether the last CHECK reached a conclusion, as a BOOLEAN rather than a display string.
         #
         # WHY THIS EXISTS. Test-PhaseCompletion decided "has this row settled?" from

@@ -187,38 +187,74 @@ if ($passesToTask -ge 2) {
     Bad "only $passesToTask remote-task call(s) pass the resolved credential (expected >= 2)"
 }
 
-# (b) the local-computer guard: custom credentials must NOT be applied to the local machine, where the
+# (b) The local-machine rule: custom credentials must NOT be applied to the local host, where the
 #     process token is already the right principal (and passing credentials to local DCOM is rejected).
-$guards = ([regex]::Matches($coreRaw, "UseCustomCredentials -and \`$Computer\.computer -ne 'localhost' -and \`$Computer\.computer -ne \`$env:COMPUTERNAME")).Count
-if ($guards -ge 2) {
-    Ok "both remote task paths skip credential resolution for the local machine ($guards guards)"
+#
+#     PHASE 1 MOVED THIS RULE. It used to be duplicated as an inline guard at both remote-task call
+#     sites; it now lives once, in the resolver, which both payloads call unconditionally. Asserting
+#     the old duplicated form would forbid the single-decision design, so the assertion is now about
+#     the RULE EXISTING IN ONE PLACE - which is what actually prevents custom credentials reaching the
+#     local host.
+$guards = ([regex]::Matches($coreRaw, "UseCustomCredentials -and \`$Computer\.computer -ne 'localhost'")).Count
+$resolverHasLocalRule = [bool]($wupdRaw -match "\`$isLocal = \(\`$ComputerName -eq 'localhost' -or \`$ComputerName -eq \`$env:COMPUTERNAME\)")
+if ($guards -eq 0 -and $resolverHasLocalRule) {
+    Ok 'the local-machine rule exists in the resolver only (no duplicated guard at the call sites)'
+} elseif ($guards -ge 2) {
+    Ok "the local-machine rule is enforced at both call sites ($guards guards)"
 } else {
-    Bad "only $guards local-machine guard(s) - custom credentials could be applied to the local host"
+    Bad "the local-machine rule is neither centralised nor present at the call sites - custom credentials could reach the local host"
 }
 
-# (c) the runspace-side resolver tries custom FIRST, then default, and caches the OUTCOME (including
-#     the default-credentials case as an explicit $null entry, not as "absent").
-if ($wupdRaw -match "-ArgumentList @\(\`$ComputerName, \`$CustomCredentials\)") {
-    Ok 'the runspace resolver tries the custom credential first'
+# (c) PHASE 1: the runspace resolver uses the configured custom credential, and there is NO fallback
+#     branch. This block used to ASSERT the fallback ("falls back to default credentials", "caches the
+#     default-credentials outcome") - i.e. it encoded the very defect Phase 1 removes, so it was
+#     rewritten rather than deleted. What matters now is the opposite: no default probe exists, and
+#     the cache cannot record one.
+$rsResolver = [regex]::Match($wupdRaw, "SetVariable\('GetRemoteCredentialsScript', \[scriptblock\]::Create\(\{([\s\S]*?)\n        \}\.ToString\(\)\)\)").Groups[1].Value
+$rsCode = (($rsResolver -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+if ($rsCode -match "-ArgumentList @\(\`$ComputerName, \`$cred\)") {
+    Ok 'the runspace resolver probes with the CONFIGURED custom credential'
 } else {
-    Bad 'the runspace resolver does not try the custom credential first'
+    Bad 'the runspace resolver does not use the configured custom credential'
 }
-if ($wupdRaw -match "-ArgumentList @\(\`$ComputerName, \`$null\)") {
-    Ok 'the runspace resolver falls back to default credentials, passing $null explicitly'
+if ($rsCode -match "-ArgumentList @\(\`$ComputerName, \`$null\)") {
+    Bad 'the runspace resolver STILL probes the default identity - the Phase 1 fallback defect is back'
 } else {
-    Bad 'the runspace resolver has no explicit default-credential fallback'
+    Ok 'the runspace resolver has NO default-identity probe (no silent fallback)'
 }
-if ($wupdRaw -match "CredentialCache\[\`$ComputerName\] = \`$null") {
-    Ok "the resolver caches the default-credentials outcome as an explicit null entry (not 'absent')"
+if ($rsCode -match "CredentialCache\[\`$ComputerName\] = \`$null") {
+    Bad "the resolver still records a 'use default' cache entry, so a fallback can occur"
 } else {
-    Bad 'the resolver does not cache the default-credentials outcome'
+    Ok "the cache cannot record a 'use default' outcome (only a verified custom credential is cached)"
+}
+# The resolver must throw when the custom credential is unusable - a return would be indistinguishable
+# from "no custom credential configured".
+if ($rsCode -match 'No fallback is attempted' -and $rsCode -match 'throw') {
+    Ok 'the runspace resolver throws (with no-fallback wording) instead of returning a usable value'
+} else {
+    Bad 'the runspace resolver does not throw on an unusable custom credential'
 }
 
-# (d) the module-side resolver must agree with the runspace-side one: same order, same cache keys.
-if ($credRaw -match 'CustomCredentials\)\s*\{' -and $credRaw -match 'CredentialCache\[\$ComputerName\] = \$null') {
-    Ok 'the module-side resolver mirrors the runspace-side order (custom, then default, cached)'
+# (d) The module-side and runspace-side resolvers must agree. They are duplicated because the worker
+#     runspace cannot call module functions, so the risk is DRIFT between the two.
+#
+#     PHASE 1 makes this a real differential rather than a pair of regexes: the two implementations
+#     are driven on identical inputs (and a stubbed probe) and their verdicts compared. The structural
+#     check that used to sit here asserted the fallback ORDER ("custom, then default"), which no longer
+#     exists - and a regex pair could not detect the failure mode that actually matters, which is one
+#     copy falling back while the other does not.
+$diffSuite = Join-Path $root 'tests\Test-CredentialDeterminism.ps1'
+if (Test-Path -LiteralPath $diffSuite) {
+    $diffOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $diffSuite 2>&1
+    $diffFailures = @($diffOut | Where-Object { $_ -match '^FAIL' })
+    $agreesRunspaceSide = [bool](@($diffOut | Where-Object { $_ -match 'CORE ASSERTION \(runspace side\)' }).Count -ge 1)
+    if ($diffFailures.Count -eq 0 -and $agreesRunspaceSide) {
+        Ok 'the module-side and runspace-side resolvers agree, including no-fallback on both (differential in Test-CredentialDeterminism)'
+    } else {
+        Bad "the resolvers are not verified to agree ($($diffFailures.Count) differential failure(s))"
+    }
 } else {
-    Bad 'the module-side resolver diverges from the runspace-side resolver'
+    Bad 'Test-CredentialDeterminism.ps1 is missing - nothing verifies that the two resolvers agree'
 }
 
 # (e) the pool probe must receive the credential as a PSCredential, never a string.

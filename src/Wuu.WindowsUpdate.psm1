@@ -232,22 +232,23 @@ function New-ComputerRunspace {
         }.ToString()))
         
         # Add Get-RemoteCredentials function to runspace (with timeout protection to prevent hangs)
+        #
+        # PHASE 1: this mirrors Resolve-WuuOperationCredential in Wuu.Credentials, which the isolated
+        # runspace cannot call. It is duplicated for the same reason the SS5 deadline decision is
+        # duplicated in the cleanup loop - module functions do not resolve on a worker thread - and it
+        # is guarded the same way: tests\Test-CredentialDeterminism.ps1 drives BOTH implementations on
+        # identical inputs and asserts they agree, so the two cannot drift.
+        #
+        # THE RULE: custom credentials configured -> use them, or FAIL. No fallback to another
+        # identity. The previous version fell through to the process identity when the custom
+        # credential failed to authenticate, so an operation could run as a different account than the
+        # operator configured - silently, because it succeeded.
         $newRunspace.SessionStateProxy.SetVariable('GetRemoteCredentialsScript', [scriptblock]::Create({
             param(
                 [string]$ComputerName,
                 [string]$Operation = 'WMI access'
             )
-            
-            # Initialize CredentialCache if it doesn't exist
-            if (-not $CredentialCache) {
-                $CredentialCache = @{}
-            }
-            
-            # Check cache first
-            if ($CredentialCache.ContainsKey($ComputerName)) {
-                return $CredentialCache[$ComputerName]
-            }
-            
+
             # Inline timeout helper: runs a CIM probe on the shared worker pool with a
             # hard timeout. Was Start-Job (one child process per probe, two per computer).
             # $Cred is always a PSCredential (or $null for default credentials) - typed so a
@@ -272,44 +273,56 @@ function New-ComputerRunspace {
                     if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
                 }
             }
-            
-            # Try custom credentials first if configured
-            if ($UseCustomCredentials -and $CustomCredentials) {
+
+            # Local targets use the process identity: DCOM rejects explicit credentials on the
+            # local machine. Decided FIRST, so only ONE branch can produce a non-custom identity.
+            $isLocal = ($ComputerName -eq 'localhost' -or $ComputerName -eq $env:COMPUTERNAME)
+            $customConfigured = [bool]($UseCustomCredentials -and $CustomCredentials)
+
+            if (-not $customConfigured -or $isLocal) {
                 try {
-                    $result = & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock $testCim `
-                        -ArgumentList @($ComputerName, $CustomCredentials) -TimeoutSeconds 5 -OperationName 'Credential probe (custom)'
-                    if ($result -and $result.Success -and $result.Result -and $result.Result.Success) {
-                        if (-not $CredentialCache) { $CredentialCache = @{} }
-                        $CredentialCache[$ComputerName] = $CustomCredentials
-                        return $CustomCredentials
-                    }
-                } catch {
-                    try {
-                        & $WriteDebugLogScript -Message "Custom credentials failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
-                    } catch { }
+                    $why = if ($isLocal) { 'local machine - process identity' } else { 'custom credentials not configured' }
+                    & $WriteDebugLogScript -Message "Credential for $ComputerName : $why" -Level 'DEBUG'
+                } catch { }
+                return $null
+            }
+
+            # Custom credentials are configured: verify them, and NEVER fall back.
+            $cred = $CustomCredentials
+            $userName = ''
+            try { $userName = [string]$cred.UserName } catch { $userName = '' }
+
+            # The cache is only honoured when it holds the configured custom credential ITSELF, so a
+            # cached entry can never contradict the configured mode.
+            if ($CredentialCache -and $CredentialCache.ContainsKey($ComputerName)) {
+                $cached = $CredentialCache[$ComputerName]
+                if ($cached -and ([string]$cached.UserName) -eq $userName) {
+                    try { & $WriteDebugLogScript -Message "Custom credential for $ComputerName served from cache ('$userName')" -Level 'DEBUG' } catch { }
+                    return $cached
                 }
             }
-            
-            # Custom credentials failed or not configured, try default credentials
+
             try {
                 $result = & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock $testCim `
-                    -ArgumentList @($ComputerName, $null) -TimeoutSeconds 5 -OperationName 'Credential probe (default)'
+                    -ArgumentList @($ComputerName, $cred) -TimeoutSeconds 5 -OperationName 'Credential verification (custom)'
                 if ($result -and $result.Success -and $result.Result -and $result.Result.Success) {
                     if (-not $CredentialCache) { $CredentialCache = @{} }
-                    $CredentialCache[$ComputerName] = $null  # null means use default credentials
-                    return $null
+                    $CredentialCache[$ComputerName] = $cred
+                    return $cred
                 }
+                $detail = ''
+                try { if ($result -and $result.Result -and $result.Result.Error) { $detail = [string]$result.Result.Error } } catch { }
+                # NO FALLBACK. Report and fail loudly - an unlogged identity substitution is worse
+                # than a refused operation.
+                try { & $WriteDebugLogScript -Message "Custom credential '$userName' FAILED for $ComputerName ($detail) - operation refused; no fallback to the process identity" -Level 'ERROR' } catch { }
+                throw "Custom credentials for '$userName' cannot be used on $ComputerName ($Operation): $detail. No fallback is attempted - fix the credentials or disable custom credentials explicitly."
             } catch {
-                try {
-                    & $WriteDebugLogScript -Message "Default credentials failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
-                } catch { }
+                if ($_.Exception.Message -match 'No fallback is attempted') { throw }
+                try { & $WriteDebugLogScript -Message "Custom credential probe errored for $ComputerName : $($_.Exception.Message) - operation refused; no fallback" -Level 'ERROR' } catch { }
+                throw "Custom credential verification failed for $ComputerName ($Operation): $($_.Exception.Message). No fallback is attempted."
             }
-            
-            # Cannot prompt for credentials from a background runspace (deadlocks UI thread)
-            # Return $null to indicate auth failed; the caller will handle the error
-            return $null
         }.ToString()))
-        
+
         # Add Get-ErrorSuggestions function to runspace
         $newRunspace.SessionStateProxy.SetVariable('GetErrorSuggestionsScript', [scriptblock]::Create({
             param([string]$ErrorMessage)
@@ -425,8 +438,41 @@ function Start-UpdateCheckJob {
             return $false
         }
 
+        # PHASE 1: a runspace captures the credential configuration at CREATION and is then reused for
+        # every later operation on that computer. So after a credential change, reusing it would run
+        # the next operation under the PREVIOUS identity - silently, and deterministically wrong.
+        #
+        # The epoch makes that impossible without rebuilding a runspace on every submission: a row
+        # records the epoch its runspace was built under, and if the global epoch has moved on, the
+        # stale runspace is disposed and a fresh one is built. When credentials have not changed the
+        # epoch matches and this costs one integer comparison.
+        $credEpoch = if ($global:CredentialEpoch) { [int]$global:CredentialEpoch } else { 0 }
+        $rowEpoch = -1
+        if ($ComputerItem.PSObject.Properties['CredentialEpoch']) { $rowEpoch = [int]$ComputerItem.CredentialEpoch }
+        if ($ComputerItem.Runspace -and $rowEpoch -ne $credEpoch) {
+            $detail = if ($ComputerItem.PSObject.Properties['CredentialIdentity']) { [string]$ComputerItem.CredentialIdentity } else { 'unknown' }
+            Write-InfoLog "[$($ComputerItem.Computer)] credential configuration changed (row epoch $rowEpoch -> $credEpoch): rebuilding the runspace so this operation runs under the CURRENT identity, not the one '$detail' captured"
+            try { $ComputerItem.Runspace.Close() } catch { }
+            try { $ComputerItem.Runspace.Dispose() } catch { }
+            $ComputerItem.Runspace = $null
+        }
+
         if (-not $ComputerItem.Runspace) {
             $ComputerItem.Runspace = New-ComputerRunspace -ComputerItem $ComputerItem
+            # Stamp the epoch AND the identity the runspace was built with. The epoch is what the
+            # staleness decision above compares; the identity is for the operator - it answers "what
+            # is this runspace actually using?" without reading a global that may have moved on.
+            if ($ComputerItem.PSObject.Properties['CredentialEpoch']) { $ComputerItem.CredentialEpoch = $credEpoch }
+            try {
+                $isLocal = ($ComputerItem.Computer -eq 'localhost' -or $ComputerItem.Computer -eq $env:COMPUTERNAME)
+                $identity = Resolve-WuuOperationCredential -ComputerName $ComputerItem.Computer -Local:$isLocal
+                if ($ComputerItem.PSObject.Properties['CredentialIdentity']) {
+                    $ComputerItem.CredentialIdentity = if ($identity.Mode -eq 'Custom') { [string]$identity.Username } else { 'process identity' }
+                }
+            } catch {
+                # Recording the identity is informational; a failure here must not block submission.
+                if ($ComputerItem.PSObject.Properties['CredentialIdentity']) { $ComputerItem.CredentialIdentity = 'process identity' }
+            }
         }
 
         # Compose the chain as ONE pipeline (multiple AddScript calls run sequentially

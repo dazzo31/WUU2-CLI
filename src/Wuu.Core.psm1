@@ -174,6 +174,10 @@ $global:UseCustomCredentials = $false
 $global:CustomCredentials = $null
 $global:CredentialCache = @{}
 $global:CredentialConfig = @{ Username = ''; Domain = ''; UseCredentials = $false }
+# Phase 1: monotonic counter bumped whenever the credential configuration changes. Stamped onto a
+# row when its runspace is built, so a submission under changed credentials rebuilds the runspace
+# instead of silently reusing one that captured the previous identity.
+$global:CredentialEpoch = 0
 
 # Job throttling for scalability
 $global:MaxConcurrentJobs = 10
@@ -1054,10 +1058,20 @@ $DownloadUpdates = {
             $computer.State = 'Downloading'
         if ($stateStore) { $stateStore.Touch() }
 
-        $remoteCred = $null
-        if ($UseCustomCredentials -and $Computer.computer -ne 'localhost' -and $Computer.computer -ne $env:COMPUTERNAME) {
-            try { $remoteCred = & $GetRemoteCredentialsScript -ComputerName $Computer.computer -Operation 'Windows Update download' } catch { $remoteCred = $null }
-        }
+        # PHASE 1: the identity decision belongs to the RESOLVER, and only to the resolver. This call
+        # is unconditional on purpose:
+        #
+        #   * the resolver returns $null when custom credentials are not configured, and also when
+        #     the target is the local machine (DCOM rejects explicit credentials locally) - so the
+        #     payload does not need to know either rule;
+        #   * the previous `if ($UseCustomCredentials -and ... -and -ne 'localhost')` guard duplicated
+        #     both rules in the payload, which is two places defining the same thing and the shape
+        #     that let a credential failure be swallowed into a $null credential.
+        #
+        # No try/catch: the resolver THROWS when configured custom credentials cannot be used, and
+        # that must reach the payload's catch so the row is marked Error. A refused operation is
+        # correct; an unlogged identity substitution is not.
+        $remoteCred = & $GetRemoteCredentialsScript -ComputerName $Computer.computer -Operation 'Windows Update download'
         $onProgress = {
             param($p)
             if ($p.Phase -ne 'Downloading') { return }
@@ -1149,6 +1163,13 @@ $GetUpdates = {
         }
         
         # Define Get-RemoteCredentials function
+        #
+        # PHASE 1: this is a thin wrapper around the injected $GetRemoteCredentialsScript, which is
+        # where the identity decision lives. It exists because the payload was written against a
+        # function name and the runspace only has the scriptblock variable. It deliberately does NOT
+        # swallow the resolver's exception: the resolver throws when custom credentials are
+        # configured but unusable, and that throw must reach the payload's catch so the operation is
+        # refused rather than continued as an unintended identity.
         function Get-RemoteCredentials {
             param(
                 [string]$ComputerName,
@@ -1973,10 +1994,9 @@ $InstallUpdates = {
             $computer.InstallErrors = 0
         if ($stateStore) { $stateStore.Touch() }
 
-        $remoteCred = $null
-        if ($UseCustomCredentials -and $Computer.computer -ne 'localhost' -and $Computer.computer -ne $env:COMPUTERNAME) {
-            try { $remoteCred = & $GetRemoteCredentialsScript -ComputerName $Computer.computer -Operation 'Windows Update install' } catch { $remoteCred = $null }
-        }
+        # PHASE 1: unconditional, like the download path above - the resolver owns the mode and the
+        # local-machine rule, so the payload does not restate them.
+        $remoteCred = & $GetRemoteCredentialsScript -ComputerName $Computer.computer -Operation 'Windows Update install'
         $onProgress = {
             param($p)
             if ($p.Phase -ne 'Installing') { return }
