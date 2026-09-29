@@ -591,12 +591,20 @@ function Start-PendingUpdateCheck {
 
 function Test-PhaseCompletion {
     <#
-    .SYNOPSIS Whether every computer in a phase has settled successfully.
+    .SYNOPSIS Whether every computer in a phase has settled SUCCESSFULLY, per the failure policy.
     .DESCRIPTION
     Reads the store, not `$uiHash.Listview.Items`. The old source made `@($null)` empty, so
     `$phaseComputers.Count -eq 0` was true and this returned `$true` for EVERY phase - i.e. phase
     gating never blocked anything. That is the opposite of the intended behaviour, and it is why a
     Phase 2 job could start while Phase 1 was still running.
+
+    FAILURE POLICY (SS9). The previous behaviour was to `continue` past an errored or timed-out
+    computer, which silently made ContinueOnFailure the only policy - the unsafe one. A failed canary
+    therefore permitted the next phase with nothing in the UI or the audit trail saying why.
+
+    The decision now comes from Test-WuuPhaseFailureBlocks, driven by
+    $stateStore.Settings.PhaseFailurePolicy (default BlockOnFailure). The two failure kinds are
+    reported separately so the caller can say *which* computers stopped it.
     #>
     param([string]$Phase)
     $store = $script:WuuCtx.StateStore
@@ -606,12 +614,33 @@ function Test-PhaseCompletion {
     if ($phaseComputers.Count -eq 0) {
         return $true  # No computers in this phase, consider it complete
     }
+
+    # Policy is read from the store so the setting has ONE home. Falling back to the safe default when
+    # absent means an older/partial Settings hashtable cannot silently become ContinueOnFailure.
+    $policy = 'BlockOnFailure'
+    if ($store.Settings.ContainsKey('PhaseFailurePolicy') -and $store.Settings['PhaseFailurePolicy']) {
+        $policy = [string]$store.Settings['PhaseFailurePolicy']
+    }
     
     foreach ($computer in $phaseComputers) {
-        # Errored/timed-out computers are settled - they must not block later phases forever
-        if ($computer.UpdatesStatus -eq 'Error' -or $computer.UpdatesStatus -eq 'Timeout') {
-            continue
+        # A row that has settled in a FAILED or TIMED-OUT state is handled here and nowhere else.
+        #
+        # This early `continue` is load-bearing and its absence made the policy DEAD CONFIGURATION.
+        # Without it, a failed row fell through to the outstanding-work check below, where
+        # `UpdatesStatus -ne 'All updates installed'` is true for an errored row - so the phase could
+        # never complete even when the policy TOLERATED the failure. ContinueOnFailure and
+        # ContinueOnTimeout therefore had no effect on the only case they exist for. Found by the
+        # policy test, not by reading the code.
+        $status = [string]$computer.UpdatesStatus
+        $state = if ($computer.PSObject.Properties['State']) { [string]$computer.State } else { '' }
+        $settledFailure = ($status -in @('Error', 'Timeout')) -or ($state -in @('Error', 'Timeout'))
+        if ($settledFailure) {
+            if (Test-WuuPhaseFailureBlocks -Row $computer -Policy $policy) {
+                return $false   # policy says stop progression for this kind of failure
+            }
+            continue            # tolerated: settled, so it is not outstanding work
         }
+
         # Not yet checked (queued for the job scheduler)
         if ($computer.Pending) {
             return $false

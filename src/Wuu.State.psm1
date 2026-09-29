@@ -174,6 +174,16 @@ function New-WuuStateStore {
             AutoDownload = $false
             AutoInstall  = $false
             AutoReboot   = $false
+            # SS9 of the hardening brief. What a FAILED or TIMED-OUT computer does to phase
+            # progression. Previously there was no policy at all: Test-PhaseCompletion simply
+            # SKIPPED errored/timed-out rows, i.e. it always behaved as ContinueOnFailure - the
+            # unsafe option. A failed canary therefore silently permitted the next phase.
+            #   BlockOnFailure    (DEFAULT) failures and timeouts block the next phase
+            #   ContinueOnTimeout           timeouts are tolerated, failures block
+            #   ContinueOnFailure           any settled failure permits the next phase
+            # Default is the safe one deliberately: for patch deployment, stopping is recoverable
+            # and continuing past a failed canary is not.
+            PhaseFailurePolicy = 'BlockOnFailure'
         })
         Status   = ''
         Revision = 0
@@ -356,6 +366,60 @@ function Test-WuuComputerBusy {
     return $false
 }
 
+function Test-WuuPhaseFailureBlocks {
+    <#
+    .SYNOPSIS Whether a settled failure on this row should BLOCK the next phase (SS9).
+    .DESCRIPTION
+    Pure and side-effect free, so the policy can be tested without a store, a scheduler or a network.
+
+    A row "blocks" when it has settled in a failed state and the active policy says that must stop
+    progression. An unrecognised policy returns $true (block) on purpose: an unknown policy is a
+    configuration error, and the safe response to a configuration error in a patching tool is to stop
+    rather than to proceed past a canary that failed.
+
+    Deliberately checks BOTH signals. UpdatesStatus is what the update payloads set; State is what the
+    timeout/error paths set. Relying on one alone missed failures written the other way, which is how
+    a failed computer could look "settled but fine".
+    #>
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$Row,
+        [string]$Policy = 'BlockOnFailure'
+    )
+
+    if ($null -eq $Row) { return $false }
+
+    $status = [string]$Row.UpdatesStatus
+    $state = if ($Row.PSObject.Properties['State']) { [string]$Row.State } else { '' }
+
+    $failed = ($status -eq 'Error') -or ($state -eq 'Error')
+    $timedOut = ($status -eq 'Timeout') -or ($state -eq 'Timeout')
+    if (-not ($failed -or $timedOut)) { return $false }
+
+    switch -CaseSensitive ($Policy) {
+        'ContinueOnFailure' { return $false }
+        'ContinueOnTimeout' { return $failed }   # timeouts tolerated, failures block
+        'BlockOnFailure' { return $true }
+        default { return $true }                  # unknown policy -> stop (safe)
+    }
+}
+
+function Set-WuuPhaseFailurePolicy {
+    <#
+    .SYNOPSIS Sets the phase failure policy with validation (SS9).
+    .DESCRIPTION
+    Separate from Set-WuuSetting because that function's ValidateSet is boolean settings; keeping the
+    policy here means the three valid values live next to the decision function that consumes them.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Store,
+        [Parameter(Mandatory)]
+        [ValidateSet('BlockOnFailure', 'ContinueOnTimeout', 'ContinueOnFailure')]
+        [string]$Policy
+    )
+    $Store.Settings['PhaseFailurePolicy'] = $Policy
+    return $Policy
+}
+
 function New-WuuOperatorContext {
     <#
     .SYNOPSIS
@@ -389,5 +453,7 @@ Export-ModuleMember -Function @(
     'Set-WuuComputerRowColor'
     'Set-WuuSetting'
     'Test-WuuComputerBusy'
+    'Test-WuuPhaseFailureBlocks'
+    'Set-WuuPhaseFailurePolicy'
     'New-WuuOperatorContext'
 )

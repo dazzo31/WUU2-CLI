@@ -111,7 +111,7 @@ from evidence rather than the brief's assumptions.
 | §6 credential propagation | **NOT VERIFIED** | Needs a per-operation audit. |
 | §7 reboot detection | **OPEN** | Reboot state correctly uses `Microsoft.Update.SystemInfo.RebootRequired`/`Win32_ComputerSystem`, but the online/offline transition in `$RestartComputer` **is** ping-authoritative (`While (Test-Connection ...)`) — up to 600 s offline wait, then an online wait. |
 | §8 workflow state vs display state | **PARTIAL** | `State` has a `ValidateSet`, and `OpState` now separates operation state from display state. But `Test-PhaseCompletion` still uses `UpdatesStatus` (a display string) as its predicate. |
-| §9 phase failure policy | **OPEN** | `Test-PhaseCompletion` treats `Error`/`Timeout` as "settled → does not block". No policy switch; a failed canary silently permits the next phase. |
+| §9 phase failure policy | **DONE** | Explicit policy on the store: `PhaseFailurePolicy` = `BlockOnFailure` (DEFAULT) / `ContinueOnTimeout` / `ContinueOnFailure`, decided by the pure `Test-WuuPhaseFailureBlocks`. The old behaviour `continue`d past failed/timed-out rows, i.e. ContinueOnFailure was hard-coded and unreported. See "Phase failure policy" below. |
 | §10 exit codes | **OPEN** | Only `0` and `1` exist. Also `Invoke-WuuCommand` returns once work is *queued*, so a scripted `wuu install` can exit 0 without the install completing. |
 | §11 WhatIf | **PARTIAL** | Non-destructive and audited already; reports the planned operation but not the per-computer update breakdown. |
 | §12 inventory vs connectivity | **OPEN** | `$RemoveOfflineComputer` deletes rows on a **single** failed `Test-Connection`, and guided pre-flight's "Remove offline computers" calls it. |
@@ -179,10 +179,49 @@ are gated rather than commented.
 
 ### Recommended next order
 
-1. **§9** — phase gating is live now, so the failure policy becomes consequential (a failed canary
-   currently permits the next phase).
-2. **§7**, then **§12**, then **§10**.
-3. **§5/§6/§8/§16** as a group; §5 needs a design decision (heartbeats) rather than a patch.
+1. **§7** (reboot detection is ping-authoritative), then **§12** (a single failed ping deletes
+   inventory), then **§10** (exit codes do not distinguish queued from completed).
+2. **§5/§6/§8/§16** as a group; §5 needs a design decision (heartbeats) rather than a patch.
+3. **§11** opportunistic.
+
+---
+
+## §9 — phase failure policy (done)
+
+**The defect.** `Test-PhaseCompletion` skipped any computer whose `UpdatesStatus` was `Error` or
+`Timeout` with a bare `continue`. That hard-coded `ContinueOnFailure` as the only behaviour, and
+nothing in the UI or the audit trail said so - so a failed canary silently permitted the next phase.
+For patch deployment the safe default is the opposite: stopping is recoverable, continuing past a
+failed canary is not.
+
+**What now exists.**
+
+* `$stateStore.Settings.PhaseFailurePolicy` - `BlockOnFailure` (**default**) / `ContinueOnTimeout` /
+  `ContinueOnFailure`, set through `Set-WuuPhaseFailurePolicy` (validated).
+* `Test-WuuPhaseFailureBlocks` - pure, side-effect free, so the policy is testable without a store,
+  a scheduler or a network. An **unknown policy blocks**: a configuration error must not become
+  "proceed past a failure".
+* `Test-PhaseCompletion` consults it, and reports failures separately from outstanding work.
+* Both failure signals are honoured (`State` **and** `UpdatesStatus`). The payloads write one and the
+  timeout paths write the other, so checking a single signal lets a failed computer look "settled but
+  fine".
+
+### The second bug, found by the test rather than by reading
+
+Adding the policy was not enough. On the first run three assertions failed, exposing that the FAILED
+row fell through to the outstanding-work check, where `UpdatesStatus -ne 'All updates installed'` is
+true for an errored row - so the phase could **never** complete and `ContinueOnFailure` /
+`ContinueOnTimeout` had **no effect on the only case they exist for**. The policy was dead
+configuration until a settled failure was handled *before* that check, with its own `continue`.
+
+Validator gate (y) now enforces the ordering, because this is exactly the kind of bug that a
+settings-shaped change hides: the setting reads back correctly, the code looks like it consults it,
+and it does nothing.
+
+**Tests.** `tests\Test-PhaseFailurePolicy.ps1` - 28 assertions: the default, every policy against
+both failure kinds, both signals independently, unknown/empty policy failing safe, `$null` tolerance,
+and - through the real `Test-PhaseReady` - that a failed Phase 1 blocks Phase 2 by default and is
+*unblocked by changing only the policy*, with every row state held identical.
 
 ---
 

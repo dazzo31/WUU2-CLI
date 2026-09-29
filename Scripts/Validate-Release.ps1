@@ -809,5 +809,35 @@ foreach ($op in @('Restart', 'RemoveOffline', 'ServiceAction')) {
 }
 if (-not $failed) { Pass 'the submission point supports every op the console handlers delegate' }
 
+# (y) PHASE FAILURE POLICY (brief SS9). Three properties, because each can fail alone:
+#     1. the policy is a validated setting with a safe default;
+#     2. the phase gate consults it rather than skipping failures unconditionally (the old
+#        `continue`, which hard-coded ContinueOnFailure);
+#     3. a settled failure is evaluated BEFORE the outstanding-work check. Without that ordering the
+#        policy is DEAD CONFIGURATION: an errored row also fails `UpdatesStatus -ne 'All updates
+#        installed'`, so the phase could never complete and ContinueOnFailure/ContinueOnTimeout had no
+#        effect on the only case they exist for. This ordering bug was found by the policy test.
+$stateRaw2 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+if ($stateRaw2 -notmatch 'function Test-WuuPhaseFailureBlocks') {
+    Fail 'Test-WuuPhaseFailureBlocks is not defined (SS9 has no decision function)'
+} elseif ($stateRaw2 -notmatch "'Test-WuuPhaseFailureBlocks'") {
+    Fail 'Test-WuuPhaseFailureBlocks is not exported - the phase gate could not resolve it'
+} elseif ($stateRaw2 -notmatch "PhaseFailurePolicy\s*=\s*'BlockOnFailure'") {
+    Fail 'the phase failure policy has no safe default of BlockOnFailure'
+} else { Pass 'phase failure policy exists, is exported, and defaults to BlockOnFailure (SS9)' }
+
+$phaseBody = Get-WuuFunctionBody $wupdRaw 'Test-PhaseCompletion'
+if (-not $phaseBody) { Fail 'could not locate Test-PhaseCompletion' }
+else {
+    if ($phaseBody -notmatch 'Test-WuuPhaseFailureBlocks') {
+        Fail 'Test-PhaseCompletion does not consult the failure policy - it would block or pass on failures unconditionally'
+    }
+    $policyAt = $phaseBody.IndexOf('Test-WuuPhaseFailureBlocks')
+    $outstandingAt = $phaseBody.IndexOf("UpdatesStatus -ne 'All updates installed'")
+    if ($policyAt -ge 0 -and $outstandingAt -ge 0 -and $policyAt -gt $outstandingAt) {
+        Fail 'the failure policy is evaluated AFTER the outstanding-work check - tolerated failures could never complete a phase (dead configuration)'
+    } else { Pass 'the phase gate evaluates the failure policy before outstanding work (policy is not dead configuration)' }
+}
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }
