@@ -1070,5 +1070,52 @@ if ($idleSitesT -gt 0 -and $clearSitesT -lt $idleSitesT) {
     Pass "the operation deadline is cleared wherever the operation lock is released ($clearSitesT/$idleSitesT) (SS5)"
 }
 
+# (ac) WORKFLOW STATE IS NOT A DISPLAY STRING (brief SS8). Test-PhaseCompletion decided "is this row
+#      settled?" from `UpdatesStatus -ne 'All updates installed'` - a DISPLAY string written from eight
+#      sites with five different values. Two consequences, both real:
+#
+#        * re-wording a status message was a silent change to phase gating;
+#        * 'Unknown' (set for a row LOADED FROM CONFIG in command mode, i.e. nothing has been checked
+#          and there is nothing to report) was permanently "outstanding", so that row's phase could
+#          never complete.
+#
+#      The check strips COMMENT LINES from the RAW text rather than using Get-WuuCodeWithoutComments.
+#      Two reasons, both learned the hard way here: that tokenizer-based helper joins every token with
+#      a space and DISCARDS newlines (so Get-WuuFunctionBody, which slices to the next "\nfunction ",
+#      returned the whole file) and drops '$' (so a '\$state -in' pattern could never match). Both
+#      produced false failures on correct code. Raw-minus-comment-lines keeps '$' and newlines.
+$wupdRawC = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+$wupdBodyC = Get-WuuFunctionBody $wupdRawC 'Test-PhaseCompletion'
+$wupdNoComments = (($wupdBodyC -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+if (-not $wupdNoComments) {
+    Fail 'could not locate Test-PhaseCompletion'
+} else {
+    if ($wupdNoComments -match 'UpdatesStatus') {
+        Fail 'the phase gate still reads UpdatesStatus - a display string is driving workflow gating (SS8)'
+    }
+    if ($wupdNoComments -notmatch 'CheckConcluded') {
+        Fail 'the phase gate does not consult CheckConcluded - it has no workflow-state predicate (SS8)'
+    }
+    if ($wupdNoComments -notmatch '\$state -in') {
+        Fail 'the phase gate does not distinguish mid-operation workflow states'
+    }
+    if (-not $failed) { Pass 'the phase gate decides from workflow state, not from a display string (SS8)' }
+}
+
+# The field must exist on the row, and must be THREE-state: $null has to stay distinguishable from
+# $false, or "never checked" would be read as "checked and clean".
+$stateRawW = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+if ($stateRawW -notmatch 'CheckConcluded\s*=\s*\$null') {
+    Fail 'CheckConcluded is not initialised to $null - "not established" must differ from "concluded clean" (SS8)'
+} elseif (-not $failed) { Pass 'CheckConcluded is three-state ($null = not established) (SS8)' }
+
+# The payload must SET it at every conclusion of a check, or the predicate never becomes non-null and
+# the field is dead in the other direction.
+$coreRawW = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+$ccSets = ([regex]::Matches($coreRawW, "CheckConcluded'\]\)\s*\{\s*\`$\w+\.CheckConcluded\s*=\s*\`$(true|false)")).Count
+if ($ccSets -lt 3) {
+    Fail "only $ccSets CheckConcluded assignment(s) in the check payload - an outcome (updates available / reboot required / clean) would never be recorded (SS8)"
+} elseif (-not $failed) { Pass "the check payload records CheckConcluded for all three outcomes ($ccSets sites) (SS8)" }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

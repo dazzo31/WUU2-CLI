@@ -39,7 +39,11 @@ else { Pass 'row created with full property contract' }
 # Property contract: every documented property must exist (rows throw on assigning undefined props)
 $required = 'State','StateTimestamp','StateSource','Computer','Phase','Available','Downloaded',
             'InstallErrors','Status','RebootRequired','UpdatesStatus','Runspace','Pending','PendingOp',
-            'TimeoutExpiresAt','TimeoutSource','RetryCount','RetryAt','Color','Revision'
+            'TimeoutExpiresAt','TimeoutSource','RetryCount','RetryAt','Color','Revision',
+            # SS5/SS8 additions: the per-op deadline (read by the cleanup loop), the op name that makes
+            # a per-op budget possible, the liveness heartbeat, and the workflow-state predicate.
+            'OpState','OpStartedAt','OpName','LastHeartbeatAt','Heartbeats','CheckConcluded',
+            'ConnectivityFailures','LastConnectivityError'
 $missing = @()
 foreach ($p in $required) { if (-not $row.PSObject.Properties[$p]) { $missing += $p } }
 if ($missing.Count) { Fail ("row missing properties: " + ($missing -join ', ')) } else { Pass "row has all $($required.Count) contract properties" }

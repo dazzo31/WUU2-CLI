@@ -150,7 +150,12 @@ Assert-Equal (Test-PhaseCompletion -Phase 'Phase 1') $false 'a phase with a queu
 $busy.Pending = $false; $busy.Available = 3
 Assert-Equal (Test-PhaseCompletion -Phase 'Phase 1') $false 'a phase with updates still outstanding is not complete'
 
-$busy.Available = 0; $busy.Downloaded = 0; $busy.UpdatesStatus = 'All updates installed'; $busy.RebootRequired = $false
+$busy.Available = 0; $busy.Downloaded = 0; $busy.RebootRequired = $false
+# SS8: the DISPLAY string is no longer the predicate. This assertion used to flip the row to complete
+# by setting UpdatesStatus alone - i.e. it encoded the very defect SS8 removes, so it kept passing
+# while the gate read a status message. A row settles as "checked, nothing outstanding" via the
+# WORKFLOW fields; UpdatesStatus is still set because production sets both together.
+$busy.State = 'Complete'; $busy.CheckConcluded = $false; $busy.UpdatesStatus = 'All updates installed'
 Assert-Equal (Test-PhaseCompletion -Phase 'Phase 1') $true 'a phase whose computers all settled successfully IS complete'
 
 Assert-Equal (Test-PhaseCompletion -Phase 'Phase 4') $true 'an empty phase is complete (does not block)'

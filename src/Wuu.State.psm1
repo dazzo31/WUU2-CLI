@@ -141,7 +141,24 @@ function New-WuuComputerRow {
         Heartbeats      = 0
         RetryCount      = 0
         RetryAt         = $null
+        # Presentation colour name. This is what Format-WuuTable maps to a console colour, and what
+        # makes timeout distinguishable from a terminal error.
         Color           = 'Default'
+        # SS8: whether the last CHECK reached a conclusion, as a BOOLEAN rather than a display string.
+        #
+        # WHY THIS EXISTS. Test-PhaseCompletion decided "has this row settled?" from
+        # `UpdatesStatus -ne 'All updates installed'`. UpdatesStatus is a DISPLAY string, written from
+        # at least eight sites with five different values, and one of them ('Unknown') is set in a
+        # path where a check has NOTHING TO REPORT - so an uncheckable row looked like outstanding
+        # work forever and blocked its phase indefinitely. Every future wording change to a status
+        # message was also a silent change to phase gating.
+        #
+        # Three states, deliberately: $null = not established (a row loaded from config, or one that
+        # has never been checked); $false = a check ran and found no updates (but see RebootRequired);
+        # $true = a check ran and there IS work outstanding. Using $false for "not established" would
+        # erase the difference between "checked and clean" and "never checked", which is the same
+        # class of ambiguity this whole pass exists to remove.
+        CheckConcluded  = $null
         Revision        = 0
     }
 }

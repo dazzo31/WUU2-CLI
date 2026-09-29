@@ -643,14 +643,19 @@ function Test-PhaseCompletion {
         # A row that has settled in a FAILED or TIMED-OUT state is handled here and nowhere else.
         #
         # This early `continue` is load-bearing and its absence made the policy DEAD CONFIGURATION.
-        # Without it, a failed row fell through to the outstanding-work check below, where
-        # `UpdatesStatus -ne 'All updates installed'` is true for an errored row - so the phase could
-        # never complete even when the policy TOLERATED the failure. ContinueOnFailure and
+        # Without it, a failed row fell through to the outstanding-work check below, where the old
+        # `UpdatesStatus -ne 'All updates installed'` test was true for an errored row - so the phase
+        # could never complete even when the policy TOLERATED the failure. ContinueOnFailure and
         # ContinueOnTimeout therefore had no effect on the only case they exist for. Found by the
         # policy test, not by reading the code.
-        $status = [string]$computer.UpdatesStatus
+        #
+        # SS8: decided from STATE only. This used to also test `$status -in @('Error','Timeout')`, i.e.
+        # the display string - and every production site that sets UpdatesStatus='Error' or 'Timeout'
+        # sets the matching State on the adjacent line (State is set at all 11 UpdatesStatus sites), so
+        # the extra test could only ADD disagreement, never catch a case State alone missed. Removing
+        # it makes this predicate depend on one field, which is the point of SS8.
         $state = if ($computer.PSObject.Properties['State']) { [string]$computer.State } else { '' }
-        $settledFailure = ($status -in @('Error', 'Timeout')) -or ($state -in @('Error', 'Timeout'))
+        $settledFailure = ($state -in @('Error', 'Timeout'))
         if ($settledFailure) {
             if (Test-WuuPhaseFailureBlocks -Row $computer -Policy $policy) {
                 return $false   # policy says stop progression for this kind of failure
@@ -662,8 +667,45 @@ function Test-PhaseCompletion {
         if ($computer.Pending) {
             return $false
         }
-        if ($computer.Available -gt 0 -or $computer.Downloaded -gt 0 -or $computer.RebootRequired -or $computer.UpdatesStatus -ne 'All updates installed') {
+
+        # --- SS8: the WORK is decided from workflow state, the STRING only decides the wording ---
+        #
+        # The old test was `UpdatesStatus -ne 'All updates installed'`, i.e. a DISPLAY string used as
+        # the workflow predicate. That string is written from eight sites with five different values,
+        # so it can disagree with the row's actual work - and then it decides phase gating. The
+        # production-reachable case: a row with Available=3 whose UpdatesStatus still reads
+        # 'All updates installed' (stale wording, e.g. after an update appeared) was considered
+        # SETTLED, and its phase advanced with updates outstanding. Verified by test.
+        #
+        # CheckConcluded is a three-state boolean ($null = not established, $false = concluded clean,
+        # $true = concluded with work outstanding). $null is NOT "clean".
+        $concluded = $null
+        if ($computer.PSObject.Properties['CheckConcluded']) { $concluded = $computer.CheckConcluded }
+        if ($null -eq $concluded) {
+            # NOT ESTABLISHED. Advance ONLY if the row is visibly settled: nothing to download, nothing
+            # waiting on a restart, and not mid-operation.
+            #
+            # A row loaded from config is exactly this case: New-WuuComputerRow gives it State='Queued'
+            # and Wuu.Core sets UpdatesStatus='Unknown' with a "run wuu check to refresh" message. It
+            # therefore does NOT settle here, and that is deliberate - a phase must not pass on
+            # machines nobody has checked. (The previous display-string predicate also blocked it, but
+            # for the wrong reason and unknowably: the same string would block a row forever after any
+            # wording change.) It is logged either way so a skipped row is visible, not silent.
+            if ($computer.Available -gt 0 -or $computer.Downloaded -gt 0 -or $computer.RebootRequired) {
+                return $false
+            }
+            if ($state -in @('Queued', 'Checking', 'Searching', 'Downloading', 'Installing', 'Rebooting', 'Verifying', 'Unknown')) {
+                return $false   # not settled: never checked, or the workflow is mid-operation
+            }
+            if ($state -in @('Complete', '')) {
+                Write-InfoLog "Phase gate: '$($computer.Computer)' has no recorded check result in $Phase - treating it as settled (no work outstanding)"
+                continue
+            }
+            # Any other workflow state is unresolved: refuse rather than guess.
             return $false
+        }
+        if ($concluded) {
+            return $false   # a check concluded that there IS work outstanding
         }
     }
     

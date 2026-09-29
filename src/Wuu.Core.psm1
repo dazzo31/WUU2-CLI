@@ -1786,16 +1786,25 @@ $GetUpdates = {
                     $computer.UpdatesStatus = 'Updates required'
                     $computer.Status = "$($adjustedAvailableCount) update(s) found. Right-click > Download Updates."
                     $computer.State = 'UpdatesFound'
+                    # SS8: the check CONCLUDED. Work is outstanding (updates are available), which is
+                    # what the phase gate needs to know - not the wording of UpdatesStatus.
+                    if ($computer.PSObject.Properties['CheckConcluded']) { $computer.CheckConcluded = $true }
                 } else {
                     # Check if reboot is required based on our simplified logic
                     if ($rebootRequired) {
                         $computer.UpdatesStatus = 'Reboot required'
                         $computer.Status = 'Up-to-date. Reboot required to complete previous installations.'
                         $computer.State = 'RebootRequired'
+                        # A required reboot is outstanding WORK, not "nothing to do": the phase cannot
+                        # be complete while a machine is waiting to restart.
+                        if ($computer.PSObject.Properties['CheckConcluded']) { $computer.CheckConcluded = $true }
                     } else {
                         $computer.UpdatesStatus = 'All updates installed'
                         $computer.Status = 'Up-to-date. No updates available.'
                         $computer.State = 'Complete'
+                        # Concluded with nothing outstanding. This is the ONLY row state in which the
+                        # phase gate may treat the row as settled-and-clean.
+                        if ($computer.PSObject.Properties['CheckConcluded']) { $computer.CheckConcluded = $false }
                     }
                 }
                 

@@ -110,7 +110,7 @@ from evidence rather than the brief's assumptions.
 | §5 operation-specific timeouts | **DONE** | See "§5 — operation-specific timeouts" below. A per-op budget table replaces the flat 10-minute stop; the deadline is recorded at submission and read by the cleanup loop, with a heartbeat separating *slow* from *stuck*. `TimeoutExpiresAt`/`TimeoutSource` were dead fields (written, never read) and are now the read side of the decision. |
 | §6 credential propagation | **NOT VERIFIED** | Needs a per-operation audit. |
 | §7 reboot detection | **DONE** | The reboot wait was `While(Test-Connection ...)` - see below. Reboot STATE was already read correctly (`Microsoft.Update.SystemInfo.RebootRequired`); it was the online/offline TRANSITION that was ICMP-driven. |
-| §8 workflow state vs display state | **PARTIAL** | `State` has a `ValidateSet`, and `OpState` now separates operation state from display state. But `Test-PhaseCompletion` still uses `UpdatesStatus` (a display string) as its predicate. |
+| §8 workflow state vs display state | **DONE** | See "§8 — workflow state vs display state" below. The phase gate no longer decides from `UpdatesStatus` (a display string); it reads a three-state `CheckConcluded` plus the workflow `State`. The display-string read in the settled-failure test was also removed — every site that sets `UpdatesStatus='Error'/'Timeout'` sets the matching `State` on the adjacent line, so it could only add disagreement. |
 | §9 phase failure policy | **DONE** | Explicit policy on the store: `PhaseFailurePolicy` = `BlockOnFailure` (DEFAULT) / `ContinueOnTimeout` / `ContinueOnFailure`, decided by the pure `Test-WuuPhaseFailureBlocks`. The old behaviour `continue`d past failed/timed-out rows, i.e. ContinueOnFailure was hard-coded and unreported. See "Phase failure policy" below. |
 | §10 exit codes | **DONE** | Eight documented codes; `-Async` distinguishes *accepted* from *completed*, so a command that returns with work outstanding exits 3 instead of 0. A dead `$script:CommandExitCode` write in the wrong module scope (which made `audit verify` exit 0 on a **broken chain**) was removed. See "§10 — exit codes" below. |
 | §11 WhatIf | **PARTIAL** | Non-destructive and audited already; reports the planned operation but not the per-computer update breakdown. |
@@ -547,3 +547,70 @@ every op. Both facts are recorded in the code at the injection site.
   The harness now cuts at the `} else {` that opens the timeout action, asserts the snippet contains
   the deadline computation, uses real time with ≥5 minutes of margin, and says in a comment why a fake
   clock is impossible.
+
+---
+
+## §8 — workflow state vs display state (done)
+
+### The defect
+
+`Test-PhaseCompletion` decided "has this row settled?" from
+`UpdatesStatus -ne 'All updates installed'` — a **display string**, written from eight sites with five
+different values. Two consequences:
+
+* re-wording a status message was a silent change to **phase gating**;
+* the string can disagree with the row's actual work, and then it decides whether a phase advances.
+
+The production-reachable failure: a row with `Available = 3` whose `UpdatesStatus` still reads
+`All updates installed` (stale wording) was considered **settled**, so its phase advanced with updates
+outstanding. That case is now a named test.
+
+### What replaced it
+
+The row gained `CheckConcluded`, a **three-state** boolean:
+
+| Value | Meaning |
+| --- | --- |
+| `$null` | **not established** — never checked (a row loaded from config gets `State='Queued'` + `UpdatesStatus='Unknown'` with a "run wuu check" message) |
+| `$false` | a check ran and concluded with nothing outstanding |
+| `$true` | a check ran and there **is** work outstanding (updates available, or a reboot pending) |
+
+`$null` is deliberately **not** "clean": a phase must not pass on machines nobody has checked — that
+would be advancing the workflow on ignorance, and it is the same class of ambiguity this pass exists to
+remove. The gate therefore requires the row to be *visibly* settled (`State` not mid-operation, no
+counts, no reboot) before `$null` advances, and logs when it does so a skipped row is visible rather
+than silent.
+
+While in the file, the settled-failure test was also reduced to `State` alone. It previously read the
+display sentinels too (`$status -in @('Error','Timeout')`) — and every site that sets
+`UpdatesStatus='Error'/'Timeout'` sets the matching `State` on the adjacent line, so the extra test
+could only **add** a way to disagree, never catch a case `State` missed.
+
+### A claim I had to retract mid-change
+
+I initially wrote, in both the code and the test, that the old predicate made a config-loaded row
+"outstanding **forever**, so its phase could never complete". Checking the row constructor showed a
+fresh row is `State = 'Queued'`, **not** `'Unknown'` — so under the old predicate that row was
+*blocked* (not falsely completed) and would unblock once it was checked. The comment now describes the
+real defect (the stale-wording case, which is production-reachable and is tested), and the test asserts
+what the code actually does rather than what I had assumed. The lesson is the same one the brief opens
+with: verify from the code, not from the comment — including my own.
+
+### Verification
+
+* `tests\Test-PhaseWorkflowState.ps1` — 17 assertions driving the **real** `Test-PhaseCompletion`
+  through a real store. Covers: the stale-wording defect; re-wording the status does not change the
+  verdict; concluded-clean settles; updates-available, reboot-required, installing and Pending all
+  block; `$null` is not read as clean; the SS9 policy ordering is preserved; and the payload records
+  all three outcomes. It invokes the gate by publishing `$script:WuuCtx` **inside the module's own
+  scope** (`& $mod { ... }`), since `Import-Module -Global` does not populate a module's `$script:`
+  scope.
+* Gate **(ac)** asserts the same, against comment-stripped raw text. It uses **line-based** stripping
+  rather than `Get-WuuCodeWithoutComments`, which joins tokens with spaces, **discards newlines** (so
+  `Get-WuuFunctionBody` sliced the whole file) and drops `$` (so `\$state -in` could never match) —
+  three false failures from one helper. That helper is still correct for its own callers; this gate
+  just cannot use it.
+* `tests\Test-PhaseFailurePolicy.ps1` **had to change**: one assertion flipped a row to complete by
+  setting `UpdatesStatus` alone — it encoded the very defect SS8 removes. It now sets the workflow
+  fields, and a comment says why.
+* Full suite: **23 pass, 1 skip (elevation-gated), 0 fail.**
