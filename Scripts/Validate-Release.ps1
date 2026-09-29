@@ -50,15 +50,34 @@ function Get-WuuCodeWithoutComments {
 }
 
 $wpfPattern = 'XamlReader|PresentationFramework|PresentationCore|WindowsBase|ItemContainerGenerator|clientObservable|Out-GridView'
+# The GUI-only namespace patterns. These were MISSING from the list above, which let a genuine,
+# reachable defect through this very gate: the AD connectivity test ended in a
+# [System.Windows.MessageBox]::Show call, so it threw "Unable to find type" on its last line -
+# precisely when an operator asks for it, since it is only offered after AD access has failed.
+#
+# WHY THE FIRST PATTERN LIST COULD NOT CATCH IT: it matches assembly and type NAMES the GUI used
+# for rendering (PresentationFramework, XamlReader, ...). It does not match the fully-qualified
+# SYSTEM namespace forms - System.Windows.MessageBox, System.Windows.Forms.*,
+# Microsoft.VisualBasic.Interaction - which is how the residual calls are written. So the gate
+# was watching for the framework rather than for the dialogs.
+#
+# Checked against COMMENT-STRIPPED text, like $wpfPattern above. This is load-bearing: the modules
+# now carry explanatory comments that name every one of these patterns ("This was a WPF
+# MessageBox..."), so matching RAW text here flags the very explanations of the fix - the same
+# false-positive class the headless test and the audit checks both hit. (Note the audit checks go
+# the other way and read raw text, because there the thing being searched for is NOT quoted in a
+# neighbouring comment. Match the representation to the text, never to habit.)
+$guiOnlyPattern = '\[System\.Windows\.MessageBox\]|\[System\.Windows\.Forms\.|\[Microsoft\.VisualBasic\.|Microsoft\.Win32\.OpenFileDialog'
 $wpfHits = New-Object System.Collections.ArrayList
 foreach ($f in $files) {
     # Skip this validator itself: it necessarily contains the very patterns it searches for.
     if ($f.Name -eq 'Validate-Release.ps1') { continue }
     $code = Get-WuuCodeWithoutComments -Path $f.FullName
     if ($code -match $wpfPattern) { [void]$wpfHits.Add($f.Name) }
+    elseif ($code -match $guiOnlyPattern) { [void]$wpfHits.Add("$($f.Name) (GUI-only type call)") }
 }
 if ($wpfHits.Count) { Fail ('WPF/XAML/ui reference in shipped code: ' + (($wpfHits | Select-Object -Unique) -join ', ')) }
-else { Pass 'no WPF/XAML/ui references in shipped code' }
+else { Pass 'no WPF/XAML/ui references in shipped code (incl. GUI-only System.Windows.* / VisualBasic form types)' }
 
 # --- 3 & 4. Modules import, and importing them loads no WPF ------------------------------
 $wpfNames = @('PresentationFramework', 'PresentationCore', 'WindowsBase')
@@ -541,6 +560,85 @@ foreach ($line in ($navRaw -split "`n")) {
 if ($unwrapped.Count -gt 0) {
     Fail "collection call site(s) not wrapped in @() - .Count would throw for a single result: $($unwrapped -join ' | ')"
 } else { Pass 'collection call sites wrap results in @() (single-element safe)' }
+
+# --- 13. Pre-flight, confirmation and audit-target invariants (spec 7 / 12 / 15) ------------
+#     The same P0-encoding idea as section 12: these are the properties a future edit is most
+#     likely to undo without noticing, because each one still LOOKS fine when it is wrong.
+
+# (j) Spec 12: a mutating operation must not run without an explicit reason. The confirmation gate
+#     is the guided UI's choke point, so it - not the screen that calls it - must refuse a blank
+#     reason. Putting the check only in the screen leaves every other caller unauditable.
+$confirmCode = Get-WuuCodeWithoutComments -Path (Join-Path $root 'src\Wuu.Navigate.psm1')
+if ($confirmCode -notmatch "A change reason is required") {
+    Fail 'the confirmation gate does not refuse a blank change reason (spec 12)'
+} else { Pass 'the confirmation gate refuses a blank change reason (spec 12)' }
+
+# (k) A refusal is an auditable event (ISO 27001 A.8.15). The confirmation gate must record it
+#     itself rather than delegating to the caller: a caller that forgets produces an unrecorded
+#     refusal, which is the exact gap the control exists to close.
+if ($confirmCode -notmatch 'DenialHook') {
+    Fail 'the confirmation gate never records a refusal as a denial (A.8.15)'
+} else { Pass 'the confirmation gate records refusals as denials (A.8.15)' }
+
+# (l) Spec 15: retry-failed must narrow to the failures. If the narrowed list does not reach the
+#     row selector, the retry silently becomes an all-computers operation - the worst possible
+#     outcome for a failed patch run, and invisible until someone reads the audit trail.
+$consoleCode2 = Get-WuuCodeWithoutComments -Path (Join-Path $root 'src\Wuu.Console.psm1')
+if ($consoleCode2 -notmatch 'WuuGuidedTargets') {
+    Fail 'Read-WuuSelection honours no guided target override - retry-failed would re-target everything (spec 15)'
+} else { Pass 'Read-WuuSelection honours the guided target override (retry-failed is safe)' }
+
+# ...and that override must be an EXPLICIT $null test, never a truthiness test. An empty guided
+# list means "target nothing"; `if ($guidedTargets)` would treat it as absent and fall through to
+# prompting for a selection the operator already authorised.
+#
+# Matched against RAW text, not the comment-stripped text: the tokenizer DROPS the '$', so a
+# pattern containing a variable reference cannot match there. This is the same representation
+# trap the audit checks (g)-(i) document - verified by observing the failure rather than
+# assumed, and the reason those checks read $auditRaw instead of $auditCode.
+$consoleRaw2 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Console.psm1') -Raw
+if ($consoleRaw2 -notmatch '\$null\s+-ne\s+\$global:WuuGuidedTargets') {
+    Fail 'the guided target override is not tested for $null - an empty list would fall through to prompting'
+} else { Pass 'the guided target override distinguishes "none" from "not decided"' }
+
+# (m) Spec 7: an offline computer must not be probed. Probing a host that is not there is a
+#     guaranteed bounded-timeout per probe, so pre-flight cost would scale with the number of
+#     machines that are down - the opposite of what an operator needs at 02:00.
+$sessCode2 = Get-WuuCodeWithoutComments -Path (Join-Path $root 'src\Wuu.Session.psm1')
+if ($sessCode2 -notmatch 'skipped \(offline\)') {
+    Fail 'pre-flight does not skip credential/service probes for offline computers (spec 7)'
+} else { Pass 'pre-flight skips expensive probes for offline computers (spec 7)' }
+
+# (n) "Cannot tell" must never be reported as "offline". Deriving the offline count as
+#     (total - reachable) unconditionally told the operator every machine was down whenever no
+#     ping probe was supplied - a false alarm, which is how a report trains people to ignore it.
+#     Raw text again, for the '$' reason above.
+$sessRaw2 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Session.psm1') -Raw
+if ($sessRaw2 -notmatch 'if \(\$PingProbe\)') {
+    Fail 'pre-flight derives the offline count without checking a ping probe ran - "unknown" would report as "offline"'
+} else { Pass 'pre-flight only reports offline when reachability was actually probed' }
+
+# (o) Spec 12: the plan shown before a mutating operation must state the lifecycle explicitly
+#     (spec 10). 'deploy' collapsing to a single step would mean the operator authorises an
+#     install they were never told would also reboot machines.
+if ($navRaw -notmatch "'Restart where required'") {
+    Fail "the deployment workflow does not include an explicit restart step (spec 11)"
+} else { Pass 'the deployment lifecycle is stated explicitly, including the reboot step (spec 11)' }
+
+# (p) The guided audit record must carry the confirmed TARGETS. Without them an interactive change
+#     is strictly less informative than a scripted one (`wuu install -Computer SRV01`), so the
+#     trail could not answer "which hosts did this person change?" for human-authorised changes.
+$coreRaw3 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+if ($coreRaw3 -notmatch 'Invoke-WuuAuditedAction -Session \$auditSession -Action \$ActionName -Reason \$Reason -Body \$Body -Targets \$Targets') {
+    Fail 'the interactive audit hook does not forward targets - guided audit records would be targetless'
+} else { Pass 'the interactive audit hook forwards the confirmed targets' }
+
+# (q) A mutating guided action must CONSUME its reason. Leaving it on the context means the second
+#     step of a deployment silently reuses the first step's reason, so the audit trail would show
+#     the same justification for actions the operator justified separately.
+if ($navRaw -notmatch "NotePropertyName Reason -NotePropertyValue ''") {
+    Fail 'the guided workflow never clears the change reason - later mutations would inherit it'
+} else { Pass 'the guided workflow consumes each change reason (no reason is silently reused)' }
 
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

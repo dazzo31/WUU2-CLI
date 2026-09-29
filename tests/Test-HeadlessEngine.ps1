@@ -27,8 +27,14 @@ $fail = $false
 function Fail($m) { Write-Host "FAIL: $m" -ForegroundColor Red; $script:fail = $true }
 function Pass($m) { Write-Host "PASS: $m" -ForegroundColor Green }
 function Get-WpfLoaded {
+    # System.Windows.Forms is included here because the CLI startup used to Add-Type it (and
+    # Microsoft.VisualBasic) with no live caller - a hard startup failure waiting for a host that
+    # lacks Forms. PresentationFramework was the only one asserted, so removing the two unused
+    # entries was unverifiable by test. Microsoft.VisualBasic cannot be checked the same way (it is
+    # a base-class-library assembly that may legitimately be loaded), so the ADD-TYPE list is what
+    # guards it, via the validator.
     @([AppDomain]::CurrentDomain.GetAssemblies() |
-        Where-Object { $_.GetName().Name -in @('PresentationFramework', 'PresentationCore', 'WindowsBase') } |
+        Where-Object { $_.GetName().Name -in @('PresentationFramework', 'PresentationCore', 'WindowsBase', 'System.Windows.Forms') } |
         ForEach-Object { $_.GetName().Name })
 }
 

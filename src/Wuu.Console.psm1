@@ -322,6 +322,10 @@ function Initialize-WuuInputMode {
     $script:WuuNonInteractive = [bool]$NonInteractive
     $script:WuuAnswers = New-Object System.Collections.Queue
     $script:WuuAnswersUsed = 0
+    # Clearing the guided target override here matters for scripted runs: a target list left set by
+    # a previous scenario would silently narrow the NEXT operation's selection, which is the kind
+    # of cross-test leak that makes a failing assertion look like a product bug.
+    $global:WuuGuidedTargets = $null
     if ($Answers) { foreach ($a in $Answers) { $script:WuuAnswers.Enqueue($a) } }
 }
 
@@ -380,11 +384,37 @@ function Read-WuuAnswer {
 
 function Read-WuuSelection {
 <# Resolves which computers an action applies to. Accepts '*' for all, a comma list of
-   names, or a phase filter - the console equivalent of the GUI's row selection. #>
+   names, or a phase filter - the console equivalent of the GUI's row selection.
+
+   GUIDED-TARGET OVERRIDE. The guided workflow confirms an explicit target list and must be able
+   to answer the selection question itself, so an operation can be narrowed to the computers that
+   FAILED (spec 15's "retry failed") rather than re-prompting for a set the operator just
+   authorised. It therefore sets $global:WuuGuidedTargets and this function honours it.
+
+   WHY A GLOBAL RATHER THAN A PARAMETER. The selection is consumed inside the $consoleActions
+   handlers in Wuu.Core, which have no parameters and are shared verbatim with the command surface
+   (spec 23/24). Threading a new argument through every handler would either fork those handlers or
+   change the shape of the object the verb table dispatches into. The global is module-visible
+   because every module is imported with -Global, and it is cleared by its setter after a single
+   use, so it cannot leak into an unrelated operation.
+
+   An EMPTY list is respected as "the caller already decided nothing is targeted" - it must not
+   fall through to prompting, or a retry with no failures would silently become an all-computers
+   operation. Only $null means "no guided decision; ask as usual". #>
     param(
         [Parameter(Mandatory)][hashtable]$Store,
         [string]$Prompt = 'Computer(s) - name(s), "all", or Enter to cancel'
     )
+    if ($null -ne $global:WuuGuidedTargets) {
+        $guided = @($global:WuuGuidedTargets)
+        $global:WuuGuidedTargets = $null
+        $rows = New-Object System.Collections.ArrayList
+        foreach ($n in $guided) {
+            $row = Get-WuuComputerRow -Store $Store -Computer $n
+            if ($row) { [void]$rows.Add($row) }
+        }
+        return $rows.ToArray()
+    }
     $all = @(Get-WuuComputerRow -Store $Store)
     if ($all.Count -eq 0) { Write-Host '  No computers in the list.' -ForegroundColor Yellow; return @() }
     $ans = Read-WuuAnswer -Prompt "  $Prompt" -Default ''

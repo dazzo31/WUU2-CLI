@@ -69,14 +69,21 @@ function Get-WuuUpdateManagementMenu {
     from separate commands." The ORDER here is the workflow:
         CHECK -> REVIEW -> DOWNLOAD -> INSTALL -> REBOOT -> VERIFY
     so it is rendered in that order rather than alphabetically.
+
+    Each entry carries a `Workflow` (the operation id) and either a Handler (a single $consoleActions
+    leaf) or a `Starts` state (an explicit multi-step sequence). Carrying the operation id as data
+    is what lets one implementation of pre-flight + confirmation + results serve every entry - see
+    Show-WuuOperationConfirmationScreen.
     #>
     @(
-        @{ Key = '1'; Label = 'Check for updates';        Handler = 'EventGetUpdates';                Mutating = $false }
-        @{ Key = '2'; Label = 'Review available updates'; Handler = 'EventShowAvailableUpdates';      Mutating = $false }
-        @{ Key = '3'; Label = 'Download updates';         Handler = 'EventDownloadUpdates';           Mutating = $true }
-        @{ Key = '4'; Label = 'Install updates';          Handler = 'EventInstallUpdates';            Mutating = $true }
-        @{ Key = '5'; Label = 'Restart computers';        Handler = 'EventRestartComputer';           Mutating = $true }
-        @{ Key = 'b'; Label = 'Back';                     Handler = '';                               Mutating = $false }
+        @{ Key = '1'; Label = 'Check for updates';        Handler = 'EventGetUpdates';           Mutating = $false; Workflow = 'check' }
+        @{ Key = '2'; Label = 'Review available updates'; Handler = 'EventShowAvailableUpdates'; Mutating = $false; Workflow = 'review' }
+        @{ Key = '3'; Label = 'Download updates';         Handler = 'EventDownloadUpdates';      Mutating = $true;  Workflow = 'download' }
+        @{ Key = '4'; Label = 'Install updates';          Handler = 'EventInstallUpdates';       Mutating = $true;  Workflow = 'install' }
+        @{ Key = '5'; Label = 'Restart computers';        Handler = 'EventRestartComputer';      Mutating = $true;  Workflow = 'restart' }
+        @{ Key = '6'; Label = 'Full deployment';          Starts = 'DEPLOYING';                  Mutating = $true;  Workflow = 'deploy' }
+        @{ Key = '7'; Label = 'Pre-flight check';         Preflight = 'check';                   Mutating = $false; Workflow = 'check' }
+        @{ Key = 'b'; Label = 'Back';                     Handler = '';                          Mutating = $false }
     )
 }
 
@@ -89,8 +96,9 @@ function Get-WuuComputerManagementMenu {
         @{ Key = '5'; Label = 'Assign phase';                  Handler = 'EventAssignPhaseInteractive';  Mutating = $false }
         @{ Key = '6'; Label = 'Show computers in a phase';     Handler = 'EventShowByPhase';             Mutating = $false }
         @{ Key = '7'; Label = 'Remove offline computers';      Handler = 'EventRemoveOfflineComputer';   Mutating = $false }
-        @{ Key = '8'; Label = 'Clear computer list';           Handler = 'ClearComputerList';            Mutating = $false }
-        @{ Key = '9'; Label = 'Export list to file';           Handler = 'EventSaveComputerList';        Mutating = $false }
+        @{ Key = '8'; Label = 'Test connectivity (pre-flight)'; Preflight = 'check';                     Mutating = $false }
+        @{ Key = '9'; Label = 'Clear computer list';           Handler = 'ClearComputerList';            Mutating = $false }
+        @{ Key = 'x'; Label = 'Export list to file';           Handler = 'EventSaveComputerList';        Mutating = $false }
         @{ Key = 'l'; Label = 'Load saved computer set';       Handler = 'EventLoadConfig';              Mutating = $false }
         @{ Key = 's'; Label = 'Save computer set';             Handler = 'EventSaveConfig';              Mutating = $false }
         @{ Key = 'b'; Label = 'Back';                          Handler = '';                             Mutating = $false }
@@ -98,9 +106,14 @@ function Get-WuuComputerManagementMenu {
 }
 
 function Get-WuuDeploymentMenu {
+    <#
+    .SYNOPSIS Deployment phases as part of deployment, not hidden configuration (spec 13).
+    #>
     @(
         @{ Key = '1'; Label = 'Show phase status';         Handler = 'EventShowByPhase';             Mutating = $false }
         @{ Key = '2'; Label = 'Assign computers to phase'; Handler = 'EventAssignPhaseInteractive';  Mutating = $false }
+        @{ Key = '3'; Label = 'Pre-flight next phase';     Preflight = 'deploy';                     Mutating = $false; Workflow = 'deploy' }
+        @{ Key = '4'; Label = 'Run full deployment';       Starts = 'DEPLOYING';                     Mutating = $true;  Workflow = 'deploy' }
         @{ Key = 'b'; Label = 'Back';                      Handler = '';                             Mutating = $false }
     )
 }
@@ -119,8 +132,9 @@ function Get-WuuDiagnosticsMenu {
 
 function Get-WuuCredentialMenu {
     @(
-        @{ Key = '1'; Label = 'Set domain credentials';    Handler = 'EventSetDomainCredentials';    Mutating = $false }
-        @{ Key = 'b'; Label = 'Back';                      Handler = '';                             Mutating = $false }
+        @{ Key = '1'; Label = 'Set domain credentials';        Handler = 'EventSetDomainCredentials';    Mutating = $false }
+        @{ Key = '2'; Label = 'Test credentials (pre-flight)'; Preflight = 'check';                      Mutating = $false }
+        @{ Key = 'b'; Label = 'Back';                          Handler = '';                             Mutating = $false }
     )
 }
 
@@ -143,6 +157,49 @@ function Get-WuuReportsMenu {
 }
 
 #endregion Navigation tree
+
+#region Workflow specs (spec 10 / 11)
+
+function Get-WuuWorkflowSpec {
+    <#
+    .SYNOPSIS The explicit step sequence for a multi-step operation (spec 10 / 11).
+    .DESCRIPTION
+    Spec 10 requires the update lifecycle be made explicit rather than inferred from separate
+    commands, and spec 11 requires full deployment to be the whole sequence:
+
+        CHECK -> DOWNLOAD -> INSTALL -> REBOOT -> RE-CHECK -> VERIFY
+
+    This table is the ONE place that sequence is written down. The renderer prints it, the executor
+    walks it, and the confirmation screen shows it - so the three can never drift apart.
+
+    Each step names the operation id it maps to, which is what makes the run loop a plain data
+    driver rather than control flow: `PreflightOp` is what pre-flight and the confirmation gate are
+    evaluated against for that step, while `Op` may be a lighter action ('restart' inside a
+    deployment is only performed where a reboot is actually pending).
+    #>
+    param([string]$Name = '')
+    switch ($Name.ToLowerInvariant()) {
+        'check-chain' {
+            @(
+                @{ Label = 'Check for updates';  Op = 'check' ; PreflightOp = 'check' ; Mutating = $false }
+                @{ Label = 'Review available';   Op = 'review'; PreflightOp = 'review'; Mutating = $false }
+            )
+        }
+        'deploy' {
+            @(
+                @{ Label = 'Check for updates';      Op = 'check'    ; PreflightOp = 'check'    ; Mutating = $false }
+                @{ Label = 'Download updates';       Op = 'download' ; PreflightOp = 'download' ; Mutating = $true }
+                @{ Label = 'Install updates';        Op = 'install'  ; PreflightOp = 'install'  ; Mutating = $true }
+                @{ Label = 'Restart where required'; Op = 'restart'  ; PreflightOp = 'restart'  ; Mutating = $true }
+                @{ Label = 'Re-check';               Op = 'check'    ; PreflightOp = 'check'    ; Mutating = $false }
+                @{ Label = 'Verify';                 Op = 'verify'   ; PreflightOp = 'review'   ; Mutating = $false }
+            )
+        }
+        default { @() }
+    }
+}
+
+#endregion Workflow specs
 
 #region Screens
 
@@ -504,8 +561,24 @@ function Show-WuuCategoryScreen {
                 Invoke-WuuAuditSubVerb -Ctx $Ctx -SubVerb $item.AuditSubVerb
                 return $State
             }
+            # Contextual pre-flight (spec 18): credentials and connectivity are reachable from the
+            # category they belong to, with a real result, rather than only after an operation fails.
+            if ($item.ContainsKey('Preflight')) {
+                $Ctx | Add-Member -NotePropertyName PreflightOperation -NotePropertyValue ([string]$item.Preflight) -Force
+                return 'PREFLIGHT'
+            }
+            # A multi-step operation (spec 10 / 11) hands off to its own state instead of
+            # dispatching one leaf here - the sequence lives in Get-WuuWorkflowSpec.
+            if ($item.ContainsKey('Starts')) {
+                $Ctx | Add-Member -NotePropertyName PendingOperation -NotePropertyValue ([string]$item.Workflow) -Force
+                $Ctx | Add-Member -NotePropertyName PreflightOperation -NotePropertyValue ([string]$item.Workflow) -Force
+                return [string]$item.Starts
+            }
             if ($item.Handler) {
-                Invoke-WuuGuidedHandler -Ctx $Ctx -Handler $item.Handler -Mutating ([bool]$item.Mutating)
+                # The operation id travels with the dispatch so the confirmation screen can state
+                # which prerequisites apply to it (spec 7 / 12).
+                $op = if ($item.ContainsKey('Workflow')) { [string]$item.Workflow } else { '' }
+                Invoke-WuuGuidedHandler -Ctx $Ctx -Handler $item.Handler -Mutating ([bool]$item.Mutating) -Operation $op
             }
             return $State
         }
@@ -515,10 +588,16 @@ function Show-WuuCategoryScreen {
 }
 
 function Invoke-WuuAuditSubVerb {
-    <# Runs `audit verify|show|export` via the same path the command surface uses. #>
+    # Runs `audit verify|show|export` via the same path the command surface uses. Export is handed
+    # the set's STORE because the operator is working in a computer set (spec 6) - the command-layer
+    # default would export the saved config file instead of the set they are looking at.
     param([Parameter(Mandatory)]$Ctx, [Parameter(Mandatory)][string]$SubVerb)
     try {
-        $null = Invoke-WuuAuditCommand -SubVerb $SubVerb
+        if ($SubVerb -eq 'export' -and $Ctx.Store) {
+            $null = Invoke-WuuAuditCommand -SubVerb $SubVerb -Store $Ctx.Store
+        } else {
+            $null = Invoke-WuuAuditCommand -SubVerb $SubVerb
+        }
     } catch {
         Write-Host ("  audit {0} failed: {1}" -f $SubVerb, $_.Exception.Message) -ForegroundColor Red
     }
@@ -542,7 +621,9 @@ function Invoke-WuuGuidedHandler {
     param(
         [Parameter(Mandatory)]$Ctx,
         [Parameter(Mandatory)][string]$Handler,
-        [bool]$Mutating = $false
+        [bool]$Mutating = $false,
+        [string]$Operation = '',
+        [AllowEmptyCollection()][string[]]$Targets = @()
     )
 
     if (-not $Ctx.Actions.ContainsKey($Handler)) {
@@ -550,25 +631,57 @@ function Invoke-WuuGuidedHandler {
         return
     }
 
+    # The selection normally lives in the store and the handler prompts for it. An explicit
+    # -Targets list is how the GUIDED WORKFLOW narrows an operation to a set it has already
+    # confirmed - most importantly the retry-failed path (spec 15), which must not re-prompt for a
+    # set the operator just authorised. $null means "no guided decision": the handler prompts.
+    # NOTE it must NOT be set to an empty array here: Read-WuuSelection treats an empty guided list
+    # as "target nothing", so defaulting it would turn every guided operation into a no-op.
+    $guidedTargetsSet = $false
+    if (@($Targets).Count -gt 0) {
+        $global:WuuGuidedTargets = @($Targets)
+        $guidedTargetsSet = $true
+    }
+
     if ($Mutating) {
-        if (-not $Ctx.AuditHook) {
+        # The reason was already collected by the confirmation screen (spec 12) when the operation
+        # was confirmed, so asking again here would be a duplicate prompt with nothing to add.
+        # It is deliberately CONSUMED (cleared) below: each mutating step of a deployment must
+        # collect its own reason rather than silently inheriting the previous step's.
+        $reason = if ($Ctx.PSObject.Properties['Reason']) { [string]$Ctx.Reason } else { '' }
+        if ([string]::IsNullOrWhiteSpace($reason) -and -not $Ctx.AuditHook) {
             Write-Host '  WARNING: auditing is not active, so this change will not be recorded.' -ForegroundColor Yellow
             & $Ctx.Actions[$Handler]
+            if ($guidedTargetsSet) { $global:WuuGuidedTargets = $null }
             return
         }
-        $reason = [string](Read-WuuAnswer -Prompt '  Reason for this change (recorded in the audit trail)' -Default '')
+        if ([string]::IsNullOrWhiteSpace($reason)) {
+            # Reached only when a mutating action is invoked WITHOUT the confirmation screen
+            # (the Advanced flat menu). Asking here keeps that path auditable.
+            $reason = [string](Read-WuuAnswer -Prompt '  Reason for this change (recorded in the audit trail)' -Default '')
+        }
         if ([string]::IsNullOrWhiteSpace($reason)) {
             Write-Host '  A reason is required for audited changes - operation cancelled.' -ForegroundColor Yellow
             if ($Ctx.DenialHook) {
                 try { & $Ctx.DenialHook $Handler 'reason not supplied (cancelled at prompt)' | Out-Null } catch { }
             }
+            if ($guidedTargetsSet) { $global:WuuGuidedTargets = $null }
             return
         }
-        & $Ctx.AuditHook $Handler $reason $Ctx.Actions[$Handler] | Out-Null
+        $Ctx | Add-Member -NotePropertyName Reason -NotePropertyValue '' -Force
+        try {
+            & $Ctx.AuditHook $Handler $reason $Ctx.Actions[$Handler] -Targets @($Targets) | Out-Null
+        } catch {
+            # Fall back to the hook's two-argument shape so a caller-supplied hook still works
+            # (e.g. in a test), rather than losing the audit record entirely.
+            & $Ctx.AuditHook $Handler $reason $Ctx.Actions[$Handler] | Out-Null
+        }
+        if ($guidedTargetsSet) { $global:WuuGuidedTargets = $null }
         return
     }
 
     & $Ctx.Actions[$Handler]
+    if ($guidedTargetsSet) { $global:WuuGuidedTargets = $null }
 }
 
 function Show-WuuAdvancedScreen {
@@ -604,6 +717,667 @@ function Show-WuuAdvancedScreen {
 
 #endregion Screens
 
+#region Pre-flight, confirmation, execution and results (spec 7 / 12 / 14 / 15)
+
+function New-WuuPreflightContext {
+    <#
+    .SYNOPSIS The LIVE probe set pre-flight uses, assembled in one place.
+    .DESCRIPTION
+    Every probe is built from primitives the engine already uses, and none of them is reimplemented:
+
+      Ping        - the same Test-Connection check $RemoveOfflineComputer performs
+      Credentials - Invoke-CimWithTimeout, the codebase's bounded DCOM probe
+      Service     - Invoke-ServiceWithTimeout -Action Check
+      OS / Reboot - Win32_OperatingSystem, and the Microsoft.Update.SystemInfo query the update
+                    engine already uses to decide whether a reboot is pending
+
+    WHY THE SCRIPTBLOCKS USE -ArgumentList RATHER THAN CLOSING OVER ANYTHING. An earlier shape
+    wrote `[scriptblock]{ param($n) ... & $probe $n ... }` to wrap each injected probe, which
+    captures the surrounding scope - and the release validator (correctly) rejects any use of the
+    injection anti-pattern in this module, because a bound scriptblock handed to another runspace
+    resolves its variables in the WRONG session and comes back empty. Calling each probe directly
+    with -ArgumentList keeps every call site free of that pattern.
+
+    Returned as data on the context rather than called in place, so a test can substitute probes
+    that answer instantly - which is the difference between asserting "offline hosts are excluded
+    from the available count" in milliseconds versus waiting on a real ping timeout per host.
+    #>
+    [pscustomobject]@{
+        Ping = { param($Name)
+            [bool](Test-Connection -Count 1 -ComputerName $Name -Quiet -ErrorAction SilentlyContinue)
+        }
+        Credentials = { param($Name)
+            $r = Invoke-CimWithTimeout -ComputerName $Name -ClassName 'Win32_ComputerSystem' `
+                -TimeoutSeconds $global:CimTimeoutSeconds -Operation 'pre-flight credential probe'
+            if ($r -and $r.Success) { 'valid' } else { 'failed' }
+        }
+        Service = { param($Name)
+            $s = Invoke-ServiceWithTimeout -ComputerName $Name -ServiceName 'wuauserv' -Action Check `
+                -TimeoutSeconds $global:ServiceTimeoutSeconds
+            if ($s -and $s.Success -and $s.Status) { [string]$s.Status } else { 'unknown' }
+        }
+        OS = { param($Name)
+            $r = Invoke-CimWithTimeout -ComputerName $Name -ClassName 'Win32_OperatingSystem' `
+                -TimeoutSeconds $global:CimTimeoutSeconds -Operation 'pre-flight OS probe'
+            if ($r -and $r.Success -and $r.Result) {
+                $os = @($r.Result)[0]
+                '{0} (build {1})' -f $os.Caption, $os.BuildNumber
+            } else { '' }
+        }
+        Reboot = { param($Name)
+            $r = Invoke-WithPoolTimeout -ScriptBlock {
+                param($c)
+                try { [bool]([activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.SystemInfo', $c))).RebootRequired }
+                catch { $false }
+            } -ArgumentList $Name -TimeoutSeconds $global:RebootProbeTimeoutSeconds -OperationName 'pre-flight reboot probe'
+            if ($r -and $r.Success) { [bool]$r.Result } else { $false }
+        }
+    }
+}
+
+function Invoke-WuuPreflightCheck {
+    <#
+    .SYNOPSIS Runs pre-flight and records the result on the context.
+    .DESCRIPTION
+    Exists so pre-flight is triggered from ONE place. The confirmation screen calls it when the
+    operator has not run it yet, and the category menus call it directly (spec 18: credentials are
+    "surfaced contextually in pre-flight ... do not make credential configuration something users
+    only find after an operation fails").
+    #>
+    param(
+        [Parameter(Mandatory)]$Ctx,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    $ctxPf = if ($Ctx.PSObject.Properties['PreflightContext']) { $Ctx.PreflightContext } else { $null }
+    if (-not $ctxPf) { $ctxPf = New-WuuPreflightContext }
+
+    Write-Host ''
+    Write-Host ("  Pre-flight: {0}" -f (Get-WuuOperationLabel -Operation $Operation)) -ForegroundColor White
+    Write-Host '  Probing reachability, credentials, Windows Update service, OS and reboot state...' -ForegroundColor DarkGray
+
+    $tick = if ($Ctx.PSObject.Properties['Tick']) { $Ctx.Tick } else { $null }
+
+    $report = Get-WuuPreflightReport -Set $Ctx.Set -Operation $Operation `
+        -PingProbe $ctxPf.Ping -CredentialProbe $ctxPf.Credentials `
+        -ServiceProbe $ctxPf.Service -OsProbe $ctxPf.OS -RebootProbe $ctxPf.Reboot `
+        -Tick $tick
+
+    $Ctx | Add-Member -NotePropertyName Preflight -NotePropertyValue $report -Force
+    $Ctx | Add-Member -NotePropertyName PreflightOperation -NotePropertyValue $Operation -Force
+    Write-InfoLog ("Pre-flight ({0}): {1} computer(s), {2} reachable, {3} available, {4} blocking, {5} warning(s)" -f `
+        $Operation, $report.Computers, $report.Reachable, $report.Available, $report.Blocking, $report.Warnings)
+    return $report
+}
+
+function Get-WuuRowOperationState {
+    <#
+    .SYNOPSIS Maps a row onto the lifecycle state the execution screen displays (spec 14).
+    .DESCRIPTION
+    Spec 14 requires the execution screen to distinguish Waiting, Checking, Downloading,
+    Installing, Rebooting, Verifying, Complete, Failed and Offline. The row's own State value
+    already IS that vocabulary (see the ValidateSet on the state setter in Wuu.Core), so this
+    translates rather than invents - and returns a display name plus the colour to use.
+    #>
+    param([Parameter(Mandatory)]$Row)
+
+    switch ([string]$Row.State) {
+        'Queued'         { @{ Name = 'Waiting';     Color = 'DarkGray' } }
+        'Connecting'     { @{ Name = 'Connecting';  Color = 'DarkGray' } }
+        'Connected'      { @{ Name = 'Connected';   Color = 'DarkGray' } }
+        'Checking'       { @{ Name = 'Checking';    Color = 'Cyan' } }
+        'Searching'      { @{ Name = 'Checking';    Color = 'Cyan' } }
+        'UpdatesFound'   { @{ Name = 'Available';   Color = 'Yellow' } }
+        'Downloading'    { @{ Name = 'Downloading'; Color = 'Cyan' } }
+        'Installing'     { @{ Name = 'Installing';  Color = 'Cyan' } }
+        'RebootRequired' { @{ Name = 'Reboot needed'; Color = 'Yellow' } }
+        'Rebooting'      { @{ Name = 'Rebooting';   Color = 'Yellow' } }
+        'Verifying'      { @{ Name = 'Verifying';   Color = 'Cyan' } }
+        'Complete'       { @{ Name = 'Complete';    Color = 'Green' } }
+        'Timeout'        { @{ Name = 'Timed out';   Color = 'Yellow' } }
+        'Error'          { @{ Name = 'Failed';      Color = 'Red' } }
+        'Offline'        { @{ Name = 'Offline';     Color = 'DarkGray' } }
+        default          { @{ Name = [string]$Row.State; Color = 'Gray' } }
+    }
+}
+
+function Wait-WuuRowsSettled {
+    <#
+    .SYNOPSIS Waits (bounded) for the targeted rows to stop running, draining the scheduler.
+    .DESCRIPTION
+    A deployment step is queued asynchronously - the action handlers return as soon as the
+    per-computer runspace is started. Without a wait, "Full deployment" would queue a download while
+    the search that discovers what to download is still running, and the download would see nothing.
+
+    Bounded on purpose: an update run can legitimately take a long time, and an unbounded wait would
+    turn an unresponsive host into a hung application. On timeout the caller is told, so the results
+    screen can say "still running" rather than claiming success.
+    #>
+    param(
+        [Parameter(Mandatory)]$Ctx,
+        [AllowEmptyCollection()][string[]]$Targets = @(),
+        [int]$TimeoutSeconds = 1800
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ($Ctx.PSObject.Properties['Tick']) { try { & $Ctx.Tick } catch { } }
+        $busy = 0
+        foreach ($r in @(Get-WuuComputerSetComputers -Set $Ctx.Set)) {
+            if (@($Targets).Count -gt 0 -and $Targets -notcontains $r.Computer) { continue }
+            if ($r.Pending) { $busy++; continue }
+            switch ([string]$r.State) {
+                'Queued'      { $busy++ }
+                'Connecting'  { $busy++ }
+                'Connected'   { $busy++ }
+                'Checking'    { $busy++ }
+                'Searching'   { $busy++ }
+                'Downloading' { $busy++ }
+                'Installing'  { $busy++ }
+                'Rebooting'   { $busy++ }
+                'Verifying'   { $busy++ }
+            }
+        }
+        if ($busy -eq 0) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+function Confirm-WuuMutation {
+    <#
+    .SYNOPSIS Builds the plan and requires explicit confirmation before a mutating operation.
+    .DESCRIPTION
+    Spec 12. Returns a decision object rather than a boolean so the caller can distinguish the
+    three outcomes that matter - "run it", "the operator said no", and "there is nothing to
+    confirm" - and act on them differently. `Proceed` is deliberately the ONLY value that permits
+    a mutation.
+
+    A blank reason is REFUSED rather than defaulted. The audit trail records the reason, and a
+    defaulted reason would make every guided change look identical in the trail; the flat menu and
+    the command surface both refuse a blank reason for the same reason.
+    #>
+    param(
+        [Parameter(Mandatory)]$Ctx,
+        [Parameter(Mandatory)][string]$Operation,
+        [AllowEmptyCollection()][string[]]$Targets = @(),
+        # -Yes is how a test (or a scripted caller) supplies the confirmation and the reason
+        # without a prompt - the same shape the command surface uses for its Answers queue.
+        [switch]$Yes,
+        [string]$Reason = ''
+    )
+
+    $plan = New-WuuOperationPlan -Set $Ctx.Set -Operation $Operation -Targets $Targets -Preflight $Ctx.Preflight
+
+    Write-WuuHeader ("CONFIRM: {0}" -f $plan.Label.ToUpperInvariant())
+    Write-Host ("  Computers:  {0} of {1}" -f $plan.AvailableCount, $plan.TargetCount) -ForegroundColor White
+    if ($plan.AvailableCount -ne $plan.TargetCount) {
+        Write-Host ("  ({0} will be skipped - see pre-flight)" -f ($plan.TargetCount - $plan.AvailableCount)) -ForegroundColor Yellow
+    }
+    Write-Host ("  Updates to download: {0}   to install: {1}" -f $plan.UpdatesToDownload, $plan.UpdatesToInstall)
+    Write-Host ("  Expected reboots:    {0}" -f $plan.ExpectedReboots)
+    Write-Host ''
+    Write-Host ("  Sequence: {0}" -f ($plan.Lifecycle -join ' -> ')) -ForegroundColor DarkCyan
+
+    if (@($plan.PerPhase).Count -gt 0) {
+        Write-Host ''
+        Write-Host '  By phase:' -ForegroundColor DarkCyan
+        foreach ($p in $plan.PerPhase) {
+            Write-Host ("    {0}: {1} computer(s)" -f $p.Phase, $p.Computers)
+        }
+    }
+
+    if (-not $Ctx.Preflight) {
+        Write-Host ''
+        Write-Host '  Pre-flight has not been run for this operation.' -ForegroundColor Yellow
+    }
+
+    if ($plan.TargetCount -eq 0) {
+        Write-Host ''
+        Write-Host '  Nothing to do - no computers selected.' -ForegroundColor Yellow
+        return @{ Proceed = $false; Reason = ''; ReasonBlank = $false; Plan = $plan; Message = 'no targets' }
+    }
+
+    Write-Host ''
+    Write-Host '    1. Confirm and run'
+    Write-Host '    2. Cancel'
+    $choice = if ($Yes) { '1' } else { [string](Read-WuuAnswer -Prompt '  Selection' -Default '2') }
+
+    if ($choice.Trim().ToLowerInvariant() -ne '1') {
+        Write-Host '  Cancelled.' -ForegroundColor Yellow
+        return @{ Proceed = $false; Reason = ''; ReasonBlank = $false; Plan = $plan; Message = 'cancelled' }
+    }
+
+    $reasonValue = $Reason
+    if ($plan.RequiresReason) {
+        if (-not $reasonValue) { $reasonValue = [string](Read-WuuAnswer -Prompt '  Change reason (recorded in the audit trail)' -Default '') }
+        if ([string]::IsNullOrWhiteSpace($reasonValue)) {
+            Write-Host '  A change reason is required - operation cancelled.' -ForegroundColor Yellow
+            # The refusal is recorded HERE rather than by the caller, because this is the function
+            # that actually knows a refusal happened. Leaving it to the screen meant any other
+            # caller of the confirmation gate (a test, a future workflow) produced an unrecorded
+            # refusal - and an unrecorded refusal is exactly what ISO 27001 A.8.15 is about.
+            if ($Ctx.DenialHook) {
+                try { & $Ctx.DenialHook $Operation 'reason not supplied (cancelled at confirmation)' | Out-Null } catch { }
+            }
+            return @{ Proceed = $false; Reason = ''; ReasonBlank = $true; Plan = $plan; Message = 'reason required' }
+        }
+    }
+
+    $Ctx | Add-Member -NotePropertyName Reason -NotePropertyValue $reasonValue -Force
+    $Ctx | Add-Member -NotePropertyName Pending -NotePropertyValue ([pscustomobject]@{
+        Operation = $Operation
+        Plan      = $plan
+        Targets   = $plan.Targets
+        Reason    = $reasonValue
+    }) -Force
+
+    return @{ Proceed = $true; Reason = $reasonValue; ReasonBlank = $false; Plan = $plan; Message = 'confirmed' }
+}
+
+function Show-WuuPreflightScreen {
+    <#
+    .SYNOPSIS Spec 7 pre-flight: report, then a real choice about what to do next.
+    .DESCRIPTION
+    The report is the P0 requirement ("The user must not discover these problems halfway through
+    a deployment"). The four actions are spec 7's own list, and the first states the real number -
+    "Continue with N available computers", not "Continue".
+    #>
+    param([Parameter(Mandatory)]$Ctx)
+
+    $computerCount = Get-WuuComputerSetCount -Set $Ctx.Set
+    if ($computerCount -eq 0) {
+        Write-WuuHeader 'PRE-FLIGHT'
+        Write-Host '  No computers in the set - nothing to check.' -ForegroundColor Yellow
+        return 'DASHBOARD'
+    }
+
+    $op = if ($Ctx.PSObject.Properties['PreflightOperation']) { [string]$Ctx.PreflightOperation } else { 'check' }
+    if ([string]::IsNullOrWhiteSpace($op)) { $op = 'check' }
+
+    $report = Invoke-WuuPreflightCheck -Ctx $Ctx -Operation $op
+
+    Write-Host ''
+    Write-Host '  PRE-FLIGHT RESULT' -ForegroundColor White
+    $fmt = '    {0,-24} {1}'
+    Write-Host ($fmt -f 'Targets', $report.Computers)
+    if ($report.ProbedOffline) {
+        # Reachability was not probed, so neither a reachable NOR an offline figure is meaningful.
+        # Printing "Offline: 3" because the ping count happened to be zero is how a pre-flight
+        # report teaches an operator to distrust it.
+        Write-Host '    Reachability, credentials, WU service, OS and reboot state: not probed' -ForegroundColor DarkGray
+    } else {
+        Write-Host ($fmt -f 'Reachable', $report.Reachable)
+        Write-Host ($fmt -f 'Offline', $report.Offline)
+        Write-Host ($fmt -f 'Credentials valid', ("{0} / {1}" -f $report.CredentialsValid, $report.Reachable))
+        Write-Host ($fmt -f 'WU service running', ("{0} / {1}" -f $report.ServiceOk, $report.Reachable))
+        Write-Host ($fmt -f 'Pending reboot', $report.RebootPending)
+    }
+    Write-Host ($fmt -f 'Prerequisites', ("{0} blocking, {1} warning" -f $report.Blocking, $report.Warnings))
+
+    if (@($report.Problems).Count -gt 0) {
+        Write-Host ''
+        Write-Host '  Potential problems' -ForegroundColor Yellow
+        foreach ($p in @($report.Problems | Select-Object -First 20)) { Write-Host ("    - {0}" -f $p) -ForegroundColor DarkYellow }
+        if (@($report.Problems).Count -gt 20) { Write-Host ("    ... and {0} more" -f (@($report.Problems).Count - 20)) -ForegroundColor DarkYellow }
+    } else {
+        Write-Host ''
+        Write-Host '  No potential problems found.' -ForegroundColor Green
+    }
+
+    Write-Host ''
+    Write-Host ("    1. Continue with {0} available computer(s)" -f $report.Available)
+    Write-Host '    2. Remove offline computers'
+    Write-Host '    3. Review problems'
+    Write-Host '    4. Cancel'
+
+    $choice = [string](Read-WuuAnswer -Prompt '  Selection' -Default '4')
+    switch ($choice.Trim().ToLowerInvariant()) {
+        '1' {
+            if ($report.Available -eq 0) {
+                Write-Host '  No available computers - nothing to continue with.' -ForegroundColor Yellow
+                return 'DASHBOARD'
+            }
+            return 'DASHBOARD'
+        }
+        '2' {
+            # Deliberately NOT re-probing straight after. The handler queues the checks, so the
+            # rows are still present at this instant; re-probing here would report the same
+            # offline hosts again and look like the removal had failed.
+            if ($report.Offline -eq 0) { Write-Host '  No offline computers to remove.' -ForegroundColor DarkGray; return 'PREFLIGHT' }
+            Write-Host ('  Queued connectivity test for {0} computer(s); unreachable rows are removed as it completes.' -f $report.Computers) -ForegroundColor Cyan
+            Invoke-WuuGuidedHandler -Ctx $Ctx -Handler 'EventRemoveOfflineComputer'
+            return 'DASHBOARD'
+        }
+        '3' {
+            Write-Host ''
+            foreach ($r in @($report.Results)) {
+                Write-Host ("    {0,-24} reach={1,-5} creds={2,-18} wu={3,-18} reboot={4}" -f `
+                    $r.Computer, $r.Reachable, $r.Credentials, $r.WuService, $r.PendingReboot)
+                if ($r.Problem) { Write-Host ("      -> {0}" -f $r.Problem) -ForegroundColor DarkYellow }
+            }
+            Write-Host ''
+            $null = Read-WuuAnswer -Prompt '  Press Enter to continue' -Default ''
+            return 'PREFLIGHT'
+        }
+        default { return 'DASHBOARD' }
+    }
+}
+
+function Show-WuuOperationConfirmationScreen {
+    <#
+    .SYNOPSIS Spec 12: run pre-flight if needed, show the plan, then obtain explicit confirmation.
+    .DESCRIPTION
+    Pre-flight is offered rather than assumed. Spec 7 requires it before disruptive operations,
+    but re-probing a large estate on every keystroke would make the workflow unusable, so an
+    operator who has ALREADY seen a fresh report (the context holds one for this same operation)
+    is not asked again - they are told the decision is theirs.
+
+    On confirmation the mutating step is dispatched through Invoke-WuuGuidedHandler, so the reason
+    collected here is what the audit choke point records (spec 12: "If a change reason is required
+    by the existing audit system, collect it naturally at this stage").
+    #>
+    param([Parameter(Mandatory)]$Ctx)
+
+    $op = if ($Ctx.PSObject.Properties['PreflightOperation']) { [string]$Ctx.PreflightOperation } else { 'check' }
+    if ([string]::IsNullOrWhiteSpace($op)) { $op = 'check' }
+
+    $targets = if ($Ctx.PSObject.Properties['RetryTargets']) { @($Ctx.RetryTargets) } else { @() }
+
+    # A fresh report for this operation means the operator has already reviewed the problems.
+    $needsPreflight = $true
+    if ($Ctx.Preflight) {
+        if ([string]$Ctx.Preflight.Operation -eq $op) { $needsPreflight = $false }
+    }
+    if ($needsPreflight -and (Get-WuuComputerSetCount -Set $Ctx.Set) -gt 0) {
+        Write-Host ''
+        Write-Host '  Running pre-flight before this operation (spec 7) - this can take a moment.' -ForegroundColor DarkGray
+        $report = Invoke-WuuPreflightCheck -Ctx $Ctx -Operation $op
+        if ($report.Blocking -gt 0) {
+            Write-Host ''
+            Write-Host ("  {0} computer(s) have blocking problems; see 'Pre-flight check' to review." -f $report.Blocking) -ForegroundColor Yellow
+        }
+    }
+
+    $decision = Confirm-WuuMutation -Ctx $Ctx -Operation $op -Targets $targets
+    if (-not $decision.Proceed) {
+        # No denial is recorded here: Confirm-WuuMutation records the refusal itself, and doing it
+        # in both places would put two 'denied' records in the trail for one cancel.
+        # Back to the category that offered the operation, so a refused confirmation is not a dead
+        # end. The category id is derived from the state that pushed this screen.
+        return (Get-WuuCategoryStateForOperation -Operation $op)
+    }
+
+    # 'deploy' is a sequence, not a leaf (spec 11) - hand it to the deployment runner.
+    if ($op.ToLowerInvariant() -eq 'deploy') {
+        $Ctx | Add-Member -NotePropertyName DeploymentStep -NotePropertyValue 0 -Force
+        return 'EXECUTING'
+    }
+
+    $handler = Get-WuuOperationHandler -Operation $op
+    if (-not $handler) {
+        Write-Host ("  DEFECT: no handler for operation '{0}'." -f $op) -ForegroundColor Red
+        return 'DASHBOARD'
+    }
+
+    Write-Host ''
+    Write-Host ("  Running: {0}" -f (Get-WuuOperationLabel -Operation $op)) -ForegroundColor White
+    Invoke-WuuGuidedHandler -Ctx $Ctx -Handler $handler -Mutating (Test-WuuOperationRequiresReason -Operation $op) -Operation $op -Targets $targets
+    Write-InfoLog ("Guided operation '{0}' dispatched for {1} computer(s), reason: {2}" -f $op, @($targets).Count, $decision.Reason)
+
+    $Ctx | Add-Member -NotePropertyName ExecutionOperation -NotePropertyValue $op -Force
+    return 'EXECUTING'
+}
+
+function Get-WuuOperationHandler {
+    <# The single $consoleActions handler responsible for an operation id. #>
+    param([Parameter(Mandatory)][string]$Operation)
+    switch ($Operation.ToLowerInvariant()) {
+        'check'    { 'EventGetUpdates' }
+        'review'   { 'EventShowAvailableUpdates' }
+        'download' { 'EventDownloadUpdates' }
+        'install'  { 'EventInstallUpdates' }
+        'restart'  { 'EventRestartComputer' }
+        'service'  { 'EventWUServiceActionInteractive' }
+        'deploy'   { '' }
+        default    { '' }
+    }
+}
+
+function Get-WuuCategoryStateForOperation {
+    <# Which category screen offered this operation - so cancelling returns somewhere sensible. #>
+    param([Parameter(Mandatory)][string]$Operation)
+    switch ($Operation.ToLowerInvariant()) {
+        'deploy' { 'DEPLOYMENT' }
+        default  { 'UPDATES' }
+    }
+}
+
+function Show-WuuExecutionScreen {
+    <#
+    .SYNOPSIS Spec 14: live per-computer progress for the running operation.
+    .DESCRIPTION
+    Spec 14 wants the lifecycle states distinguished; Get-WuuRowOperationState maps the row's own
+    vocabulary onto them. For a single-step operation this waits for the step to settle and then
+    moves to the results screen, which is spec 15's requirement that a run never just ends with
+    "Operation complete."
+
+    Full deployment is driven step-by-step from Get-WuuWorkflowSpec (spec 11) - each step is
+    confirmed separately, because a change reason is required per change, and the operator should
+    be able to stop between steps.
+    #>
+    param([Parameter(Mandatory)]$Ctx)
+
+    $op = if ($Ctx.PSObject.Properties['ExecutionOperation']) { [string]$Ctx.ExecutionOperation } else { 'check' }
+    if ([string]::IsNullOrWhiteSpace($op)) { $op = 'check' }
+
+    $targets = if ($Ctx.PSObject.Properties['RetryTargets']) { @($Ctx.RetryTargets) } else { @() }
+
+    $spec = @(Get-WuuWorkflowSpec -Name (Get-WuuWorkflowNameForOperation -Operation $op))
+
+    Write-WuuHeader ("EXECUTING: {0}" -f (Get-WuuOperationLabel -Operation $op).ToUpperInvariant())
+
+    if ($spec.Count -gt 0) {
+        # Multi-step: run the sequence, showing progress after each step. The AUTHORISATION for the
+        # whole sequence was taken once, by the confirmation screen, so the loop collects a reason
+        # per mutating step from the context rather than interrupting each one with its own
+        # Confirm/Cancel prompt - and it deliberately does NOT re-probe. Re-running the full probe
+        # set before every step would multiply pre-flight cost by the number of steps while telling
+        # the operator nothing new within a single deployment run.
+        $stepIndex = 0
+        if ($Ctx.PSObject.Properties['DeploymentStep']) { $stepIndex = [int]$Ctx.DeploymentStep }
+        while ($stepIndex -lt $spec.Count) {
+            $step = $spec[$stepIndex]
+            Write-Host ''
+            Write-Host ("  [{0}/{1}] {2}" -f ($stepIndex + 1), $spec.Count, $step.Label) -ForegroundColor White
+
+            if ($step.Mutating -and -not [string]$Ctx.Reason) {
+                # Each mutating step is its own audited change, so it needs its own reason. This is
+                # collected here (not inherited) because the trail must be able to explain step 4
+                # without reference to step 2.
+                $stepReason = [string](Read-WuuAnswer -Prompt ("  Change reason for '{0}'" -f $step.Label) -Default '')
+                if ([string]::IsNullOrWhiteSpace($stepReason)) {
+                    Write-Host '  A change reason is required - deployment stopped.' -ForegroundColor Yellow
+                    if ($Ctx.DenialHook) {
+                        try { & $Ctx.DenialHook ([string]$step.Op) 'reason not supplied (deployment step cancelled)' | Out-Null } catch { }
+                    }
+                    $Ctx | Add-Member -NotePropertyName DeploymentStep -NotePropertyValue 0 -Force
+                    return 'RESULTS'
+                }
+                $Ctx | Add-Member -NotePropertyName Reason -NotePropertyValue $stepReason -Force
+            }
+
+            $handler = Get-WuuOperationHandler -Operation ([string]$step.Op)
+            if ($handler) {
+                Invoke-WuuGuidedHandler -Ctx $Ctx -Handler $handler -Mutating ([bool]$step.Mutating) -Operation ([string]$step.Op) -Targets $targets
+            } else {
+                Write-Host ("  DEFECT: workflow step '{0}' has no handler." -f $step.Op) -ForegroundColor Red
+            }
+
+            $settled = Wait-WuuRowsSettled -Ctx $Ctx -Targets $targets
+            if (-not $settled) {
+                Write-Host '  Some computers are still running; moving on with the last known state.' -ForegroundColor Yellow
+            }
+
+            Write-WuuExecutionTable -Ctx $Ctx -Targets $targets
+            $stepIndex++
+            $Ctx | Add-Member -NotePropertyName DeploymentStep -NotePropertyValue $stepIndex -Force
+        }
+        $Ctx | Add-Member -NotePropertyName DeploymentStep -NotePropertyValue 0 -Force
+        return 'RESULTS'
+    }
+
+    # Single step: wait for it, showing the table as it goes.
+    Write-Host ''
+    Write-Host '  Waiting for the operation to complete...' -ForegroundColor DarkGray
+    $settled = Wait-WuuRowsSettled -Ctx $Ctx -Targets $targets
+    if (-not $settled) {
+        Write-Host '  Bounded wait elapsed - reporting the state as it stands.' -ForegroundColor Yellow
+    }
+    Write-WuuExecutionTable -Ctx $Ctx -Targets $targets
+    return 'RESULTS'
+}
+
+function Get-WuuWorkflowNameForOperation {
+    <# Maps an operation id onto the workflow spec that drives it, if any. #>
+    param([Parameter(Mandatory)][string]$Operation)
+    switch ($Operation.ToLowerInvariant()) {
+        'deploy' { 'deploy' }
+        default  { '' }
+    }
+}
+
+function Write-WuuExecutionTable {
+    <# Spec 14's per-computer progress view. #>
+    param(
+        [Parameter(Mandatory)]$Ctx,
+        [AllowEmptyCollection()][string[]]$Targets = @()
+    )
+
+    Write-Host ''
+    $fmt = '    {0,-22} {1,-16} {2}'
+    Write-Host ($fmt -f 'COMPUTER', 'STATE', 'DETAIL') -ForegroundColor DarkCyan
+    foreach ($r in @(Get-WuuComputerSetComputers -Set $Ctx.Set)) {
+        if (@($Targets).Count -gt 0 -and $Targets -notcontains $r.Computer) { continue }
+        $s = Get-WuuRowOperationState -Row $r
+        Write-Host ($fmt -f $r.Computer, $s.Name, ([string]$r.Status)) -ForegroundColor $s.Color
+    }
+}
+
+function Show-WuuResultsScreen {
+    <#
+    .SYNOPSIS Spec 15: never finish with only "Operation complete."
+    .DESCRIPTION
+    Reports Successful / Failed / Offline / Reboot required, lists failures WITH their cause, and
+    offers actionable next steps - retry failed, view errors, history, export, dashboard. The
+    retry path narrows the set via $Ctx.RetryTargets so the next operation targets exactly the
+    computers that failed, rather than making the operator re-select them (spec 6).
+    #>
+    param([Parameter(Mandatory)]$Ctx)
+
+    $op = if ($Ctx.PSObject.Properties['ExecutionOperation']) { [string]$Ctx.ExecutionOperation } else { 'check' }
+    if ([string]::IsNullOrWhiteSpace($op)) { $op = 'check' }
+
+    $summary = Get-WuuComputerSetSummary -Set $Ctx.Set
+    $computers = @(Get-WuuComputerSetComputers -Set $Ctx.Set)
+
+    $failed = @($computers | Where-Object { [string]$_.State -eq 'Error' })
+    $timedOut = @($computers | Where-Object { [string]$_.State -eq 'Timeout' })
+    $rebootPending = @($computers | Where-Object { $_.RebootRequired })
+    $successful = @($computers | Where-Object { [string]$_.State -eq 'Complete' })
+
+    Write-WuuHeader 'RESULTS'
+    Write-Host ("  Operation:      {0}" -f (Get-WuuOperationLabel -Operation $op)) -ForegroundColor White
+    Write-Host ("  Successful:     {0}" -f $successful.Count) -ForegroundColor Green
+    Write-Host ("  Failed:         {0}" -f ($failed.Count + $timedOut.Count)) -ForegroundColor $(if (($failed.Count + $timedOut.Count) -gt 0) { 'Red' } else { 'Gray' })
+    Write-Host ("  Offline:        {0}" -f $summary.Offline) -ForegroundColor $(if ($summary.Offline -gt 0) { 'Yellow' } else { 'Gray' })
+    Write-Host ("  Reboot required:{0}" -f $rebootPending.Count) -ForegroundColor $(if ($rebootPending.Count -gt 0) { 'Yellow' } else { 'Gray' })
+
+    # Failures with their cause (spec 15). The row's Status is where the engine records why.
+    if (($failed.Count + $timedOut.Count) -gt 0) {
+        Write-Host ''
+        Write-Host '  FAILURES' -ForegroundColor Red
+        foreach ($f in ($failed + $timedOut)) {
+            Write-Host ("    {0}" -f $f.Computer) -ForegroundColor Red
+            Write-Host ("      {0}" -f ([string]$f.Status)) -ForegroundColor DarkRed
+        }
+    }
+
+    if ($rebootPending.Count -gt 0) {
+        Write-Host ''
+        Write-Host '  REBOOT PENDING' -ForegroundColor Yellow
+        foreach ($r in $rebootPending) { Write-Host ("    {0}" -f $r.Computer) -ForegroundColor Yellow }
+    }
+
+    Write-Host ''
+    Write-Host '  Next actions:'
+    Write-Host '    1. Retry failed computers'
+    Write-Host '    2. View errors'
+    Write-Host '    3. Update history'
+    Write-Host '    4. Export audit bundle'
+    Write-Host '    5. Back to dashboard'
+    Write-Host '    6. Exit'
+
+    $choice = [string](Read-WuuAnswer -Prompt '  Selection' -Default '5')
+    switch ($choice.Trim().ToLowerInvariant()) {
+        '1' {
+            $targets = @(($failed + $timedOut) | ForEach-Object { $_.Computer })
+            if ($targets.Count -eq 0) {
+                Write-Host '  Nothing failed - nothing to retry.' -ForegroundColor DarkGray
+                return 'RESULTS'
+            }
+            Write-Host ("  Retrying {0} computer(s): {1}" -f $targets.Count, ($targets -join ', ')) -ForegroundColor Cyan
+            $Ctx | Add-Member -NotePropertyName RetryTargets -NotePropertyValue $targets -Force
+            $Ctx | Add-Member -NotePropertyName PreflightOperation -NotePropertyValue $op -Force
+            # Force a fresh pre-flight: the retry must not inherit the pre-flight that ran BEFORE
+            # the failures, because the whole point of retrying is that something has changed.
+            $Ctx | Add-Member -NotePropertyName Preflight -NotePropertyValue $null -Force
+            return 'CONFIRM'
+        }
+        '2' { Invoke-WuuGuidedHandler -Ctx $Ctx -Handler 'GetErrors'; return 'RESULTS' }
+        '3' { Invoke-WuuGuidedHandler -Ctx $Ctx -Handler 'EventShowUpdateHistory'; return 'RESULTS' }
+        '4' { Invoke-WuuAuditSubVerb -Ctx $Ctx -SubVerb 'export'; return 'RESULTS' }
+        '6' { return 'EXIT' }
+        default { return 'DASHBOARD' }
+    }
+}
+
+function Start-WuuDeploymentSequence {
+    <#
+    .SYNOPSIS Spec 11: full deployment as an explicit, confirmable sequence.
+    .DESCRIPTION
+    Named for spec 13, which requires phases to be visible as part of deployment rather than
+    hidden configuration: the confirmation step of the sequence reports the per-phase plan, so the
+    operator sees which phase each computer belongs to at the moment they authorise the change.
+
+    The screen itself is Show-WuuExecutionScreen, driven by the 'deploy' workflow spec - this
+    function exists so a menu entry can name a state ('DEPLOYING') without that state having to
+    know the workflow table.
+    #>
+    param([Parameter(Mandatory)]$Ctx)
+
+    if ((Get-WuuComputerSetCount -Set $Ctx.Set) -eq 0) {
+        Write-WuuHeader 'FULL DEPLOYMENT'
+        Write-Host '  No computers in the set - nothing to deploy.' -ForegroundColor Yellow
+        return 'DASHBOARD'
+    }
+
+    if ($Ctx.PSObject.Properties['RetryTargets']) {
+        $Ctx | Add-Member -NotePropertyName RetryTargets -NotePropertyValue @() -Force
+    }
+    $Ctx | Add-Member -NotePropertyName ExecutionOperation -NotePropertyValue 'deploy' -Force
+    $Ctx | Add-Member -NotePropertyName DeploymentStep -NotePropertyValue 0 -Force
+    # A deployment starts a NEW sequence, so any pre-flight from an earlier operation must not be
+    # treated as covering its first step.
+    $Ctx | Add-Member -NotePropertyName Preflight -NotePropertyValue $null -Force
+    $Ctx | Add-Member -NotePropertyName PreflightOperation -NotePropertyValue '' -Force
+
+    Write-InfoLog 'Guided full deployment started (spec 11 sequence)'
+    return Show-WuuExecutionScreen -Ctx $Ctx
+}
+
+#endregion Pre-flight, confirmation, execution and results
+
 #region Workflow loop
 
 function Start-WuuGuidedWorkflow {
@@ -632,6 +1406,15 @@ function Start-WuuGuidedWorkflow {
         AuditHook     = $AuditHook
         DenialHook    = $DenialHook
         LastOperation = ''
+        # Set by Show-WuuPreflightScreen; read by the confirmation screen. Null means "pre-flight
+        # has not run for the pending operation", which the confirmation screen treats as a reason
+        # to offer running it rather than to assume the targets are fine.
+        Preflight     = $null
+        # The operation awaiting confirmation. Null means no operation is pending.
+        Pending       = $null
+        # Injectable probes so the workflow is drivable without a network. See
+        # New-WuuPreflightContext for why they are injected rather than called directly.
+        PreflightContext = (New-WuuPreflightContext)
         Quit          = $false
     }
 
@@ -642,6 +1425,11 @@ function Start-WuuGuidedWorkflow {
         # Drain queued work each tick - same reason as the flat menu: a console blocked in a prompt
         # has no message loop, so the scheduler must be polled by this loop.
         try { & $DrainScheduler } catch { Write-Warning "Scheduler tick failed: $($_.Exception.Message)" }
+
+        # Screens below run synchronous, potentially slow work (pre-flight probes, then the update
+        # steps themselves). The loop is not ticking while a screen is on the stack, so the drain
+        # is passed down as ctx.Tick and the pre-flight/deployment loops poll it per computer.
+        $ctx | Add-Member -NotePropertyName Tick -NotePropertyValue $DrainScheduler -Force
 
         switch ($state) {
             'ACQUIRE'      { $state = Show-WuuAcquisitionScreen -Ctx $ctx }
@@ -656,6 +1444,11 @@ function Start-WuuGuidedWorkflow {
             'DIAGNOSTICS'  { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'DIAGNOSTICS' -Items @(Get-WuuDiagnosticsMenu) -State 'DIAGNOSTICS' }
             'REPORTS'      { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'REPORTS / AUDIT' -Items @(Get-WuuReportsMenu) -State 'REPORTS' }
             'ADVANCED'     { $state = Show-WuuAdvancedScreen -Ctx $ctx }
+            'PREFLIGHT'    { $state = Show-WuuPreflightScreen -Ctx $ctx }
+            'CONFIRM'      { $state = Show-WuuOperationConfirmationScreen -Ctx $ctx }
+            'EXECUTING'    { $state = Show-WuuExecutionScreen -Ctx $ctx }
+            'RESULTS'      { $state = Show-WuuResultsScreen -Ctx $ctx }
+            'DEPLOYING'    { $state = Start-WuuDeploymentSequence -Ctx $ctx }
             'SAVE'         { Invoke-WuuGuidedHandler -Ctx $ctx -Handler 'EventSaveConfig'; $ctx.Set.IsSaved = $true; $state = 'DASHBOARD' }
             default {
                 Write-Host ("  DEFECT: unknown workflow state '{0}' - returning to dashboard." -f $state) -ForegroundColor Red
@@ -678,6 +1471,7 @@ Export-ModuleMember -Function @(
     'Get-WuuDiagnosticsMenu'
     'Get-WuuCredentialMenu'
     'Get-WuuReportsMenu'
+    'Get-WuuWorkflowSpec'
     'Select-WuuImportColumn'
     'Show-WuuAcquisitionScreen'
     'Show-WuuManualEntryScreen'
@@ -686,6 +1480,15 @@ Export-ModuleMember -Function @(
     'Show-WuuDashboardScreen'
     'Show-WuuCategoryScreen'
     'Show-WuuAdvancedScreen'
+    'Show-WuuPreflightScreen'
+    'Show-WuuOperationConfirmationScreen'
+    'Show-WuuExecutionScreen'
+    'Show-WuuResultsScreen'
+    'Start-WuuDeploymentSequence'
+    'New-WuuPreflightContext'
+    'Invoke-WuuPreflightCheck'
+    'Confirm-WuuMutation'
+    'Get-WuuRowOperationState'
     'Invoke-WuuGuidedHandler'
     'Invoke-WuuAuditSubVerb'
     'Start-WuuGuidedWorkflow'

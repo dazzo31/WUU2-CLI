@@ -97,7 +97,11 @@ Enhanced Version - 2025-07-08
 # across modules. Previously the banner and the audit records each hardcoded their own string,
 # so a release could ship with the log claiming one version and the audit trail recording
 # another - a genuine compliance problem for a field an ISO 27001 review relies on.
-$global:WuuVersion = 'v1.4.1-cli'
+#
+# v1.5.0-beta.1-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
+# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.1-cli` knows the evidence
+# came from pre-release software. Do not reuse this string for a final release.
+$global:WuuVersion = 'v1.5.0-beta.1-cli'
 
 # Toggle debug logging. Set to $true to enable detailed logging (performance impact).
 # WARNING: Enabling this creates large log files and reduces performance.
@@ -459,12 +463,20 @@ try {
     
     $assemblies = @(
         # Console edition: WPF assemblies (PresentationFramework/PresentationCore/WindowsBase)
-        # are deliberately NOT loaded. Only the non-GUI dependencies remain.
-        'Microsoft.VisualBasic',
-        'System.Windows.Forms'
+        # are deliberately NOT loaded, and neither are Microsoft.VisualBasic or
+        # System.Windows.Forms. Both were inherited from the GUI edition and are used by NO live
+        # code in this edition - verified by grep: the only [Microsoft.VisualBasic.Interaction]
+        # uses are inside dead GUI closures, and [System.Windows.Forms.*] has no type uses at all.
+        #
+        # Removing them is not cosmetic. Add-Type -AssemblyName THROWS on failure and the catch
+        # below exits, so carrying an unused assembly turns a missing optional component into a
+        # hard startup failure - which would contradict this edition's central claim that it runs
+        # anywhere PowerShell 5.1 runs. Add an entry here only with a caller that needs it.
     )
     
-    # For PowerShell 7, we need to explicitly load DirectoryServices
+    # DirectoryServices is genuinely required (the AD import path resolves
+    # System.DirectoryServices.ActiveDirectory at runtime), but only needs an explicit Add-Type on
+    # PS 7+ - on 5.1 the types resolve from the default load context.
     if ($PSVersionTable.PSVersion.Major -ge 6) {
         try {
             Add-Type -AssemblyName 'System.DirectoryServices' -ErrorAction SilentlyContinue
@@ -670,6 +682,11 @@ function _WuuReadPassword {
 
 # Function to show message box and log error
 function Show-ErrorDialog {
+    # Console edition: the GUI's MessageBox is gone, and so is the WPF assembly it needed. A modal
+    # dialog would be fatal in a HEADLESS tool - an unattended run would block forever with nobody
+    # to click OK. The message is logged and printed instead. Kept rather than deleted: it is the
+    # obvious thing for a future error path to call, and a caller that silently vanished would be
+    # worse than one that prints.
     param(
         [string]$Message,
         [string]$Title = 'Error',
@@ -683,11 +700,13 @@ function Show-ErrorDialog {
         Write-ErrorLog $Message -Computer $Computer
     }
     
-    [System.Windows.MessageBox]::Show($Message, $Title, 'OK', 'Error')
+    Write-Host ''
+    Write-Host ("  {0}: {1}" -f $Title, $Message) -ForegroundColor Red
 }
 
 # Function to show warning dialog and log
 function Show-WarningDialog {
+    # See the note on Show-ErrorDialog: console output, never a modal dialog.
     param(
         [string]$Message,
         [string]$Title = 'Warning',
@@ -701,7 +720,8 @@ function Show-WarningDialog {
         Write-WarningLog $Message -Computer $Computer
     }
     
-    [System.Windows.MessageBox]::Show($Message, $Title, 'OK', 'Warning')
+    Write-Host ''
+    Write-Host ("  {0}: {1}" -f $Title, $Message) -ForegroundColor Yellow
 }
 
 #endregion Utility Functions
@@ -861,57 +881,6 @@ $AddEntry = {
 
 
 # Assign computers to phases
-$eventAssignPhase = {
-    Param($phase)
-    try {
-        Write-InfoLog "Phase assignment started for phase: $phase"
-        $selectedComputers = @($uiHash.Listview.SelectedItems)
-        
-        if ($selectedComputers.Count -gt 0) {
-        Write-InfoLog "Assigning $($selectedComputers.Count) computers to $phase"
-        $computerNames = @()
-        
-        ForEach ($Computer in $selectedComputers) {
-            try {
-                # Safer approach: modify property directly and refresh once
-                $Computer.Phase = $phase
-                Write-InfoLog "Assigned $($Computer.Computer) to $phase"
-                $computerNames += $Computer.Computer
-            } catch {
-                $errorMsg = $_.Exception.Message
-                Write-ErrorLog "Failed to assign $($Computer.Computer) to $phase - Error: $errorMsg"
-            }
-        }
-        
-        # Refresh the view once after all updates
-        try {
-            if ($stateStore) { $stateStore.Touch() }
-            Write-InfoLog "Store refresh signalled after phase assignment"
-        } catch {
-            $errorMsg = $_.Exception.Message
-            Write-ErrorLog "Failed to signal refresh after phase assignment - Error: $errorMsg"
-        }
-
-        # Update status with appropriate message
-        if ($selectedComputers.Count -eq 1) {
-            Update-StatusBackground "Computer '$($computerNames[0])' assigned to $phase"
-        } else {
-            Update-StatusBackground "$($selectedComputers.Count) computers assigned to ${phase}: $($computerNames -join ', ')"
-        }
-        } else {
-            Write-WarningLog "No computers selected for phase assignment"
-        }
-    } catch {
-        $errorMsg = $_.Exception.Message
-        Write-ErrorLog "Critical error in phase assignment - Error: $errorMsg"
-        [System.Windows.MessageBox]::Show(
-            "An error occurred during phase assignment - Error: $errorMsg",
-            "Phase Assignment Error",
-            'OK',
-            'Error'
-        )
-    }
-}
 
 # Remove entry ScriptBlock
 $removeEntry = {
@@ -1022,9 +991,6 @@ $clearComputerList = {
 }
 
 # Clear computer list (legacy alias)
-$ClearComputerList = {
-    &$clearComputerList
-}
 
 #endregion ScriptBlocks
 
@@ -2260,11 +2226,6 @@ $jobCleanup.Thread = $jobCleanup.PowerShell.BeginInvoke()
 
 #region Menu and Action Events
 
-$eventActionMenu = { #Enable/disable action menu items
-    $uiHash.ClearComputerListMenu.IsEnabled = ($stateStore.Rows.Count -gt 0)
-    $uiHash.OfflineHostsMenu.IsEnabled = ($stateStore.Rows.Count -gt 0)
-    $uiHash.ViewErrorMenu.IsEnabled = ($Error.Count -gt 0)
-}
 #region Active Directory Import
 
 # Test Active Directory connectivity function
@@ -2323,22 +2284,34 @@ $TestADConnection = {
         $results += "[ERROR] Computer search failed: $($_.Exception.Message)"
     }
     
-    # Test 5: Check if the OU selector XAML exists
-    $ouPickerPath = Join-Path $WuuRoot "ui\OUSelector.xaml"
-    if (Test-Path $ouPickerPath) {
-        $results += "[OK] OUSelector.xaml found at: $ouPickerPath"
+    # Test 5: the AD import path's own prerequisites. This REPLACED a check for ui\OUSelector.xaml,
+    # which the console edition deliberately deleted - so it reported "[ERROR] OUSelector.xaml NOT
+    # found" for a file that should not exist, telling the operator the opposite of the truth.
+    if (Get-Command Read-WuuYesNo -ErrorAction SilentlyContinue) {
+        $results += "[OK] Console interaction helpers available (Read-WuuYesNo)"
     } else {
-        $results += "[ERROR] OUSelector.xaml NOT found at: $ouPickerPath"
+        $results += "[ERROR] Read-WuuYesNo is missing - the AD import prompts cannot run"
     }
-    
-    # Show results in a message box
-    $resultText = $results -join "`n"
-    [System.Windows.MessageBox]::Show(
-        "Active Directory Connectivity Test Results:`n`n$resultText`n`nIf any tests failed, that's likely why AD import isn't working.",
-        "AD Connection Test",
-        'OK',
-        'Information'
-    )
+    if (Get-Command Invoke-WuuGuidedHandler -ErrorAction SilentlyContinue) {
+        $results += "[OK] Guided workflow available (EventAddAD is reachable)"
+    } else {
+        $results += "[WARN] Guided workflow not loaded - AD import is reachable from the flat menu only"
+    }
+
+    # Report on the CONSOLE. This was a WPF MessageBox, which now throws (PresentationFramework is
+    # deliberately not loaded), so the diagnostic destroyed itself on its own last line - exactly
+    # when it was needed, since it is only offered after AD access has already failed.
+    Write-Host ''
+    Write-Host '  Active Directory Connectivity Test Results' -ForegroundColor White
+    Write-Host '  ------------------------------------------------------------------' -ForegroundColor DarkGray
+    foreach ($r in $results) {
+        $colour = if ($r -like '*[OK]*') { 'Green' } elseif ($r -like '*[WARN*') { 'Yellow' } else { 'Red' }
+        Write-Host ('    {0}' -f $r) -ForegroundColor $colour
+    }
+    if ($results -match '\[ERROR\]') {
+        Write-Host ''
+        Write-Host "  If any test failed, that is likely why AD import isn't working." -ForegroundColor Yellow
+    }
     
     # Also log the results
     Write-InfoLog "AD Connection Test Results:"
@@ -2434,300 +2407,12 @@ $eventAddAD = { #Add computers from Active Directory (console edition)
 
 #endregion
 #region Manual Computer Entry
-$eventAddComputer = { #Add computers by typing them in manually
-    #Open prompt
-    $computer = [Microsoft.VisualBasic.Interaction]::InputBox('Enter a computer name or names. Separate computers with a comma (,) or semi-colon (;).', 'Add Computer(s)')
-
-    #Verify computers were input
-    If (-Not [System.String]::IsNullOrEmpty($computer)) {
-        [string[]]$computername = $computer -split ',|;' #Parse
-    }
-    if($computername){&$AddEntry $computername} #Add computers
-}
 #endregion
 
 #region File Import
-$eventAddFile = { #Add computers from CSV or TXT file with advanced options
-    # Import computers from files with CSV column detection, duplicate checking, exempt filtering, and import summary
-    
-    #Open file dialog
-    $dlg = new-object microsoft.win32.OpenFileDialog
-    $dlg.DefaultExt = '*.csv'
-    $dlg.Filter = 'CSV Files (*.csv)|*.csv|Text Files (*.txt)|*.txt|All Files (*.*)|*.*'
-    $dlg.InitialDirectory = $pwd
-    $dlg.Title = 'Add Computers From File'
-    [void]$dlg.showdialog()
-    $File = $dlg.FileName
-
-    #Verify file was selected
-    If (-Not ([system.string]::IsNullOrEmpty($File))) {
-        try {
-            $fileExtension = [System.IO.Path]::GetExtension($File).ToLower()
-            $computerNames = @()
-            $importCount = 0
-            $duplicateCount = 0
-            $exemptCount = 0
-            
-            # Load exempt list if it exists
-            $exemptList = @()
-            if (Test-Path 'Exempt.txt') {
-                $exemptList = Get-Content 'Exempt.txt' | Where-Object { $_ -and $_.Trim() -ne '' }
-            }
-            
-            # Get existing computers to check for duplicates
-            $existingComputers = @()
-            if ($stateStore.Rows.Count -gt 0) {
-                $existingComputers = (Get-WuuComputerRow -Store $stateStore | Select-Object -ExpandProperty Computer)
-            }
-            
-            if ($fileExtension -eq '.csv') {
-                # Handle CSV file
-                $csvData = Import-Csv -Path $File
-                
-                # Try to detect computer name column
-                $computerColumn = $null
-                $possibleColumns = @('Computer', 'ComputerName', 'Name', 'Hostname', 'Host', 'Server', 'Machine')
-                
-                foreach ($column in $possibleColumns) {
-                    if ($csvData[0].PSObject.Properties.Name -contains $column) {
-                        $computerColumn = $column
-                        break
-                    }
-                }
-                
-                if (-not $computerColumn) {
-                    # Show column selection dialog
-                    $columns = $csvData[0].PSObject.Properties.Name
-                    $selectedColumn = $null
-                    
-                    # Create a simple selection dialog
-                    Add-Type -AssemblyName Microsoft.VisualBasic
-                    $columnList = $columns -join ', '
-                    $message = "Available columns in CSV: $columnList`n`nWhich column contains the computer names? (Enter exact column name)"
-                    $selectedColumn = [Microsoft.VisualBasic.Interaction]::InputBox($message, 'Select Computer Name Column', $columns[0])
-                    
-                    if ($selectedColumn -and $columns -contains $selectedColumn) {
-                        $computerColumn = $selectedColumn
-                    } else {
-                        [System.Windows.MessageBox]::Show("Invalid column selection. Import cancelled.", "Import Error", 'OK', 'Warning')
-                        return
-                    }
-                }
-                
-                # Extract computer names from CSV
-                foreach ($row in $csvData) {
-                    $computerName = $row.$computerColumn
-                    if ($computerName -and $computerName.ToString().Trim() -ne '') {
-                        $computerNames += $computerName.ToString().Trim()
-                    }
-                }
-                
-            } else {
-                # Handle TXT file (and other text files)
-                $fileContent = Get-Content $File
-                
-                # Try to detect delimiter
-                $delimiters = @(',', ';', '`t', '|')
-                $detectedDelimiter = $null
-                
-                foreach ($delimiter in $delimiters) {
-                    if ($fileContent[0] -split $delimiter | Where-Object { $_.Trim() -ne '' } | Measure-Object | Select-Object -ExpandProperty Count -gt 1) {
-                        $detectedDelimiter = $delimiter
-                        break
-                    }
-                }
-                
-                if ($detectedDelimiter) {
-                    # Ask user if they want to use the detected delimiter
-                    $delimiterName = switch ($detectedDelimiter) {
-                        ',' { 'comma' }
-                        ';' { 'semicolon' }
-                        '`t' { 'tab' }
-                        '|' { 'pipe' }
-                    }
-                    
-                    $result = [System.Windows.MessageBox]::Show(
-                        "Detected $delimiterName-separated values in file.`n`nDo you want to import only the first column as computer names?`n`nClick 'Yes' to use first column only, 'No' to treat each line as a computer name.",
-                        "Import Format Detection",
-                        'YesNo',
-                        'Question'
-                    )
-                    
-                    if ($result -eq 'Yes') {
-                        # Use first column only
-                        foreach ($line in $fileContent) {
-                            if ($line -and $line.Trim() -ne '') {
-                                $firstColumn = ($line -split $detectedDelimiter)[0]
-                                if ($firstColumn -and $firstColumn.Trim() -ne '') {
-                                    $computerNames += $firstColumn.Trim()
-                                }
-                            }
-                        }
-                    } else {
-                        # Treat each line as computer name
-                        $computerNames = $fileContent | Where-Object { $_ -and $_.Trim() -ne '' } | ForEach-Object { $_.Trim() }
-                    }
-                } else {
-                    # No delimiter detected, treat each line as computer name
-                    $computerNames = $fileContent | Where-Object { $_ -and $_.Trim() -ne '' } | ForEach-Object { $_.Trim() }
-                }
-            }
-            
-            # Process computer names
-            $validComputers = @()
-            foreach ($computer in $computerNames) {
-                $computer = $computer.Trim()
-                
-                # Skip empty names
-                if ([string]::IsNullOrEmpty($computer)) {
-                    continue
-                }
-                
-                # Check if computer is in exempt list
-                if ($exemptList -contains $computer) {
-                    $exemptCount++
-                    continue
-                }
-                
-                # Check if computer already exists
-                if ($existingComputers -contains $computer) {
-                    $duplicateCount++
-                    continue
-                }
-                
-                # Add to valid computers list
-                $validComputers += $computer
-            }
-            
-            # Show import summary
-            $totalProcessed = $computerNames.Count
-            $importCount = $validComputers.Count
-            
-            $summaryMessage = "Import Summary:`n`n"
-            $summaryMessage += "Total entries processed: $totalProcessed`n"
-            $summaryMessage += "Valid computers to import: $importCount`n"
-            if ($duplicateCount -gt 0) { $summaryMessage += "Duplicates skipped: $duplicateCount`n" }
-            if ($exemptCount -gt 0) { $summaryMessage += "Exempt computers skipped: $exemptCount`n" }
-            
-            if ($importCount -gt 0) {
-                $summaryMessage += "`nProceed with import?"
-                $result = [System.Windows.MessageBox]::Show($summaryMessage, "Import Computer List", 'YesNo', 'Question')
-                
-                if ($result -eq 'Yes') {
-                    # Import the computers
-                    & $AddEntry $validComputers
-                    
-                    # Update status
-                    Update-StatusBackground "Successfully imported $importCount computer(s) from $([System.IO.Path]::GetFileName($File))"
-                } else {
-                    # Update status
-                    Update-StatusBackground 'Import cancelled by user'
-                }
-            } else {
-                [System.Windows.MessageBox]::Show($summaryMessage + "`nNo valid computers found to import.", "Import Computer List", 'OK', 'Warning')
-                Update-StatusBackground 'No valid computers found in selected file'
-            }
-            
-        } catch {
-            [System.Windows.MessageBox]::Show("Error importing file: $($_.Exception.Message)", "Import Error", 'OK', 'Error')
-            Update-StatusBackground "Import failed: $($_.Exception.Message)"
-        }
-    }
-}
 #endregion
 
 #region Update Operations
-$eventGetUpdates = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
-        # Manual check resets the Phase-E auto-retry budget and cancels any scheduled retry
-        if ($_.PSObject.Properties['RetryCount']) { $_.RetryCount = 0; $_.RetryAt = $null }
-        if (-not $_.Runspace) {
-            # Item was never started (phase-gated or loaded from config): use the full startup path
-            if ($_.PSObject.Properties['Pending']) { $_.Pending = $false }
-            [void](Start-UpdateCheckJob -ComputerItem $_)
-            return
-        }
-        $temp = New-Object PSObject -Property @{
-            PowerShell = $null
-            Runspace = $null
-            StartTime = Get-Date
-            Computer = $_.Computer
-        }
-        $temp.PowerShell = [powershell]::Create().AddScript($GetUpdates).AddArgument($_)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
-    }
-}
-$eventDownloadUpdates = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
-        if (-not $_.Runspace) {
-            $item = $_
-            try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
-                Write-ErrorLog "Failed to create runspace for $($item.Computer): $($_.Exception.Message)"
-                return
-            }
-        }
-        #Don't bother downloading if nothing available.
-        if($_.Available -eq $_.Downloaded){
-            #Update status based on whether computer is up-to-date or already has downloads
-                if($_.Available -eq 0){
-                    $_.Status = 'Up-to-Date - No updates available for download.'
-                } else {
-                    $_.Status = 'All available updates are already downloaded.'
-                }
-            if ($stateStore) { $stateStore.Touch() }
-            return
-        }
-
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($DownloadUpdates).AddArgument($_)
-        # Disable SetUpdatesStatus to prevent hanging - status updates are handled within DownloadUpdates
-        # $temp.PowerShell.AddScript($SetUpdatesStatus).AddArgument($_)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
-    }
-}
-$eventInstallUpdates = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
-        if (-not $_.Runspace) {
-            $item = $_
-            try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
-                Write-ErrorLog "Failed to create runspace for $($item.Computer): $($_.Exception.Message)"
-                return
-            }
-        }
-        #Check if there are any updates that are downloaded and don't require user input
-        $downloadedUpdates = $updatesHash[$_.computer] | Where-Object {$_.IsDownloaded -and $_.InstallationBehavior.CanRequestUserInput -eq $false}
-        $availableUpdates = $updatesHash[$_.computer] | Where-Object {-not $_.IsDownloaded -and $_.InstallationBehavior.CanRequestUserInput -eq $false}
-        
-        if(-not $downloadedUpdates){
-            #Update status based on whether there are updates available for download
-                if($availableUpdates){
-                    $_.Status = 'Download Available Updates - No downloaded updates ready for installation.'
-                } elseif($_.Available -eq 0) {
-                    $_.Status = 'Up-to-Date - No updates available for this computer.'
-                } else {
-                    $_.Status = 'No updates available that can be installed remotely (may require user input).'
-                }
-            if ($stateStore) { $stateStore.Touch() }
-            
-            #No need to continue if there are no updates to install.
-            return
-        }
-
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($InstallUpdates).AddArgument($_)
-        $temp.PowerShell.AddScript($RestartComputer).AddArgument($_).AddArgument($true)
-        $temp.PowerShell.AddScript($GetUpdates).AddArgument($_)
-        # Disable SetUpdatesStatus to prevent hanging - status updates are handled within GetUpdates
-        # $temp.PowerShell.AddScript($SetUpdatesStatus).AddArgument($_)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
-    }
-}
 
 #region System Management
 $eventRemoveOfflineComputer = {
@@ -2746,126 +2431,14 @@ $eventRemoveOfflineComputer = {
         $jobs.Add($temp) | Out-Null
     }
 }
-$eventRestartComputer = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
-        if (-not $_.Runspace) {
-            $item = $_
-            try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
-                Write-ErrorLog "Failed to create runspace for $($item.Computer): $($_.Exception.Message)"
-                return
-            }
-        }
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($RestartComputer).AddArgument($_).AddArgument($false)
-        $temp.PowerShell.AddScript($GetUpdates).AddArgument($_)
-        # Disable SetUpdatesStatus to prevent hanging - status updates are handled within GetUpdates
-        # $temp.PowerShell.AddScript($SetUpdatesStatus).AddArgument($_)		
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
-    }
-}
 #endregion
 
 #region Clipboard Operations
 # Copy selected computer information to clipboard
-$eventCopyComputers = {
-    if ($uiHash.Listview.SelectedItems.Count -gt 0) {
-        $clipboardData = @()
-        
-        foreach ($item in $uiHash.Listview.SelectedItems) {
-            # Create a comprehensive line with all relevant information
-            $line = "Computer: $($item.Computer)"
-            
-            if ($item.Status -and $item.Status -ne 'Ready' -and $item.Status -ne '') {
-                $line += " | Status: $($item.Status)"
-            }
-            
-            if ($item.Available -and $item.Available -gt 0) {
-                $line += " | Available Updates: $($item.Available)"
-            }
-            
-            if ($item.Downloaded -and $item.Downloaded -gt 0) {
-                $line += " | Downloaded: $($item.Downloaded)"
-            }
-            
-            if ($item.Installed -and $item.Installed -gt 0) {
-                $line += " | Installed: $($item.Installed)"
-            }
-            
-            if ($item.UpdatesStatus -and $item.UpdatesStatus -ne '') {
-                $line += " | Updates Status: $($item.UpdatesStatus)"
-            }
-            
-            $clipboardData += $line
-        }
-        
-        $clipboardText = $clipboardData -join "`r`n"
-        
-        try {
-            [System.Windows.Clipboard]::SetText($clipboardText)
-            Update-Status "Copied detailed information for $($uiHash.Listview.SelectedItems.Count) computer(s) to clipboard"
-        } catch {
-            Update-Status "Failed to copy to clipboard: $($_.Exception.Message)"
-        }
-    } else {
-        Write-WarningLog "No valid OU selected to process"
-        Update-Status 'No computers selected to copy'
-    }
-}
 
 # Copy only status/error messages to clipboard
-$eventCopyStatus = {
-    if ($uiHash.Listview.SelectedItems.Count -gt 0) {
-        $statusData = @()
-        
-        foreach ($item in $uiHash.Listview.SelectedItems) {
-            if ($item.Status -and $item.Status -ne 'Ready' -and $item.Status -ne '') {
-                $statusData += "$($item.Computer): $($item.Status)"
-            } else {
-                $statusData += "$($item.Computer): Ready"
-            }
-        }
-        
-        if ($statusData.Count -gt 0) {
-            $clipboardText = $statusData -join "`r`n"
-            
-            try {
-                [System.Windows.Clipboard]::SetText($clipboardText)
-                Update-Status "Copied status messages for $($uiHash.Listview.SelectedItems.Count) computer(s) to clipboard"
-            } catch {
-                Update-Status "Failed to copy status to clipboard: $($_.Exception.Message)"
-            }
-        }
-    } else {
-        Update-Status 'No computers selected to copy status'
-    }
-}
 
 # Paste computer names from clipboard
-$eventPasteComputers = {
-    try {
-        $clipboardText = [System.Windows.Clipboard]::GetText()
-        
-        if (-not [string]::IsNullOrWhiteSpace($clipboardText)) {
-            # Split by common delimiters (newlines, commas, semicolons, spaces)
-            $computerNames = $clipboardText -split '[\r\n,;\s]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-            
-            if ($computerNames.Count -gt 0) {
-                # Add computers to the list
-                &$AddEntry $computerNames
-                
-                Update-Status "Pasted $($computerNames.Count) computer name(s) from clipboard"
-            } else {
-                Update-Status 'No valid computer names found in clipboard'
-            }
-        } else {
-            Update-Status 'Clipboard is empty or contains no text'
-        }
-    } catch {
-        Update-Status "Failed to paste from clipboard: $($_.Exception.Message)"
-    }
-}
 #endregion
 
 
@@ -3817,8 +3390,14 @@ try {
         # the transcript is what answers "why did they think that was right?".
         [void](Start-WuuAuditTranscript -Session $auditSession)
         $auditHook = {
-            param([string]$ActionName, [string]$Reason, [scriptblock]$Body)
-            Invoke-WuuAuditedAction -Session $auditSession -Action $ActionName -Reason $Reason -Body $Body
+            param([string]$ActionName, [string]$Reason, [scriptblock]$Body, [string[]]$Targets = @())
+            # -Targets is forwarded when the caller supplies it (the guided workflow does, from the
+            # confirmed plan) and otherwise derived from the rows the store is tracking. Without
+            # this the record's targets were always empty for interactive changes while a scripted
+            # `wuu install -Computer SRV01` recorded 'SRV01' - so the trail could not answer "which
+            # hosts did this person change?" for exactly the changes a human authorised.
+            if (@($Targets).Count -eq 0) { $Targets = @(Get-WuuComputerRow -Store $stateStore | ForEach-Object { $_.Computer }) }
+            Invoke-WuuAuditedAction -Session $auditSession -Action $ActionName -Reason $Reason -Body $Body -Targets $Targets
         }.GetNewClosure()
 
         # Refusals are first-class events too (ISO 27001 A.8.15): a menu action cancelled at the

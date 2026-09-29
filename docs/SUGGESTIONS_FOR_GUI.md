@@ -234,6 +234,113 @@ the wrong-password branch, which today can only be exercised by a human typing).
 
 ---
 
+## S13 — `Wuu.Logging` carries a bug fix the GUI edition never received
+
+**Problem.** `src\Wuu.Logging.psm1` differs between the editions by **8 lines**, and the difference
+is a real fix, not cosmetic. The GUI version has:
+
+```powershell
+if (-not $LogLock) { $LogLock = New-Object System.Object }
+```
+
+PowerShell variable names are case-insensitive, so that assignment targets the function's **own
+`[object]$LogLock` parameter** — the same pattern that made the console shell unusable when a local
+named `$actions` overwrote a `[hashtable]$Actions` parameter and threw on type coercion. It happens
+to work today only because the types match. The CLI version assigns to a separate local
+(`$effectiveLock`), typed explicitly, so a future change to the parameter's type cannot turn it into
+a crash.
+
+**Suggestion.** Port the CLI version verbatim. It is 8 lines, behaviour-identical on the happy path,
+and removes a latent type-coercion crash on the logging path — which is the worst place for one,
+because logging is what you rely on when something else has already gone wrong.
+
+**Risk if adopted:** very low. It is the same function with one renamed local.
+
+**Why it matters beyond itself.** This is an instance of the general problem that neither repo
+detects: the shared core is a *copy*, and copies drift. See "Shared core" below.
+
+---
+
+## S14 — A WPF `MessageBox` inside a diagnostic destroys the diagnostic
+
+**Problem.** `$TestADConnection` (still present in the GUI edition at the time of writing) both
+assembles its results **and** displays them in a `[System.Windows.MessageBox]`. Two consequences:
+
+- The diagnostic is only reachable as a *side effect of running it*. Its output cannot be captured,
+  logged, tested, or piped.
+- In the CLI edition this call is fatal, because `PresentationFramework` is deliberately not loaded
+  there: the function throws `Unable to find type [System.Windows.MessageBox]` **on its last line**.
+  The operator gets a diagnostic that fails while reporting — and only ever sees it after AD access
+  has already failed, which is precisely when they need it. (Found 2026-09-29; fixed in CLI.)
+
+**Suggestion.** Separate *collecting* from *presenting*: have the test return its `$results` array
+and let each shell render it — `MessageBox` in the GUI, `Write-Host` in the console. That also makes
+the test itself unit-testable (assert on the array, not on a dialog).
+
+**Risk if adopted:** very low, and it is a prerequisite for the "one engine, two shells" property
+the editions already claim for every other operation.
+
+**Generalisation worth recording.** Any function that both computes and *displays* cannot be reused
+by the other shell. Grep for it: `[System.Windows.MessageBox]` appears **43 times** across
+`Wuu.Core.psm1`, `Wuu.Credentials.psm1` and `Wuu.WindowsUpdate.psm1`. Most are legitimate GUI
+feedback, but every one is a place where behaviour and presentation are fused.
+
+---
+
+## Shared core — what is already shared, and the drift risk
+
+Measured 2026-09-29 by hashing both trees. This is *already* a shared core, copied rather than
+extracted, and nothing in either repository detects when it drifts.
+
+### Byte-identical (do not diverge these casually)
+
+| File | Note |
+| --- | --- |
+| `src\Wuu.Remote.psm1` | DCOM CIM sessions, remote task execution, timeouts |
+| `src\Wuu.Network.psm1` | connectivity / performance probes |
+| `src\Wuu.Workers.psm1` | bounded runspace pool |
+| `src\Wuu.Models.psm1` | state factories, error suggestions |
+| `Scripts\Download-Patches.ps1` | **runs ON the target** |
+| `Scripts\Install-Patches.ps1` | **runs ON the target** |
+| `Scripts\Audit-WSUSUpdates.ps1` | **runs ON the target** |
+| `Scripts\Diagnostic-FindMissingUpdates.ps1` | diagnostic |
+| `Exempt.txt`, `Kill-WUU-Processes.ps1` | data / helper |
+
+Divergence in the three **target-side** scripts is the most dangerous kind: they execute on the
+remote machine as SYSTEM via a scheduled task, so an inconsistency between editions means two
+different patch behaviours across one estate — with the same audit trail claiming both are WUU2.
+
+### Legitimately different (shell-specific by design)
+
+| File | Nature of the difference |
+| --- | --- |
+| `src\Wuu.WindowsUpdate.psm1` | In **2 of 7** functions: `New-ComputerRunspace` (368 vs 468 lines) and `Start-UpdateCheckJob` (86 vs 87). Both differences are the presentation layer — the GUI injects `SafeUpdateListViewItemScript` + `$uiHash` + `Dispatcher.Invoke`, the CLI injects the state store. |
+| `src\Wuu.WindowsUpdate.psm1` *(other 5)* | `Start-PendingUpdateCheck`, `Test-PhaseCompletion`, `Get-NextAvailablePhase`, `Test-PhaseReady`, `Initialize-WuuWindowsUpdateContext` are **byte-identical**. |
+| `src\Wuu.Credentials.psm1` | XAML dialogs vs console prompts (403 vs 689 lines) |
+| `src\Wuu.Core.psm1` | 3,520 vs 4,717 lines — the GUI carries all the WPF event wiring and `MessageBox` feedback the console replaced |
+
+### CLI-only (by design — not candidates for sharing)
+
+`Wuu.Audit`, `Wuu.Command`, `Wuu.Console`, `Wuu.Navigate`, `Wuu.Session`, `Wuu.State`.
+
+### Suggestion: make drift *visible*
+
+There is no build system in either repo, so this does not need tooling — a test would do. Add a
+`tests\Test-SharedCore.ps1` to each repo that hashes the frozen list above against
+`..\WUU2\{file}` (or a checked-in manifest of expected hashes) and reports any file that has
+diverged, distinguishing "expected to differ" from "unexpectedly identical". Two properties make it
+worth the ~20 lines:
+
+- It turns "someone edited one copy" from an invisible event into a test failure.
+- It makes the frozen set explicit, so a future edit to `Download-Patches.ps1` is a deliberate
+  decision to diverge rather than an accident.
+
+`Wuu.Logging` (S13) is the proof this is needed: it diverged to carry a real bug fix, and nothing
+noticed for at least one release.
+
+
+---
+
 ## Not suggested
 
 - **Don't** try to unify the GUI and CLI shells behind one abstraction. The two editions share
@@ -253,10 +360,45 @@ the wrong-password branch, which today can only be exercised by a human typing).
 3. **S4 + S6** — small, consolidates duplicated error/timeout handling.
 4. **S12** — split password acquisition from the load path; unlocks testing the wrong-password
    branch.
-5. **S1** — the big one; do it module-by-module with `Test-StateStore.ps1`-style proof at each
+5. **S13** — port the `Wuu.Logging` fix (8 lines, removes a latent type-coercion crash on the
+   logging path). Do this early despite being last in the numbering — it is the cheapest item here.
+6. **S14** — split collection from presentation in `$TestADConnection`, and review the other 43
+   `MessageBox` sites for the ones that are genuinely *diagnostics* rather than feedback.
+7. **Shared-core drift test** — see "Shared core" above. This is not a refactor; it is a guard.
+8. **S1** — the big one; do it module-by-module with `Test-StateStore.ps1`-style proof at each
    step. Highest value (removes the deadlock class and the virtualized-row colour bug).
-6. **S3** — cleanup pass after S2 lands.
-7. **S7** — opportunistic.
+9. **S3** — cleanup pass after S2 lands.
+10. **S7** — opportunistic.
+
+### Already fixed in the CLI edition (2026-09-29) — no action needed in the GUI unless it has the same shape
+
+- **457 lines of dead GUI-era closures removed** from the CLI's `Wuu.Core.psm1`
+  (3977 → 3520). Twelve closures — `$eventAddFile` (187 lines), `$eventAssignPhase` (49),
+  `$eventCopyComputers` (44), `$eventInstallUpdates` (39), `$eventDownloadUpdates` (30),
+  `$eventCopyStatus` (26), `$eventPasteComputers` (23), `$eventGetUpdates` (22),
+  `$eventRestartComputer` (19), `$eventAddComputer` (10), `$eventActionMenu` (5),
+  `$ClearComputerList` (3). Every one read `$uiHash.Listview.SelectedItems` (which the console
+  never populates) or called `System.Windows.Clipboard` / an `InputBox` / an `OpenFileDialog`, and
+  none was invoked: the console's equivalents are the `$consoleActions.*` adapters, which call the
+  same payloads. **They are alive in the GUI edition** — there they are the real handlers — so this
+  is *not* a suggestion to delete them there. It is recorded because the CLI carried two apparent
+  implementations of every operation for a whole release, and editing the wrong one would have
+  looked correct while doing nothing.
+- **`System.Windows.MessageBox` removed from the CLI's phase-assignment error path** (it now prints
+  to the console), and `Show-ErrorDialog`/`Show-WarningDialog` converted from `MessageBox` to
+  console output.
+- **`Microsoft.VisualBasic` and `System.Windows.Forms` no longer loaded at CLI startup.** Neither
+  had a live caller, and `Add-Type -AssemblyName` *throws* on failure with the catch calling
+  `exit` — so an unused assembly was a hard startup failure waiting for a host without it.
+- **Validator gate added** for the GUI-only type forms (`[System.Windows.MessageBox]`,
+  `[System.Windows.Forms.*]`, `[Microsoft.VisualBasic.*]`, `OpenFileDialog`). The existing gate
+  watched assembly/type *names* (`PresentationFramework`, `XamlReader`) and so could not see the
+  fully-qualified `System.Windows.*` forms — which is how the AD-test defect got in.
+- **`tests\Test-CredentialTyping.ps1` repaired.** It parsed `WUU.ps1` for a function that moved to
+  `src\Wuu.Remote.psm1` during the module split, so it had been throwing `Invoke-CimWithTimeout not
+  found` and failing silently. Now 3/3 PASS.
+- **`tests\Test-HeadlessEngine.ps1` now also asserts `System.Windows.Forms` is not loaded**, so
+  removing it from the startup list is verified rather than assumed.
 
 ## Verification recipe for a mechanical pass (proven on the CLI edition)
 

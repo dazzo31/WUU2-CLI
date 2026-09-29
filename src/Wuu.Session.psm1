@@ -267,6 +267,342 @@ function Add-WuuComputerSetNames {
 
 #endregion Acquisition
 
+#region Prerequisites, pre-flight and operation plans (spec 7 / 11 / 12)
+
+function Test-WuuPrerequisite {
+    <#
+    .SYNOPSIS Decides whether one operation's prerequisites are met for one computer (spec 7).
+    .DESCRIPTION
+    Spec 7 requires pre-flight to evaluate "operation-specific prerequisites". This is the single
+    decision point for "may this operation run against this computer", expressed as PURE STATE -
+    no I/O, no console - so it can be tested by building a row and asserting the verdict.
+
+    The verdict is three-valued (Ok | Warning | Blocking) rather than a boolean, because those are
+    genuinely different things to an operator:
+      Warning  - a soft signal they may accept ("no update has been found yet")
+      Blocking - the operation cannot do anything useful ("install with nothing downloaded")
+    Collapsing both into $false is how a pre-flight list becomes noise that people learn to skip.
+
+    An unrecognised operation reports Blocking on purpose. Defaulting to Ok would mean a typo'd
+    operation name passes pre-flight with its prerequisites unchecked - the exact failure pre-flight
+    exists to prevent.
+    #>
+    param(
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][string]$Op
+    )
+
+    # A row already known to be offline can satisfy nothing, whatever the operation.
+    if ([string]$Row.State -eq 'Offline') {
+        return @{ State = 'Blocking'; Reason = 'offline' }
+    }
+
+    $available  = [int]$Row.Available
+    $downloaded = [int]$Row.Downloaded
+    $updStatus  = [string]$Row.UpdatesStatus
+
+    switch ($Op.ToLowerInvariant()) {
+        'check' {
+            if ($Row.Pending) { return @{ State = 'Warning'; Reason = 'a check is already queued' } }
+            return @{ State = 'Ok'; Reason = '' }
+        }
+        'review' {
+            if ($available -eq 0 -and $updStatus -ne 'Updates required') {
+                return @{ State = 'Warning'; Reason = 'no update search has found anything yet' }
+            }
+            return @{ State = 'Ok'; Reason = '' }
+        }
+        'download' {
+            if ($available -eq 0) { return @{ State = 'Warning'; Reason = 'no updates available to download' } }
+            if ($downloaded -ge $available) { return @{ State = 'Warning'; Reason = 'all available updates are already downloaded' } }
+            return @{ State = 'Ok'; Reason = '' }
+        }
+        'install' {
+            if ($downloaded -eq 0) { return @{ State = 'Blocking'; Reason = 'nothing downloaded to install' } }
+            return @{ State = 'Ok'; Reason = '' }
+        }
+        'restart' {
+            if (-not $Row.RebootRequired) { return @{ State = 'Warning'; Reason = 'no reboot is pending' } }
+            return @{ State = 'Ok'; Reason = '' }
+        }
+        # The service action operates on wuauserv itself, so it has no update-state precondition.
+        'service' { return @{ State = 'Ok'; Reason = '' } }
+        'deploy' {
+            if ([int]$Row.InstallErrors -gt 0) { return @{ State = 'Warning'; Reason = "$([int]$Row.InstallErrors) recorded install error(s)" } }
+            if ($available -gt 0 -and $available -eq $downloaded -and [string]$Row.State -eq 'Complete' -and -not $Row.RebootRequired) {
+                return @{ State = 'Warning'; Reason = 'already at the end of the update lifecycle' }
+            }
+            return @{ State = 'Ok'; Reason = '' }
+        }
+        default {
+            return @{ State = 'Blocking'; Reason = "unknown operation '$Op'" }
+        }
+    }
+}
+
+function Get-WuuOperationLabel {
+    <# Human label for an operation id - used by the plan, confirmation and results screens. #>
+    param([Parameter(Mandatory)][string]$Operation)
+    switch ($Operation.ToLowerInvariant()) {
+        'check'    { 'Check for updates' }
+        'review'   { 'Review available updates' }
+        'download' { 'Download updates' }
+        'install'  { 'Install updates' }
+        'restart'  { 'Restart computers' }
+        'service'  { 'Windows Update service action' }
+        'deploy'   { 'Full deployment' }
+        default    { $Operation }
+    }
+}
+
+function Test-WuuOperationRequiresReason {
+    <#
+    .SYNOPSIS Whether this operation needs a change reason before it may run (spec 12 / audit).
+    .DESCRIPTION
+    Must agree with the mutating flags in the flat menu and the command verb table, which are the
+    same set: download, install, restart, service. 'deploy' is a guided-only composite that runs
+    those same mutating steps, so it requires a reason too.
+    #>
+    param([Parameter(Mandatory)][string]$Operation)
+    return (@('download', 'install', 'restart', 'service', 'deploy') -contains $Operation.ToLowerInvariant())
+}
+
+function Get-WuuPreflightReport {
+    <#
+    .SYNOPSIS Evaluates reachability, credentials, WU service, OS, reboot and prerequisites (spec 7).
+    .DESCRIPTION
+    Spec 7: "Before any disruptive operation, evaluate reachability, credentials, Windows Update
+    service, OS compatibility, pending reboot, existing errors, phase configuration,
+    operation-specific prerequisites." This composes the LIVE probes rather than reimplementing
+    any of them:
+
+      reachability - the same Test-Connection check $RemoveOfflineComputer uses
+      credentials  - Invoke-CimWithTimeout, the codebase's bounded DCOM probe
+      WU service   - Invoke-ServiceWithTimeout -Action Check
+      OS / reboot  - the Win32_OperatingSystem and Microsoft.Update.SystemInfo queries the update
+                     engine already uses
+
+    WHY EVERY PROBE IS INJECTED. Two reasons, both structural rather than stylistic:
+      1. Spec 23 - session/presentation code sits ABOVE the engine and must not reach into it.
+         Injection is how Wuu.Navigate and Wuu.Session stay engine-free (the release validator
+         fails the build if this module calls an engine function directly).
+      2. It makes the whole report deterministic in a test. Without it, verifying "offline hosts
+         are reported offline and excluded from the availability count" would need a genuinely
+         unreachable host and a several-second ping timeout per assertion.
+
+    Probes are only run against computers that answered Ping. Probing credentials and services on
+    a host that is not there is a guaranteed multi-second timeout, so doing it anyway would make
+    pre-flight cost scale with the number of offline machines - the opposite of what an operator
+    wants to discover at 02:00.
+
+    Availability (how many computers would actually be targeted) is reported separately from the
+    row count, so spec 7's "Continue with N available computers" is a real N.
+    #>
+    param(
+        [Parameter(Mandatory)]$Set,
+        [Parameter(Mandatory)][string]$Operation,
+        [scriptblock]$PingProbe = $null,
+        [scriptblock]$CredentialProbe = $null,
+        [scriptblock]$ServiceProbe = $null,
+        [scriptblock]$OsProbe = $null,
+        [scriptblock]$RebootProbe = $null,
+        # Called between computers so the caller can drain queued work while pre-flight runs; the
+        # workflow loop cannot tick during a synchronous screen otherwise.
+        [scriptblock]$Tick = $null
+    )
+
+    $rows = @(Get-WuuComputerSetComputers -Set $Set)
+    $results = New-Object System.Collections.ArrayList
+    $problems = New-Object System.Collections.ArrayList
+    $reachable = 0; $credentialsValid = 0; $serviceOk = 0; $rebootPending = 0
+    $blocking = 0; $warnings = 0; $available = 0
+
+    foreach ($r in $rows) {
+        if ($Tick) { try { & $Tick } catch { } }
+
+        $verdict = Test-WuuPrerequisite -Row $r -Op $Operation
+        $prereqState = [string]$verdict.State
+        $problem = [string]$verdict.Reason
+
+        $row = [pscustomobject]@{
+            Computer       = $r.Computer
+            Phase          = $r.Phase
+            Reachable      = $false
+            ProbeState     = 'not tested'
+            Credentials    = 'not tested'
+            WuService      = 'not tested'
+            OS             = ''
+            PendingReboot  = $false
+            Prerequisite   = $prereqState
+            Problem        = $problem
+        }
+
+        # Reachability. No ping probe supplied means "cannot tell" - so attempt the rest rather
+        # than declaring every host offline.
+        $reachableKnown = $true
+        if ($PingProbe) {
+            try { $row.Reachable = [bool](& $PingProbe $r.Computer) } catch { $row.Reachable = $false }
+        } else {
+            $reachableKnown = $false
+        }
+
+        if ($row.Reachable) { $reachable++ }
+
+        if ($row.Reachable -or -not $reachableKnown) {
+            $row.ProbeState = 'probed'
+            if ($CredentialProbe) {
+                try { $row.Credentials = [string](& $CredentialProbe $r.Computer) } catch { $row.Credentials = 'failed' }
+            }
+            if ($row.Credentials -eq 'valid') { $credentialsValid++ }
+            if ($ServiceProbe) {
+                try { $row.WuService = [string](& $ServiceProbe $r.Computer) } catch { $row.WuService = 'unknown' }
+            }
+            if ($row.WuService -eq 'Running') { $serviceOk++ }
+            if ($OsProbe) {
+                try { $row.OS = [string](& $OsProbe $r.Computer) } catch { $row.OS = '' }
+            }
+            if ($RebootProbe) {
+                try { $row.PendingReboot = [bool](& $RebootProbe $r.Computer) } catch { $row.PendingReboot = $false }
+            }
+            if ($row.PendingReboot) { $rebootPending++ }
+        } else {
+            # Offline overrides the prerequisite verdict: nothing about this computer can be
+            # satisfied while it is unreachable, and saying "Ok" here would put an offline host
+            # into the "continue with N" count.
+            $row.ProbeState = 'skipped (offline)'
+            $row.Credentials = 'not tested (offline)'
+            $row.WuService = 'not tested (offline)'
+            $prereqState = 'Blocking'
+            $problem = 'offline'
+        }
+
+        $row.Prerequisite = $prereqState
+        $row.Problem = $problem
+        if ($prereqState -eq 'Blocking') { $blocking++ } elseif ($prereqState -eq 'Warning') { $warnings++ }
+        # A computer counts as available when it is reachable (or reachability is unknown) and
+        # nothing blocking stands in the way.
+        if ($prereqState -ne 'Blocking' -and ($row.Reachable -or -not $reachableKnown)) { $available++ }
+
+        if ($problem) { [void]$problems.Add(("{0}: {1}" -f $row.Computer, $problem)) }
+        [void]$results.Add($row)
+    }
+
+    [pscustomobject]@{
+        Operation        = $Operation
+        Label            = Get-WuuOperationLabel -Operation $Operation
+        Computers        = $rows.Count
+        Targets          = @($rows | ForEach-Object { $_.Computer })
+        Reachable        = $reachable
+        # ONLY meaningful when reachability was actually probed. Deriving it as
+        # (total - reachable) unconditionally reported EVERY computer as offline whenever no ping
+        # probe was supplied - which is precisely the "cannot tell" case, not a fleet of dead
+        # machines. Reporting 0 here keeps the number honest; the screen states separately that
+        # these checks were not performed.
+        Offline          = $(if ($PingProbe) { $rows.Count - $reachable } else { 0 })
+        CredentialsValid = $credentialsValid
+        ServiceOk        = $serviceOk
+        RebootPending    = $rebootPending
+        Blocking         = $blocking
+        Warnings         = $warnings
+        Available        = $available
+        Results          = $results.ToArray()
+        Problems         = $problems.ToArray()
+        ProbedOffline    = (-not $PingProbe)
+    }
+}
+
+function New-WuuOperationPlan {
+    <#
+    .SYNOPSIS The explicit execution plan shown before a mutating operation (spec 12).
+    .DESCRIPTION
+    Spec 12: "show the complete execution plan (computer count, update breakdown, expected reboots,
+    per-phase plan, change reason) and require explicit confirmation."
+
+    The lifecycle steps are stated, not implied, because that is the whole point of spec 10/11 -
+    the operator should not have to infer CHECK -> DOWNLOAD -> INSTALL -> REBOOT -> VERIFY from a
+    list of separate commands.
+
+    Targets default to the entire computer set. That is spec 6: "Operations operate against the
+    current computer set. Do not make users re-specify the same computers for every interactive
+    operation." A caller passes -Targets only for the retry-failed path, where the set is
+    deliberately narrowed to the computers that failed.
+    #>
+    param(
+        [Parameter(Mandatory)]$Set,
+        [Parameter(Mandatory)][string]$Operation,
+        [string]$Reason = '',
+        [AllowEmptyCollection()][string[]]$Targets = @(),
+        $Preflight = $null
+    )
+
+    $rows = @(Get-WuuComputerSetComputers -Set $Set)
+    # Both branches wrapped separately and assigned explicitly. An `if` expression whose branch
+    # emits a ONE-element array is unwrapped by the pipeline, so `$targetRows.Count` would throw
+    # under strict mode for a narrowed single-computer plan (the retry-failed path). This is the
+    # same unwrapping class that crashed manual entry on a single computer name.
+    $targetRows = @()
+    if (@($Targets).Count -gt 0) {
+        $targetRows = @($rows | Where-Object { $Targets -contains $_.Computer })
+    } else {
+        $targetRows = @($rows)
+    }
+
+    # Explicit rather than derived: 'install' really does re-check afterwards (the console
+    # adapter appends the check), and 'deploy' is the full spec-11 sequence.
+    $lifecycle = switch ($Operation.ToLowerInvariant()) {
+        'check'    { @('Check') }
+        'review'   { @('Review') }
+        'download' { @('Download') }
+        'install'  { @('Install', 'Re-check') }
+        'restart'  { @('Restart', 'Re-check') }
+        'service'  { @('Service action') }
+        'deploy'   { @('Check', 'Download', 'Install', 'Restart where required', 'Re-check', 'Verify') }
+        default    { @($Operation) }
+    }
+
+    $updatesToDownload = 0
+    $updatesToInstall = 0
+    $reboots = 0
+    foreach ($t in $targetRows) {
+        $updatesToDownload += [Math]::Max(0, [int]$t.Available - [int]$t.Downloaded)
+        $updatesToInstall += [Math]::Max(0, [int]$t.Downloaded)
+        if ($t.RebootRequired) { $reboots++ }
+    }
+
+    $perPhase = New-Object System.Collections.ArrayList
+    foreach ($p in 1..5) {
+        $inPhase = @($targetRows | Where-Object { [string]$_.Phase -eq "Phase $p" })
+        if ($inPhase.Count -eq 0) { continue }
+        [void]$perPhase.Add([pscustomobject]@{
+            Phase     = "Phase $p"
+            Computers = $inPhase.Count
+            Names     = @($inPhase | ForEach-Object { $_.Computer })
+        })
+    }
+
+    # When pre-flight ran, its availability figure is the honest one to show - the row count
+    # includes computers pre-flight just proved cannot be reached.
+    $available = $targetRows.Count
+    if ($Preflight) { $available = [int]$Preflight.Available }
+
+    [pscustomobject]@{
+        Operation         = $Operation
+        Label             = Get-WuuOperationLabel -Operation $Operation
+        Lifecycle         = $lifecycle
+        Targets           = @($targetRows | ForEach-Object { $_.Computer })
+        TargetCount       = $targetRows.Count
+        AvailableCount    = $available
+        UpdatesToDownload = $updatesToDownload
+        UpdatesToInstall  = $updatesToInstall
+        ExpectedReboots   = $reboots
+        PerPhase          = $perPhase.ToArray()
+        Reason            = $Reason
+        RequiresReason    = (Test-WuuOperationRequiresReason -Operation $Operation)
+    }
+}
+
+#endregion Prerequisites, pre-flight and operation plans
+
 Export-ModuleMember -Function @(
     'Test-WuuComputerName'
     'Split-WuuComputerNames'
@@ -276,4 +612,9 @@ Export-ModuleMember -Function @(
     'Get-WuuComputerSetPhases'
     'Get-WuuComputerSetSummary'
     'Add-WuuComputerSetNames'
+    'Test-WuuPrerequisite'
+    'Get-WuuOperationLabel'
+    'Test-WuuOperationRequiresReason'
+    'Get-WuuPreflightReport'
+    'New-WuuOperationPlan'
 )

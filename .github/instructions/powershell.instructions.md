@@ -2,32 +2,54 @@
 applyTo: "**/*.ps1, **/*.psm1, **/*.psd1"
 ---
 
-# PowerShell standards for WUU2
+# PowerShell standards for WUU2-CLI
 
-## Target runtime
-- Windows PowerShell 5.1, elevated, STA (`powershell.exe -STA`). Keep PowerShell 7 compatibility: `Get-CimInstance` not `Get-WmiObject`, `Invoke-Command` not `-ComputerName` remoting parameters, nested `Join-Path` not 3-arg form.
+Windows PowerShell 5.1 is the floor (7.x must also work). Keep PS7 compatibility: `Get-CimInstance`
+not `Get-WmiObject`, `Invoke-Command` not `-ComputerName` remoting parameters, 2-argument
+`Join-Path` not the 3-argument form, no `ForEach-Object -Parallel`.
 
 ## Naming and correctness
-- Variable names are case-insensitive: never define two variables differing only by case (`$removeEntry` vs `$RemoveEntry` silently overwrite each other — this caused a real runspace leak). Never use `$host`, `$pid`, or other automatic-variable names as locals.
+- Variable names are case-insensitive: never declare two that differ only by case, and never use
+  `$host`, `$pid`, `$error`, `$matches`, or another automatic variable as a local.
 - PascalCase approved Verb-Noun for functions; only real, documented cmdlets and parameters.
-- Single-quoted strings unless interpolating; here-strings for multi-line content (XAML); no unnecessary backticks.
+- Single-quoted strings unless interpolating; here-strings for multi-line text; no stray backticks.
 
-## Runspace and threading rules (critical in WUU.ps1)
-- UI updates from background runspaces MUST use `$uiHash.<Control>.Dispatcher.Invoke(...)`.
-- Scriptblocks injected into runspaces via `SessionStateProxy.SetVariable` MUST be unbound: `[scriptblock]::Create($sb.ToString())`. A literal `{...}` stays bound to the creating runspace and resolves variables there (usually `$null`).
-- Windows Update COM objects must stay in-process: never `Start-Job` (serialization strips COM methods). Use nested `[powershell]::Create()` + `BeginInvoke` polling for timeouts, and `Dispose()` on every path.
-- `PowerShell.Dispose()` does NOT close an explicitly assigned runspace — call `Runspace.Close()` + `Dispose()` yourself or the runspace leaks.
-- Snapshot synchronized collections before enumerating: `@($jobs)`.
+## Module and state boundaries
+- Modules are imported with `-Global` (see `Import-WuuModules`). A module imported without it is
+  invisible to the isolated worker runspaces, which is why cross-module helpers read `$global:*`.
+- Interactive input must go through `Read-WuuAnswer` / `Read-WuuYesNo` / `Read-WuuSelection`: they
+  honour non-interactive mode. A `Read-Host` call inside a screen cannot be driven by a test.
+- Presentation code (`Wuu.Navigate`, `Wuu.Session`) delegates to the action layer. Reaching into
+  the update engine from a screen forks the engine and bypasses the audit reason rule.
 
-## Windows Update Agent API
-- Valid search criteria only: `IsInstalled`, `IsHidden`, `IsAssigned`, `Type`, etc. `Title like '...'` throws 0x80240032. MSRT is invisible to all WUA searches (delivered outside the WUA store).
+## Runspaces, threading, and the update engine
+- Windows Update Agent COM objects are apartment-affine and cannot cross a process or runspace
+  boundary: never `Start-Job` for them (serialization strips the COM interfaces) and never route
+  them through the worker pool. WUA work stays in `New-ComputerRunspace`; the pool in
+  `Wuu.Workers.psm1` is for bounded WMI/CIM/service/ping/network probes only.
+- Bound remote work with `Invoke-CimWithTimeout` / `Invoke-ServiceWithTimeout` /
+  `Invoke-WithPoolTimeout` rather than hand-rolled waits.
+- Scriptblocks injected into a runspace via `SessionStateProxy.SetVariable` must be unbound:
+  `[scriptblock]::Create($sb.ToString())`. A literal `{...}` stays bound to the creating runspace.
+- `PowerShell.Dispose()` does not close an explicitly assigned runspace — call `Runspace.Close()`
+  and then `Dispose()`, or it leaks.
+- Snapshot a synchronized collection before enumerating it (`@($jobs)`), and write to the store
+  by mutating row properties plus `$stateStore.Touch()`.
 
-## Errors and output
-- `try`/`catch` only where handled or rethrown, referencing `$_.Exception.Message`; check `$LASTEXITCODE` after psexec/external tools.
-- Output objects, not formatted text; `Write-Host` only for user-facing status in standalone diagnostic scripts.
-- No hard-coded secrets; use `Get-Credential`, the existing credential-cache config, or parameters.
+## Output and loops
+- Prefer pipeline cmdlets (`Where-Object`, `Select-Object`, `ForEach-Object`) to manual loops, and
+  never grow an array with `+=` inside a loop — use `[System.Collections.ArrayList]`.
+- **Exception:** on any path that can execute while a caller is blocked on the console renderer,
+  use language constructs only (`foreach`/`if`). Pipeline cmdlets there have deadlocked this app.
+- Return collections plainly and wrap call sites in `@()`. Do not use `return ,$x` or
+  `Write-Output -NoEnumerate` — combined with a wrapping caller that yields a nested array.
+- Output objects, not formatted text; never parse `Format-*` output. `Write-Host` only for
+  operator-facing status.
 
-## Validation before release
-- Parse check: `[System.Management.Automation.Language.Parser]::ParseFile(...)` must report zero errors.
-- Run `Scripts\Validate-Release.ps1` (XAML load + FindName check for every control wired with `Add_*` in WUU.ps1).
-- Keep PSScriptAnalyzer clean (no unused variables).
+## Errors, diagnostics, secrets
+- `try`/`catch` only where handled or rethrown, referencing `$_.Exception.Message`; check
+  `$LASTEXITCODE` after external tools; use `Write-Verbose` for diagnostics.
+- No hard-coded secrets. Use `Get-Credential`, a parameter, or the existing encrypted
+  computer-list config / credential cache; expose paths and environment values as parameters.
+- Logging is fault-tolerant by design: a failure to log must not abort the operation — except on
+  mutating audit paths, which are deliberately fail-closed.

@@ -349,27 +349,49 @@ Key architectural constraint:
 | 4.3 AD acquisition | **implemented** | `Show-WuuAcquisitionScreen` → `EventAddAD` (handler existed but was unwired) |
 | 5 review screen | **implemented** | `Show-WuuComputerSetReviewScreen` |
 | 6 ComputerSet as first-class object | **implemented** | `New-WuuComputerSet` (`Wuu.Session.psm1`) |
-| 7 pre-flight | not yet | planned |
+| 7 pre-flight | **implemented** | `Show-WuuPreflightScreen` + `Get-WuuPreflightReport` + `Test-WuuPrerequisite` |
 | 8 dashboard | **implemented** | `Show-WuuDashboardScreen` |
 | 9 grouped navigation | **implemented** | `Get-WuuNavigationTree` |
-| 10–11 update lifecycle / full deployment | **implemented (grouping)** | Update management submenu |
-| 12 confirmation | not yet | planned |
-| 13 phases visible | **implemented** | Dashboard phase summary |
-| 14–15 execution / results screens | not yet | planned |
+| 10–11 update lifecycle / full deployment | **implemented** | `Get-WuuWorkflowSpec` + `Start-WuuDeploymentSequence` |
+| 12 confirmation | **implemented** | `Confirm-WuuMutation` + `New-WuuOperationPlan` |
+| 13 phases visible | **implemented** | Dashboard phase summary; per-phase plan in confirmation |
+| 14–15 execution / results screens | **implemented** | `Show-WuuExecutionScreen`, `Show-WuuResultsScreen` |
 | 16 computer details | not yet | planned |
-| 17–21 management / credentials / diagnostics / reports / saved sets | **implemented (navigation + delegation)** | grouped submenus delegate to existing handlers |
+| 17–21 management / credentials / diagnostics / reports / saved sets | **implemented (navigation + delegation)** | grouped submenus delegate to existing handlers; credentials and connectivity are also reachable *as pre-flight* (§18) |
 | 22 state model | **implemented** | `Wuu.Navigate.psm1` state machine |
 | 23–24 reuse engine / preserve automation | **enforced** | no engine change; verbs unchanged (regression-tested) |
-| 25 P0 | **mostly** | see gaps above; automation preserved and tested |
-| 26–27 acceptance tests | **27 covered**; 26 partial | `tests\Test-Navigation.ps1` |
+| 25 P0 | **complete** | all eleven P0 properties have an assertion in `tests\Test-Navigation.ps1` |
+| 26–27 acceptance tests | **27 covered**; 26 covered up to results/retry/export | `tests\Test-Navigation.ps1` |
 | 28–29 design rule / priority | adopted | — |
+
+### P0 coverage (spec 25), each with an assertion
+
+| P0 property | Assertion |
+| --- | --- |
+| acquisition is the first task | `Test-Navigation` §9 — an empty set starts at `ACQUIRE` |
+| manual entry | §8 — parses, reviews and commits, including the single-name case |
+| list import | §4 / §11 — reports added / duplicate / invalid; CSV column detection |
+| saved sets loadable | §6 — `EventLoadConfig` reachable from every relevant menu |
+| AD acquisition | §6 — `EventAddAD` resolves to a wired handler |
+| review before operations | §8 — review screen gates the dashboard |
+| operations grouped, not flat | §5 — ≤ 12 top-level entries, no mutating one among them |
+| pre-flight before disruptive operations | §13 — verdicts, availability, offline skipping |
+| explicit confirmation for mutating operations | §15 — decline, blank reason, reason recorded |
+| lifecycle visible as a workflow | §14 / §19 — the deploy spec is the full sequence |
+| phases visible | §4 — all five phases reported, including empty ones |
+| execution progress visible | §17 — state mapping covers every row state |
+| results summarised | §18 — successful / failed / offline / reboot required |
+| failures actionable | §18 — retry narrows to the failures; cause printed |
+| command-line automation still functional | §7 / §9 — verbs intact, mutating set unchanged |
 
 ### Deliberate deviations, and why
 
 - **The flat menu is retained as `Advanced (all operations)`.** Section 9 forbids exposing 25+
   operations *at the top level*, which is satisfied — but the flat list is still valuable for an
   operator who already knows WUU2, and removing it would reduce capability (contradicting §27's
-  spirit). It is one level down, under a clearly-labelled entry.
+  spirit). It is one level down, under a clearly-labelled entry. Its mutating entries route through
+  the same audit choke point; they ask for a reason at the point of dispatch, because the flat menu
+  has no confirmation screen of its own.
 - **AD acquisition routes to the pre-existing `EventAddAD` handler** rather than being reimplemented.
   That handler existed and worked but was **never wired into any menu or verb** — so the operation
   was unreachable despite appearing implemented. Wiring it is §23 (reuse the engine) rather than
@@ -377,3 +399,44 @@ Key architectural constraint:
 - **Named saved sets are not a new registry.** Per §21's own requirement to preserve existing
   encryption/security semantics, the saved set is the existing encrypted config file. Loading and
   saving route to `EventLoadConfig` / `EventSaveConfig`.
+- **Pre-flight probes are injected, not called in place.** §23 forbids presentation code reaching
+  into the engine, and a real ping timeout per host would make the property untestable in
+  reasonable time. `New-WuuPreflightContext` is the only place the live probes are named.
+- **Pre-flight runs per operation, not per workflow step.** A full deployment is confirmed once
+  (with the complete sequence and per-phase plan shown); re-probing the estate before each of the
+  six steps would multiply the cost while telling the operator nothing new within one run. Each
+  mutating step still collects its own change reason, so the audit trail explains each change
+  independently.
+- **`-Targets` travels to the handlers through a guided-target override on `Read-WuuSelection`**
+  rather than a new handler parameter. The handlers are shared verbatim with the command surface
+  (§23/§24); adding a parameter would either fork them or change the shape the verb table
+  dispatches into. An *empty* override means "target nothing" and is distinguished from "not
+  decided" by an explicit `$null` test — otherwise a retry with no failures would silently become
+  an all-computers run.
+
+### Defects found and fixed while implementing §7 / §12 (each was caught by an assertion, not by inspection)
+
+1. **`Get-WuuWorkflowSpec` had no `param` block**, so `$Name` was undefined and the function threw
+   the moment any workflow ran under `Set-StrictMode`. The test caught it; nothing else would have,
+   because an unused workflow is only reached from the deployment path.
+2. **Single-target plans threw.** `$targetRows = if (...) { @(...) } else { $rows }` unwraps a
+   one-element array to a scalar, so `.Count` threw for exactly the retry-failed case — the same
+   unwrapping class that once crashed manual entry on a single computer name.
+3. **"Cannot tell" was reported as "offline".** The offline count was derived unconditionally as
+   `(total - reachable)`, so with no ping probe every computer was reported down. Both the count
+   and the screen now state that reachability was not probed.
+4. **The interactive audit hook discarded its targets**, so a human-authorised change recorded no
+   targets while a scripted `wuu install -Computer SRV01` did — the trail could not answer "which
+   hosts did this person change?".
+5. **The guided handler passed the audit body positionally** into `-Reason`, which would have
+   written a record whose reason read `System.Management.Automation.PSDataCollection...`. It now
+   passes `-Reason` and `-Targets` by name.
+6. **The change reason was not consumed**, so the second step of a deployment silently inherited
+   the first step's justification.
+7. **A pre-flight refusal was recorded by the screen, not the gate** — so any other caller of the
+   confirmation gate produced an unrecorded refusal, which is the specific gap A.8.15 addresses.
+   The gate now records it.
+8. **`tests/Test-Navigation.ps1` reported `ALL PASS` after failures** because the summary read
+   `$failed` while the helper sets `$fail`. An undefined variable under no strict mode is falsy, so
+   the suite's verdict was independent of its own assertions. Every failure above was being printed
+   and then contradicted one line later.

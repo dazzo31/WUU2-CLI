@@ -1,22 +1,32 @@
-# WUU2 — Copilot instructions
+# WUU2-CLI — Copilot instructions
 
-GUI tool (Windows Update Utility) for checking/downloading/installing Windows Updates on remote machines. Pure PowerShell + WPF/XAML; no build system, no package manager, no test suite.
+**Windows Update Utility, console edition.** Remote Windows Update check/download/install/reboot
+across a fleet, with a hash-chained ISO 27001 A.8.15 audit trail. Pure PowerShell 5.1 — no build
+system, no package manager, no Pester. This is a **separate git repository** from the GUI edition
+(`..\WUU2`); do not mix them, and do not copy its XAML/WPF rules here.
 
-## Canonical files
-- [WUU.ps1](../WUU.ps1) is the ONLY main script to edit. `WUU_backup*.ps1`, `WUU_v1.1.ps1`, `WUU_debug.ps1`, `WUU_perplexity.ps1`, `WUU_git_version.ps1`, and `WUU_backup_*.xaml` are historical snapshots — never modify them and don't treat them as current behavior. `dist/` (including `dist/staging/`) is packaged output — never edit it and exclude it from searches when locating current code.
-- UI layout lives in `WUU.xaml` (main window) and `OUPicker.xaml`, loaded at runtime via `[Windows.Markup.XamlReader]::Load`. Controls are resolved with `FindName` — keep `x:Name` values in XAML and lookups in WUU.ps1 in sync.
+## Layout boundaries
+- `WUU.ps1` is the entry point only. All logic lives in `src\*.psm1` — add code to a module.
+- Modules load via `Import-WuuModules` (all `-Global`); the order is mostly for readability.
+  `Wuu.Navigate` (guided workflow) and `Wuu.Session` (ComputerSet) sit *above* the engine: they
+  delegate to the `$consoleActions` handlers in `Wuu.Core.psm1` and must never call the update
+  engine directly.
+- `dist\` (including `dist\staging\`) is packaged output — never edit it or search it.
+- `Wuu.Core.psm1` retains legacy closures (`$eventGetUpdates`, `$eventInstallUpdates`,
+  `$eventCopyComputers`, `$eventActionMenu`, …) that read `$uiHash.Listview.SelectedItems` — a
+  WPF path the console shell never populates. Console behaviour lives in the `$consoleActions.*`
+  adapters; extend those, not the `$event*` closures, and add no new WPF/`System.Windows.*` use.
 
-## Runtime constraints
-- Target Windows PowerShell 5.1, elevated, STA mode (`powershell.exe -STA`); the script self-checks `$host.Runspace.ApartmentState`. Preserve PowerShell 7 compatibility patterns already in place: `Get-CimInstance` instead of `Get-WmiObject`, `Invoke-Command` instead of `-ComputerName` remoting parameters.
-- Remote download/install runs `Scripts\Download-Patches.ps1` / `Install-Patches.ps1` on the target as a temporary SYSTEM scheduled task via `Invoke-WuuRemoteTask` (src/Wuu.Remote.psm1, DCOM CIM session; progress via `HKLM\SOFTWARE\WUU2\Jobs`), because Windows Update COM APIs refuse remote download/install. No PsExec. Worker runspaces get it as the injected `$InvokeRemoteTaskScript`.
+## Commands (elevated; `-STA` is required)
+- Release gate: `powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Validate-Release.ps1`
+- Suites: `tests\Test-*.ps1`, excluding `Test-ColumnResize.ps1` and `Test-DragResize.ps1`
+  (GUI leftovers; the latter hangs on a blocking dispatcher pump).
 
-## Concurrency conventions (critical)
-- UI state is shared through the synchronized hashtable `$uiHash`; background work uses runspaces plus the synchronized `$jobs` ArrayList, throttled by `$MaxConcurrentJobs`.
-- Any UI update from a background runspace MUST go through `$uiHash.<Control>.Dispatcher.Invoke(...)` — never touch WPF controls directly off the UI thread.
-- Script-scoped toggles (`$script:EnableDebugLogging`, `$script:EnableEnhancedErrorHandling`, credential config) live in the `#region Configuration` block at the top of WUU.ps1; add new global settings there.
-
-## Verification & packaging
-- Smoke test: `powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WUU.ps1` (needs admin for full function).
-- Before releasing: `powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File Scripts\Validate-Release.ps1` (XAML load + control/event-wiring checks).
-- Package a release zip with `Scripts\Package-WUU2.ps1` — when adding new runtime files, also add them to its `$include` list.
-- Keep the script clean under PSScriptAnalyzer (past fixes removed unused variables).
+## Constraints that have broken this project before
+- PowerShell 5.1 is the floor: no `ForEach-Object -Parallel`, no 3-argument `Join-Path`.
+- Shipped files containing non-ASCII must keep a UTF-8 BOM — `files.encoding` is `utf8` for this
+  reason. A BOM-less file is read as ANSI by 5.1 and a multi-byte character eats a quote.
+- Interactive input goes through `Read-WuuAnswer` / `Read-WuuYesNo` / `Read-WuuSelection` only.
+  A screen that calls `Read-Host` cannot be tested and hangs scripted runs.
+- Mutating operations carry `Mutating = $true` and run through the audit choke point, which
+  requires a reason. Keep those flags accurate — a wrong flag silently skips the audit rule.
