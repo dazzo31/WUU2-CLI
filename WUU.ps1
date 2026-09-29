@@ -24,7 +24,15 @@ Requires an elevated PowerShell host:
     powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WUU.ps1 check -All
 (-STA is retained for compatibility with the update COM APIs and the per-computer runspaces.)
 
-Exit codes: 0 = success, 1 = the command failed (command mode only).
+Exit codes (command mode; see `WUU.ps1 -Help` and src\Wuu.Command.psm1 Get-WuuExitCode):
+    0 success - the operation COMPLETED     4 partial success (reserved)
+    1 operation failed                      5 audit failure (chain broken / unwritable)
+    2 usage error                           6 queued (-Async: accepted, NOT completed)
+    3 timeout - still working               7 refused (e.g. a mutating verb without -Reason)
+
+Note 6: `-Async` means "queue it and give me my prompt back". Without -Async, a command that
+returns while work is still running exits 3, never 0 - a script must not read "accepted" as
+"done".
 
 TIP - create a `wuu.cmd` shim on PATH to avoid typing the host:
     @echo off

@@ -3469,7 +3469,7 @@ try {
                 -Set $(if ($parsed.Options['Set']) { [int]$parsed.Options['Set'] } else { 0 }) `
                 -ServiceAction $(if ($parsed.Verb -eq 'service') { [string]$parsed.SubVerb } else { '' }) `
                 -SubVerb $parsed.SubVerb -Reason $parsed.Options['Reason'] `
-                -Json:$parsed.Options['Json'] -WhatIf:$parsed.Options['WhatIf']
+                -Json:$parsed.Options['Json'] -WhatIf:$parsed.Options['WhatIf'] -Async:$parsed.Options['Async']
 
             # Give queued background work a bounded chance to run, then report state. A one-shot
             # command must not return before the operation it started has had an opportunity to
@@ -3480,22 +3480,65 @@ try {
                 Start-Sleep -Milliseconds 250
             }
 
+            # SS10: what was ACCEPTED is not what COMPLETED. The loop above is a bounded wait, so
+            # "returned from Invoke-WuuCommand" only proves the work was queued. Classify by the
+            # STORE (does any requested row still have work outstanding?) rather than by whether
+            # the call returned a result object, then add what this loop measured (the timeout).
+            # Selection mirrors the handlers: 'all' or empty means every row, otherwise the names.
+            $sel = @($parsed.Options['Computer'] -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $targetRows = @(Get-WuuComputerRow -Store $stateStore | Where-Object {
+                $sel.Count -eq 0 -or ($sel -contains 'all') -or ($sel -contains $_.Computer)
+            })
+            $outstanding = @($targetRows | Where-Object { ($_.OpState -eq 'Running') -or [bool]$_.Pending })
+            $busy = $outstanding.Count -gt 0
+
+            # The classification decides the code. Each condition is distinct: a timeout is not a
+            # usage error, an audit-integrity failure is not an operation failure, and queued work
+            # is not success unless the caller asked for it with -Async.
+            $exitCode = 0
+            if ($busy -and -not $parsed.Options['Async']) {
+                $exitCode = Get-WuuExitCode -Result 'Timeout'
+            } elseif ($parsed.Options['Async'] -and $busy) {
+                $exitCode = Get-WuuExitCode -Result 'Queued'
+            } elseif (-not $result.Ok) {
+                if ($result.PSObject.Properties['Result'] -and $result.Result) {
+                    $exitCode = Get-WuuExitCode -Result $result.Result
+                } else {
+                    $exitCode = Get-WuuExitCode -Result 'OperationFailed'
+                }
+            } elseif ($busy) {
+                # -Async was requested and the work was finished inside the window, so the wait
+                # merely observed a completion. That is a success, not a queue notification.
+                $exitCode = Get-WuuExitCode -Result 'Success'
+            }
+
             if ($parsed.Options['Json']) {
                 $snapshot = @(Get-WuuComputerRow -Store $stateStore | ForEach-Object {
                     [pscustomobject]@{
                         Computer = $_.Computer; Phase = $_.Phase; State = $_.State
                         UpdatesStatus = $_.UpdatesStatus; Available = $_.Available
                         Downloaded = $_.Downloaded; RebootRequired = $_.RebootRequired
-                        Status = $_.Status
+                        Status = $_.Status; OpState = $_.OpState; Pending = [bool]$_.Pending
                     }
                 })
-                [pscustomobject]@{ Command = $parsed.Verb; Ok = $result.Ok; Computers = $snapshot } | ConvertTo-Json -Depth 5
+                [pscustomobject]@{
+                    Command = $parsed.Verb; Ok = $result.Ok; ExitCode = $exitCode
+                    Completed = -not $busy; Outstanding = $outstanding.Count
+                    Computers = $snapshot
+                } | ConvertTo-Json -Depth 5
             } else {
                 Write-WuuStatusTable -Store $stateStore
                 Write-WuuStatusLine -Store $stateStore
+                if ($busy -and -not $parsed.Options['Async']) {
+                    Write-Host ("  Timed out after {0}s with {1} computer(s) still working; the queued" -f $CommandWaitSeconds, $outstanding.Count) -ForegroundColor Yellow
+                    Write-Host '  work continues in this process, but this run has NOT confirmed it finished.' -ForegroundColor Yellow
+                } elseif ($parsed.Options['Async'] -and $busy) {
+                    Write-Host ("  Queued on {0} computer(s) - not waiting (-Async). Exit code 6 means" -f $outstanding.Count) -ForegroundColor Yellow
+                    Write-Host '  "accepted", NOT "succeeded".' -ForegroundColor Yellow
+                }
             }
 
-            if (-not $result.Ok) { $script:CommandExitCode = 1 }
+            $script:CommandExitCode = $exitCode
         }
     }
     else {

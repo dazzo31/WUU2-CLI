@@ -76,13 +76,13 @@ function Invoke-WuuAuditCommand {
             Sort-Object LastWriteTime -Descending)
         if ($candidates.Count -eq 0) {
             Write-Host ("  No audit log found in {0}." -f $dir) -ForegroundColor Yellow
-            return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = 'no audit log' }
+            return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = 'no audit log'; Result = 'AuditFailure' }
         }
         $resolvedLog = $candidates[0].FullName
     }
     if (-not (Test-Path -LiteralPath $resolvedLog)) {
         Write-Host ("  Audit log not found: {0}" -f $resolvedLog) -ForegroundColor Red
-        return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = "audit log not found: $resolvedLog" }
+        return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = "audit log not found: $resolvedLog"; Result = 'AuditFailure' }
     }
 
     switch ($SubVerb) {
@@ -97,9 +97,12 @@ function Invoke-WuuAuditCommand {
                 Write-Host ("  CHAIN BROKEN at line {0} of {1}:" -f $v.FirstBreak, $v.Checked) -ForegroundColor Red
                 foreach ($p in $v.Problems) { Write-Host "    $p" -ForegroundColor Red }
             }
-            # Non-zero exit on a broken chain so a pipeline can gate on it.
-            if (-not $v.Ok) { $script:CommandExitCode = 1 }
-            return [pscustomobject]@{ Ok = $v.Ok; Verb = 'audit'; SubVerb = $SubVerb; Checked = $v.Checked; FirstBreak = $v.FirstBreak }
+            # A broken chain is an audit-integrity failure, not an operation failure (SS10): it has
+            # its own exit code so CI can tell "the trail is tampered with" from "the work failed".
+            # The old code set $script:CommandExitCode here, which is THIS module's script scope -
+            # not the caller's - so the value never reached the exit path. Classification travels on
+            # the result object instead, which crosses the scope boundary correctly.
+            return [pscustomobject]@{ Ok = $v.Ok; Verb = 'audit'; SubVerb = $SubVerb; Checked = $v.Checked; FirstBreak = $v.FirstBreak; Result = $(if ($v.Ok) { 'Success' } else { 'AuditFailure' }) }
         }
         'show' {
             $recs = @(Get-Content -LiteralPath $resolvedLog | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
@@ -114,7 +117,7 @@ function Invoke-WuuAuditCommand {
                     Write-Host ($fmt -f $r.seq, $r.timestampUtc, $r.action, $r.result, (($r.targets) -join ','), $r.reason)
                 }
             }
-            return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Count = $recs.Count }
+            return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Count = $recs.Count; Result = 'Success' }
         }
         'export' {
             # Bundle the log (and the matching transcript, if present) into one file for a
@@ -158,14 +161,80 @@ function Invoke-WuuAuditCommand {
             } catch {
                 Write-Host ("  Export verification FAILED: {0}" -f $_.Exception.Message) -ForegroundColor Red
                 Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
-                return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = "export bundle unreadable: $($_.Exception.Message)" }
+                return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = "export bundle unreadable: $($_.Exception.Message)"; Result = 'AuditFailure' }
             }
             Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host ("  Exported audit bundle: {0} ({1} entries)" -f $outPath, $entryCount) -ForegroundColor Green
             Write-Host '  NOTE: the bundle carries the hash chain but NO external anchor, so it is' -ForegroundColor DarkGray
             Write-Host '        tamper-EVIDENT, not non-repudiable. See docs/ISO_27001_A815_MAPPING.md 8.' -ForegroundColor DarkGray
-            return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Path = $outPath; Entries = $entryCount }
+            return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Path = $outPath; Entries = $entryCount; Result = 'Success' }
         }
+    }
+}
+
+function Get-WuuExitCode {
+    <#
+    .SYNOPSIS The exit-code contract for the command surface (hardening brief SS10).
+    .DESCRIPTION
+    One vocabulary, in one place, so a script can gate on a documented number rather than on the
+    folklore that "non-zero means something went wrong". Before this, only 0 and 1 existed and 1
+    conflated five different situations.
+
+        0  Success         the requested operation actually completed successfully
+        1  OperationFailed one or more targets failed
+        2  UsageError      unknown verb, missing argument, invalid input
+        3  Timeout         the wait elapsed with work still outstanding
+        4  PartialSuccess  (reserved; not currently produced - see the note below)
+        5  AuditFailure    the audit chain failed to verify, or a fail-closed audit write failed
+        6  Queued          -Async was requested and the work was ACCEPTED, not completed
+        7  Refused         refused before running: missing -Reason, or a pre-flight/confirmation refusal
+
+    WHY 6 EXISTS. `wuu install` used to return as soon as the work had been QUEUED (it waits a bounded
+    period and then reports), so a script saw "success" for an install that had not happened. Returning
+    a distinct code keeps the async behaviour useful without letting it masquerade as completion.
+
+    WHY 4 IS NOT PRODUCED. With `-Computer A,B` the selection is resolved by ONE shared answer, so
+    "A worked and B failed" is not observable per target from here - the payload updates rows, not a
+    result set. The code is reserved so the number is not later assigned a different meaning, and the
+    honest answer today is 1 (the operation did not succeed for everything requested). Producing a real
+    4 would need per-target completion results, which is a larger change than an exit-code pass.
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Success', 'OperationFailed', 'UsageError', 'Timeout', 'PartialSuccess', 'AuditFailure', 'Queued', 'Refused')]
+        [string]$Result = 'Success'
+    )
+    switch ($Result) {
+        'Success' { 0 }
+        'OperationFailed' { 1 }
+        'UsageError' { 2 }
+        'Timeout' { 3 }
+        'PartialSuccess' { 4 }
+        'AuditFailure' { 5 }
+        'Queued' { 6 }
+        'Refused' { 7 }
+        default { 1 }
+    }
+}
+
+function Get-WuuExitCodeMeaning {
+    <#
+    .SYNOPSIS Human-readable meaning of an exit code and the action it suggests.
+    .DESCRIPTION
+    Kept next to the numbers so the two cannot drift, and so a failure can print WHY it exited
+    non-zero rather than leaving the operator to look it up.
+    #>
+    param([Parameter(Mandatory)][int]$Code)
+    switch ($Code) {
+        0 { 'success - the operation completed' }
+        1 { 'operation failed - one or more targets did not succeed' }
+        2 { 'usage error - check the verb and its arguments (wuu -Help)' }
+        3 { 'timeout - the wait elapsed with work still outstanding' }
+        4 { 'partial success' }
+        5 { 'audit failure - the audit trail could not be trusted or written' }
+        6 { 'queued - the work was accepted, not completed (-Async)' }
+        7 { 'refused - the operation was declined before it ran (often a missing -Reason)' }
+        default { "unknown exit code $Code" }
     }
 }
 
@@ -306,7 +375,14 @@ function Get-WuuCommandHelp {
     Write-Host '    -LogPath <file>     audit verify|show|export: the audit log to read (unambiguous)'
     Write-Host '    -Json               machine-readable output (read verbs)'
     Write-Host '    -WhatIf             report what would happen; change nothing'
+    Write-Host '    -Async              queue the work and return (exit 6 = accepted, NOT completed)'
     Write-Host '    -Help               this help, or per-verb help with a verb'
+    Write-Host ''
+    Write-Host '  EXIT CODES' -ForegroundColor Cyan
+    Write-Host '    0 success (completed)      4 partial success (reserved, not yet produced)'
+    Write-Host '    1 operation failed         5 audit failure (chain broken / unwritable)'
+    Write-Host '    2 usage error              6 queued (-Async; accepted, not completed)'
+    Write-Host '    3 timeout (still working)  7 refused (e.g. missing -Reason)'
     Write-Host ''
     Write-Host '  AUDIT TRAIL' -ForegroundColor Cyan
     Write-Host '    wuu audit verify                  check the hash chain; non-zero exit if broken'
@@ -352,14 +428,17 @@ function Invoke-WuuCommand {
         [string]$Reason = '',
         [switch]$Json,
         [switch]$WhatIf,
+        # Declare that queued-and-returned is the DESIRED outcome (SS10). Without it, a command that
+        # finished its bounded wait with work still outstanding is reported as a timeout, because a
+        # script must never read "success" for an install that has not run.
+        [switch]$Async,
         # Selects the pre-redesign flat interactive menu. Consumed by the caller; kept out of the
         # unknown-option report so `wuu --flat-menu` is not mistaken for a typo.
         [switch]$FlatMenu
     )
-
     $table = Get-WuuCommandTable
     if (-not $table.ContainsKey($Verb)) {
-        return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = "Unknown verb '$Verb'. Run 'wuu -Help'." }
+        return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = "Unknown verb '$Verb'. Run 'wuu -Help'."; Result = 'UsageError' }
     }
     $entry = $table[$Verb]
 
@@ -374,14 +453,14 @@ function Invoke-WuuCommand {
             'phases'    = 'EventShowByPhase'
         }
         if (-not $SubVerb -or -not $map.ContainsKey($SubVerb)) {
-            return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = "wuu show needs one of: $($map.Keys -join ', ')" }
+            return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = "wuu show needs one of: $($map.Keys -join ', ')"; Result = 'UsageError' }
         }
         $actionName = $map[$SubVerb]
     }
     elseif ($Verb -eq 'config') {
         if ($SubVerb -eq 'save') { $actionName = 'EventSaveConfig' }
         elseif ($SubVerb -eq 'load') { $actionName = 'EventLoadConfig' }
-        else { return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu config needs save or load' } }
+        else { return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu config needs save or load'; Result = 'UsageError' } }
     }
     elseif ($Verb -eq 'audit') {
         # 'wsus' audits a TARGET's WSUS state. verify/show/export inspect the LOCAL audit
@@ -391,12 +470,12 @@ function Invoke-WuuCommand {
             return Invoke-WuuAuditCommand -SubVerb $SubVerb -Path $Path -LogPath $LogPath -Json:$Json
         }
         if ($SubVerb -ne 'wsus') {
-            return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu audit needs one of: wsus, verify, show, export' }
+            return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu audit needs one of: wsus, verify, show, export'; Result = 'UsageError' }
         }
     }
 
     if (-not $actionName -or -not $Actions.ContainsKey($actionName)) {
-        return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = "Action '$actionName' is not registered." }
+        return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = "Action '$actionName' is not registered."; Result = 'UsageError' }
     }
 
     # -WhatIf: report intent, change nothing. Deliberately BEFORE any handler call.
@@ -437,9 +516,13 @@ function Invoke-WuuCommand {
                 -Targets $(if ($All) { @('all') } elseif ($Computer) { @($Computer) } else { @() }) `
                 -Parameters @{ computer = $p.Computer; serviceAction = $p.ServiceAction; set = $p.Set } | Out-Null
         } catch {
-            Write-WarningLog ("Could not record denial for '{0}': {1}" -f $Verb, $_.Exception.Message)
+            # Best-effort BY DESIGN: the operation is already blocked, so failing to RECORD the
+            # denial must never replace a clean refusal with an exception. The nested try is not
+            # paranoia - when only this module is loaded (tests, tooling) the logger itself is
+            # absent, and that turned a correct refusal into an unhandled CommandNotFound.
+            try { Write-WarningLog ("Could not record denial for '{0}': {1}" -f $Verb, $_.Exception.Message) } catch { }
         }
-        return [pscustomobject]@{ Ok = $false; Verb = $Verb; Action = $actionName; Error = $msg; NeedsReason = $true }
+        return [pscustomobject]@{ Ok = $false; Verb = $Verb; Action = $actionName; Error = $msg; NeedsReason = $true; Result = 'Refused' }
     }
 
     $prev = Get-WuuInputMode
@@ -461,9 +544,12 @@ function Invoke-WuuCommand {
                 -Reason $Reason -Body { & $Actions[$actionName] }
             $sw.Stop()
             if (-not $audited.Ok) {
-                return [pscustomobject]@{ Ok = $false; Verb = $Verb; Action = $actionName; Error = $audited.Error; CorrelationId = $audited.CorrelationId }
+                # The audited choke point only fails when the record could not be written, which is a
+                # DIFFERENT failure from the operation failing - hence its own code (SS10).
+                $isAuditFailure = $audited.Error -match 'audit'
+                return [pscustomobject]@{ Ok = $false; Verb = $Verb; Action = $actionName; Error = $audited.Error; CorrelationId = $audited.CorrelationId; Result = $(if ($isAuditFailure) { 'AuditFailure' } else { 'OperationFailed' }) }
             }
-            return [pscustomobject]@{ Ok = $true; Verb = $Verb; Action = $actionName; CorrelationId = $audited.CorrelationId; Audited = $true }
+            return [pscustomobject]@{ Ok = $true; Verb = $Verb; Action = $actionName; CorrelationId = $audited.CorrelationId; Audited = $true; Result = 'Success' }
         }
         # READ-ONLY verbs are audited too, but on the opposite footing from mutations: the record
         # is best-effort and NEVER blocks the operation. ISO 27001 A.8.15 covers access to
@@ -481,11 +567,11 @@ function Invoke-WuuCommand {
         # Logged, not Audited: 'Audited' means "went through the mutating choke point (intent +
         # outcome, fail-closed)". A read takes the best-effort path, so it reports a distinct
         # flag - conflating the two would make 'Audited' meaningless for callers.
-        return [pscustomobject]@{ Ok = $true; Verb = $Verb; Action = $actionName; Logged = $true }
+        return [pscustomobject]@{ Ok = $true; Verb = $Verb; Action = $actionName; Logged = $true; Result = 'Success' }
     } catch {
         Write-ErrorLog "Command '$Verb' failed: $($_.Exception.Message)"
         Write-Host ("  Command failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
-        return [pscustomobject]@{ Ok = $false; Verb = $Verb; Action = $actionName; Error = $_.Exception.Message }
+        return [pscustomobject]@{ Ok = $false; Verb = $Verb; Action = $actionName; Error = $_.Exception.Message; Result = 'OperationFailed' }
     } finally {
         # Always restore interactive input, even on failure.
         Initialize-WuuInputMode -NonInteractive:$prev.NonInteractive
@@ -507,6 +593,10 @@ function ConvertTo-WuuCommandLine {
         '-computer' = 'Computer'; '-all' = 'All'; '-json' = 'Json'; '-whatif' = 'WhatIf'
         '-path' = 'Path'; '-column' = 'Column'; '-set' = 'Set'; '-help' = 'Help'
         '-reason' = 'Reason'; '-logpath' = 'LogPath'
+        # Declare "queue and return" as the DESIRED outcome (SS10). Without it, a command whose
+        # bounded wait expires with work still outstanding exits 3 (timeout) instead of 0, because
+        # success must mean completed, not accepted.
+        '-async' = 'Async'
         # Interactive-mode switch, consumed by Start-WuuApplication (not a verb option).
         '--flat-menu' = 'FlatMenu'
     }
@@ -551,6 +641,8 @@ function ConvertTo-WuuCommandLine {
 Export-ModuleMember -Function @(
     'Get-WuuCommandTable'
     'Get-WuuCommandHelp'
+    'Get-WuuExitCode'
+    'Get-WuuExitCodeMeaning'
     'Invoke-WuuCommand'
     'ConvertTo-WuuCommandLine'
     # Exported because the guided UI's Reports/audit category (spec 20) invokes the audit verbs

@@ -112,7 +112,7 @@ from evidence rather than the brief's assumptions.
 | §7 reboot detection | **DONE** | The reboot wait was `While(Test-Connection ...)` - see below. Reboot STATE was already read correctly (`Microsoft.Update.SystemInfo.RebootRequired`); it was the online/offline TRANSITION that was ICMP-driven. |
 | §8 workflow state vs display state | **PARTIAL** | `State` has a `ValidateSet`, and `OpState` now separates operation state from display state. But `Test-PhaseCompletion` still uses `UpdatesStatus` (a display string) as its predicate. |
 | §9 phase failure policy | **DONE** | Explicit policy on the store: `PhaseFailurePolicy` = `BlockOnFailure` (DEFAULT) / `ContinueOnTimeout` / `ContinueOnFailure`, decided by the pure `Test-WuuPhaseFailureBlocks`. The old behaviour `continue`d past failed/timed-out rows, i.e. ContinueOnFailure was hard-coded and unreported. See "Phase failure policy" below. |
-| §10 exit codes | **OPEN** | Only `0` and `1` exist. Also `Invoke-WuuCommand` returns once work is *queued*, so a scripted `wuu install` can exit 0 without the install completing. |
+| §10 exit codes | **DONE** | Eight documented codes; `-Async` distinguishes *accepted* from *completed*, so a command that returns with work outstanding exits 3 instead of 0. A dead `$script:CommandExitCode` write in the wrong module scope (which made `audit verify` exit 0 on a **broken chain**) was removed. See "§10 — exit codes" below. |
 | §11 WhatIf | **PARTIAL** | Non-destructive and audited already; reports the planned operation but not the per-computer update breakdown. |
 | §12 inventory vs connectivity | **DONE** | `$RemoveOfflineComputer` deleted the row on a single failed `Test-Connection`. Now classified by `Update-WuuConnectivityState` (testable) with a consecutive-failure threshold. See below. |
 | §13 audit integrity | **PARTIAL** | The limitation *is* already documented accurately. No external anchor exists. |
@@ -332,3 +332,114 @@ reaches `New-CimSession`. That is strictly stronger than the dynamic check and t
 
 The gate script (`C:\Temp\wuu-gate.ps1`, dev-only) now applies a **per-suite timeout and kills
 stragglers**, so one hang cannot stall a full run again.
+
+---
+
+## §10 — exit codes (done)
+
+### The defect
+
+Two things were wrong, and only the first was obvious:
+
+1. **Only `0` and `1` existed.** Five different situations — usage error, operation failure, timeout,
+   refusal, audit-integrity failure — all collapsed into `1`, so a script could not tell "you typed
+   the verb wrong" from "the change was refused by policy" from "the audit trail is tampered with".
+2. **`0` did not mean "completed".** `Invoke-WuuCommand` returns after a *bounded wait*
+   (`$CommandWaitSeconds`), so `wuu install -Computer SRV01` could exit `0` while the install was
+   merely **queued**. Every CI job that gated on that exit code was reading "accepted" as "done" —
+   silently, which is the worst way for that to be wrong.
+
+There was also a third, independent bug found while wiring this up:
+
+3. `Invoke-WuuAuditCommand` set `$script:CommandExitCode = 1` on a broken hash chain. That is
+   *Wuu.Command.psm1*'s script scope — **not the caller's** — so the assignment was discarded and
+   `wuu audit verify` exited `0` on a broken chain. A gate that always passes is worse than no gate,
+   because it is trusted.
+
+### The contract
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| 0 | Success | the requested operation **completed** successfully |
+| 1 | OperationFailed | one or more targets failed |
+| 2 | UsageError | unknown verb, missing argument, invalid input |
+| 3 | Timeout | the wait elapsed with work still outstanding |
+| 4 | PartialSuccess | *reserved — not currently produced, see below* |
+| 5 | AuditFailure | the audit chain failed to verify, or a fail-closed audit write failed |
+| 6 | Queued | `-Async` was requested and the work was **accepted**, not completed |
+| 7 | Refused | declined before running: missing `-Reason`, or a pre-flight/confirmation refusal |
+
+`Get-WuuExitCode` (with a `ValidateSet`) maps names to numbers and `Get-WuuExitCodeMeaning` maps them
+back to prose. They live together so the two cannot drift, and help documents both.
+
+**Why 4 is reserved rather than produced.** With `-Computer A,B` the selection is resolved by *one*
+shared answer, so "A worked and B failed" is not observable per target from here — the payload
+updates rows, not a result set. Producing a genuine `4` needs per-target completion results, which is
+a larger change than an exit-code pass. The number is reserved so it is never later assigned a
+different meaning, and the honest answer today is `1`. This is noted in the code, not just here.
+
+### How the classification is derived
+
+`Invoke-WuuCommand` now returns a `Result` name (not merely `Ok`), so the caller maps outcome → code
+without re-deriving anything:
+
+* unknown verb / bad subverb / unregistered action → `UsageError`
+* mutating verb without `-Reason` → `Refused` (the refusal path, which does not run the handler)
+* fail-closed audit write failure → `AuditFailure`
+* handler threw → `OperationFailed`
+* `audit verify` on a broken chain → `AuditFailure`
+
+Then Core decides completion **from the store**, not from the fact that a call returned:
+
+```powershell
+$outstanding = @($targetRows | Where-Object { ($_.OpState -eq 'Running') -or [bool]$_.Pending })
+```
+
+* outstanding **and** no `-Async` → `Timeout` (3)
+* outstanding **and** `-Async` → `Queued` (6)
+* otherwise → the result's own classification (falling back to `OperationFailed`)
+
+Two properties are load-bearing and are enforced by validator gate **(aa)**:
+
+* **the timeout branch is evaluated first.** If `-not $result.Ok` were tested first, a command that
+  reported `Ok` but left work running would be classified by the result object alone — i.e. success.
+* **the code is assigned unconditionally** (`$script:CommandExitCode = $exitCode`), so a success
+  *clears* an earlier value instead of leaving a stale non-zero code behind.
+
+### `-Async`
+
+`-Async` makes "queue it and give me my prompt back" an explicit request, which is what lets the
+default be strict. It is parsed in `ConvertTo-WuuCommandLine`, forwarded by Core, and documented in
+`-Help`. A script that wants fire-and-forget says so and gets `6`; a script that does not say so gets
+`3` rather than a false `0`.
+
+### Verification
+
+* `tests\Test-CommandExitCodes.ps1` — 33 assertions. It checks the vocabulary against the *real*
+  function (a test that re-listed the numbers would pass forever while the function drifted), that
+  all eight codes are distinct and all have meanings, that an out-of-range code is reported unknown,
+  and that each classification is produced by the production path. The Core side is checked
+  statically, with a comment explaining why (driving the shell needs elevation, a live WSUS target
+  and minutes).
+* Validator gate **(aa)** asserts the same invariants in the release gate, plus the two ordering
+  properties above and the absence of the wrong-scope `$script:CommandExitCode` write.
+* Full suite: **21 pass, 1 skip (elevation-gated), 0 fail.**
+
+### Two test-quality bugs this work exposed
+
+Both were in *my own* new checks, and both produced **false failures** rather than false passes:
+
+* `$coreRaw -match "Async'\]\s*-and\s*\$busy"` — in a double-quoted string `$busy` **interpolates to
+  empty**, so the pattern became `...-and\s*\` and the trailing backslash threw *"Illegal \ at end of
+  pattern"*. Patterns containing `$` must be single-quoted.
+* The validator's equivalent check used `$.Pending` where the code says `$_.Pending`. A bare `$` in a
+  regex is an end-of-line anchor, so the check could never match. It now uses literal `.IndexOf`.
+
+### Also fixed: a skip that reported failure
+
+`Test-RemoteTask.ps1` exits `1` when not elevated — but its own header says `1 = failure`, and
+`Test-ComputerBusy`/`Test-AutoSettings` signal a skip with a `SKIP:` marker and exit `0`. The result
+was a **spurious failure in every non-elevated run**, which is how it surfaced here. It now exits `0`
+with the marker, and the harness matches `(?m)^\s*SKIP:` — anchored, because the earlier unanchored
+`SKIP` match also caught assertion *names* like "the reboot gate **skips** the reboot" and reported
+passing suites as skipped.

@@ -25,8 +25,11 @@ function Assert-True([bool]$Condition, [string]$Name) {
 }
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    # Exit 0 with a SKIP marker: a suite that COULD NOT RUN has not failed, and exiting 1 here made
+    # every non-elevated CI run report a spurious failure (observed in the per-suite harness).
+    # Test-ComputerBusy and Test-AutoSettings use the marker instead; this now matches them.
     Write-Host "SKIP: must run elevated (registers a SYSTEM scheduled task)" -ForegroundColor Yellow
-    exit 1
+    exit 0
 }
 
 Import-Module (Join-Path $RepoRoot "src\Wuu.Logging.psm1") -Global -ErrorAction Stop

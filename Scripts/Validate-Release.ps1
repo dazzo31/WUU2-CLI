@@ -890,5 +890,74 @@ if ($stateRaw3 -notmatch 'function Update-WuuConnectivityState') {
     Fail 'the connectivity payload does not delegate to Update-WuuConnectivityState'
 } else { Pass 'the connectivity decision is a tested function, and the payload delegates to it (SS12)' }
 
+# (aa) EXIT CODES (brief SS10). Asserted by NUMBER and by the ORDER of the branches that produce
+#      them, because the contract is the number a script branches on. The defect SS10 names is that a
+#      scripted `wuu install` could exit 0 while the install was merely QUEUED - "accepted" read as
+#      "done", silently, in every CI job that used it.
+#
+#      Static, like the neighbouring Core gates: driving the shell for real needs elevation, a live
+#      WSUS target and minutes per run, so it cannot be a per-build gate. Literal .IndexOf is used
+#      instead of -match for the patterns containing '$', because a bare '$busy' in a regex is an
+#      end-of-line anchor - that produced a false failure while writing the accompanying test.
+$cmdRawE = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Command.psm1') -Raw
+
+# 1. The vocabulary itself: every name must map to its documented number.
+$codeMap = @{ 'Success' = 0; 'OperationFailed' = 1; 'UsageError' = 2; 'Timeout' = 3; 'PartialSuccess' = 4; 'AuditFailure' = 5; 'Queued' = 6; 'Refused' = 7 }
+$exitBody = Get-WuuFunctionBody $cmdRawE 'Get-WuuExitCode'
+if (-not $exitBody) {
+    Fail 'Get-WuuExitCode is not defined - SS10 has no vocabulary and every exit is folklore'
+} else {
+    foreach ($n in ($codeMap.Keys | Sort-Object)) {
+        if ($exitBody -notmatch ("'" + $n + "'\s*\{\s*" + $codeMap[$n] + "\s*\}")) {
+            Fail "exit code '$n' is not mapped to $($codeMap[$n])"
+        }
+    }
+    # A name that reaches the default arm silently becomes 1, i.e. a usage error reported as an
+    # operation failure. The ValidateSet is what makes that impossible.
+    if ($exitBody -notmatch 'ValidateSet') {
+        Fail 'Get-WuuExitCode has no ValidateSet - an unknown name would silently become 1'
+    }
+    if (-not $failed) { Pass 'the exit-code vocabulary maps all eight names to their documented numbers (SS10)' }
+}
+
+if ($cmdRawE -notmatch "'Get-WuuExitCode'") { Fail 'Get-WuuExitCode is not exported (the caller cannot resolve it)' }
+if ($cmdRawE -notmatch 'function Get-WuuExitCodeMeaning') { Fail 'Get-WuuExitCodeMeaning is missing - a non-zero exit would be unexplained' }
+
+# 2. -Async must be parsed AND forwarded. Either one alone makes the flag a silent no-op: parsed
+#    but not forwarded and Core still calls an async command a timeout; forwarded but not parsed
+#    and the option is reported as a typo before it ever reaches Core.
+$coreRawE = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+if ($cmdRawE -notmatch "'-async'\s*=\s*'Async'") { Fail 'the command parser does not recognise -Async' }
+if ($coreRawE.IndexOf('-Async:$parsed.Options[''Async'']') -lt 0) { Fail 'Core does not forward -Async from the parsed options' }
+
+# 3. The four properties that make the exit code honest. Each can fail alone.
+if ($coreRawE.IndexOf('OpState -eq ''Running''') -lt 0 -or $coreRawE.IndexOf('$_.Pending') -lt 0) {
+    Fail 'outstanding work is not measured from the store rows (OpState/Pending) - the exit code would reflect a queue, not a result'
+}
+if ($coreRawE.IndexOf("Get-WuuExitCode -Result 'Timeout'") -lt 0) {
+    Fail 'unfinished work does not produce the Timeout code - a queued install could still exit 0'
+}
+if ($coreRawE.IndexOf("Get-WuuExitCode -Result 'Queued'") -lt 0) {
+    Fail 'queued work does not produce the Queued code (-Async has no distinct outcome)'
+}
+$timeoutAt = $coreRawE.IndexOf("Get-WuuExitCode -Result 'Timeout'")
+$notOkAt = $coreRawE.IndexOf('elseif (-not $result')
+if ($timeoutAt -gt 0 -and $notOkAt -gt 0 -and $timeoutAt -gt $notOkAt) {
+    Fail 'the timeout branch is evaluated AFTER the result-object branch - a command that reported Ok but left work running would be classified as success'
+}
+if ($coreRawE.IndexOf('$script:CommandExitCode = $exitCode') -lt 0) {
+    Fail 'the exit code is not assigned unconditionally - a stale non-zero code could persist into a later run'
+}
+
+# 4. Audit integrity is a DIFFERENT failure from a failed operation, so it gets its own code. The
+#    old code set $script:CommandExitCode from inside Wuu.Command.psm1, which is that module's
+#    script scope - not the caller's - so `audit verify` on a broken chain exited 0. Classification
+#    travels on the result object instead, which crosses the scope boundary correctly.
+if ($cmdRawE -notmatch "'AuditFailure'") { Fail 'audit-integrity failures carry no classification' }
+if ($cmdRawE -match '\$script:CommandExitCode\s*=') {
+    Fail 'Wuu.Command sets $script:CommandExitCode in the wrong scope - the value never reaches the exit path (audit verify would exit 0 on a broken chain)'
+}
+if (-not $failed) { Pass 'exit codes distinguish completion, timeout, queueing, usage, refusal and audit integrity (SS10)' }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }
