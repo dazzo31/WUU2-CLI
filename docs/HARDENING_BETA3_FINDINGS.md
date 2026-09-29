@@ -97,6 +97,71 @@ Recorded here so they are not lost; each is fixed in its own phase.
 
 ---
 
-## Phase 1 — Credential determinism
+## Phase 1 — Credential determinism (PASS)
 
-*(in progress — findings and changes recorded below as they are made)*
+### The rule
+
+> If custom credentials are configured and enabled, the operation uses that identity **or fails**.
+> It never falls back to the process identity.
+
+### The defect (three parts, all silent)
+
+| Part | Location | What it did |
+| --- | --- | --- |
+| Resolver fallback | `Wuu.Credentials.psm1` | *"Custom credentials failed **or not configured**, try default credentials"* — a configured-but-rejected credential produced a **successful operation under the wrong account** |
+| Call-site swallow | both remote-task paths | `catch { $remoteCred = $null }`. `$null` legitimately means "use the process identity", so a credential **refusal** was converted into an **identity substitution** |
+| Ambiguous return | `Get-RemoteCredentials` | `$null` meant **both** "use the default" and "nothing works", so no caller could tell them apart |
+
+### What changed
+
+* **`Resolve-WuuOperationCredential`** — reports `Mode` / `Credential` / `Username` / `Verified` /
+  `Reason` as one self-describing value, with the mode decided **before any probe runs**. The answer to
+  *"which identity was intended?"* never requires reading mutable global state afterwards.
+  `-Verify` is optional so identity can be fixed at submission without a network round trip.
+* **`Get-RemoteCredentials`** keeps its contract (`[pscredential]` or `$null` = process identity) but
+  now **throws** when configured custom credentials are unusable. It also no longer probes on the
+  default path — its own documentation claimed that round trip was pointless, and the first version of
+  the fix reintroduced it.
+* **Runspace-side resolver rewritten** to match, with no fallback, and a cache that can only hold the
+  configured credential itself (so a cached entry cannot contradict the configured mode).
+* **Call sites made unconditional** — the resolver owns the mode *and* the local-machine rule, so the
+  duplicated `-ne 'localhost'` guard is gone. Identity is decided in **one** place.
+
+### A determinism hole the brief asks about (case 7)
+
+A runspace captures the credential configuration **at creation** and is then **reused**
+(`if (-not $ComputerItem.Runspace)`). So a credential change left every existing row running the next
+operation under the **previous** identity — silently and deterministically wrong.
+
+Fixed with a **credential epoch**: bumped whenever the configuration changes, stamped on the row when
+its runspace is built, and compared at submission. A mismatch disposes the stale runspace and builds a
+fresh one. One integer comparison when nothing has changed.
+
+### Verification
+
+* `tests\Test-CredentialDeterminism.ps1` — **30 assertions**. Includes the core assertion on **both**
+  resolvers (a failed custom credential probes **no** default identity) and a **differential** that
+  drives the module-side and runspace-side implementations on identical inputs and compares verdicts.
+* `tests\Test-CredentialPropagation.ps1` — the `(b)`/`(c)`/`(d)` blocks were **rewritten, not
+  deleted**: they *asserted the fallback as a requirement* ("falls back to default credentials",
+  "caches the default-credentials outcome"), i.e. the suite encoded the defect. Regex-pair agreement
+  was replaced with the real differential.
+* Validator gates **(ad)/(SS6)** updated for the same reason — one gate **demanded** the fallback and
+  now **forbids** it.
+* Tautology check: reintroduced the fallback and confirmed **both** the validator and the suite fail.
+* Full suite **27 pass, 0 fail** (1 elevation-gated skip). Validator: all gates pass.
+
+### Mistake made during this phase (recorded, not hidden)
+
+I ran the tautology experiment with `git checkout --` as the **restore** step while Phase 1 was still
+**uncommitted**. That discarded the two `Wuu.WindowsUpdate.psm1` changes. I detected it via
+`git status` (the file no longer appeared as modified), verified exactly what was lost, and re-applied
+both. The pattern is fixed: **copy to a temp file and restore from the copy**, or commit first —
+never `git checkout` on uncommitted work.
+
+---
+
+## Phase 2 — Stale-worker / race correctness
+
+*(in progress)*
+
