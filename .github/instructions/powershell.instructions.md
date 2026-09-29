@@ -4,9 +4,14 @@ applyTo: "**/*.ps1, **/*.psm1, **/*.psd1"
 
 # PowerShell standards for WUU2-CLI
 
-Windows PowerShell 5.1 is the floor (7.x must also work). Keep PS7 compatibility: `Get-CimInstance`
-not `Get-WmiObject`, `Invoke-Command` not `-ComputerName` remoting parameters, 2-argument
-`Join-Path` not the 3-argument form, no `ForEach-Object -Parallel`.
+**Windows PowerShell 5.1 is the requirement** (`#Requires -Version 5.1` in every shipped file). **PowerShell 7 is
+a best-effort target**, exercised only on the remote worker paths — never a requirement, never something to write
+code for. (An earlier revision of this file said 7.x "must also work", which contradicted the README's
+best-effort statement and the CI job, which runs 5.1 only and fails on any other major version.)
+
+Keep to constructs that work on 5.1: `Get-CimInstance` not `Get-WmiObject`, `Invoke-Command` not
+`-ComputerName` remoting parameters, 2-argument `Join-Path` not the 3-argument form, no
+`ForEach-Object -Parallel`.
 
 ## Naming and correctness
 - Variable names are case-insensitive: never declare two that differ only by case, and never use

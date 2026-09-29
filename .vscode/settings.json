@@ -9,11 +9,17 @@
     "files.encoding": "utf8",
     "files.eol": "\r\n",
 
-    // The release validator enforces a UTF-8 BOM on every shipped file that contains non-ASCII
-    // bytes. PS7's Set-Content -Encoding UTF8 writes BOM-LESS, and PowerShell 5.1 then reads the
-    // file as ANSI - a multi-byte character eats a quote and the parse error appears far away from
-    // the cause. This has broken this project three times, so it is gated in Validate-Release.ps1;
-    // do not set files.encoding to anything else.
+    // The release validator enforces a UTF-8 BOM on every shipped PowerShell file that contains
+    // non-ASCII bytes. PS7's Set-Content -Encoding UTF8 writes BOM-LESS, and PowerShell 5.1 then
+    // reads the file as ANSI - a multi-byte character eats a quote and the parse error appears far
+    // away from the cause. This has broken this project three times, so it is gated byte-level in
+    // Validate-Release.ps1.
+    //
+    // THE SETTING THAT MATTERS IS IN [powershell] BELOW, NOT THE "utf8" ABOVE. In VS Code,
+    // "utf8" means WITHOUT a BOM - so the top-level value cannot satisfy the requirement, and an
+    // earlier revision of these settings claimed it did. "utf8bom" is the value that writes a BOM.
+    // The top-level entry is kept for non-PowerShell files (markdown, JSON), where a BOM is neither
+    // needed nor wanted; PowerShell files are covered by the language-scoped override.
     "powershell.scriptAnalysis.enable": true,
     "powershell.codeFormatting.preset": "OTBS",
 
@@ -31,6 +37,10 @@
         "*.ps1": "powershell"
     },
     "[powershell]": {
+        // MUST be utf8bom, not utf8: VS Code reads "utf8" as "without BOM", and a BOM-less save of
+        // a file containing non-ASCII bytes is read as ANSI by PowerShell 5.1 (see the note above).
+        // Scoped to the language rather than set globally so markdown/JSON files stay BOM-free.
+        "files.encoding": "utf8bom",
         "editor.tabSize": 4,
         "editor.insertSpaces": true,
         "editor.rulers": [100]

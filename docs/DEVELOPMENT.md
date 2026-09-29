@@ -9,11 +9,11 @@
 > * **CURRENT** — the workflow, commands and constraints that are true today.
 > * **TARGET** — the invariants and behaviour the project is working toward.
 >
-> **Phases 3, 4 and 6 of the hardening plan are implementation work, not established behaviour.**
-> The invariants they describe (the absolute concurrency cap, the pending-work policy, terminal-state
-> protection) **do not exist in the code today**. Read the status table in
+> **Phases 1-5 are done**, and only **Phase 6** (terminal-state protection) remains - blocked on the
+> operation **record**, which identity alone does not provide. The invariants the completed phases
+> introduced (**8.2**, **8.3**, **8.6**, **8.7**) are ENFORCED; read the status table in
 > [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8 before assuming any
-> invariant is real.
+> invariant is real, and note that **8.4** is still TARGET.
 >
 > Phase 1 (credential determinism) and Phase 2 (operation identity and stale-worker rejection) are
 > **done and ENFORCED** — invariants 8.2 and 8.3 moved from TARGET to ENFORCED when Phase 2 landed.
@@ -134,34 +134,35 @@ This is the single most important section in this document for avoiding false cl
 | 0 | Baseline capture | **done** |
 | 1 | Deterministic credential identity (no silent fallback) | **done** |
 | 2 | Operation identity + stale-worker rejection | **done** |
-| 3 | Absolute concurrency cap at admission | **not started** — currently exploitable |
-| 4 | Pending-work policy | **not started** |
-| 5 | Stale-worker protection (extended: retry/cancel paths) | **partly done in Phase 2** |
-| 6 | Terminal-state protection | **not started** — blocked on the operation record |
+| 3 | Absolute concurrency cap at admission | **done** |
+| 4 | Pending-work policy | **done** |
+| 5 | Stale-worker protection (extended: retry/cancel paths) | **done in Phase 2** |
+| 6 | Terminal-state protection | **not started** — needs the operation record |
 
-**Phases 3, 4 and 6 are not implemented.** Anything they introduce must not be described as existing
-behaviour, and any documentation, comment or test that implies otherwise is a defect to fix.
+**Only Phase 6 remains**, and it is blocked on the operation **record** (not the identity, which exists).
+Anything it introduces must not be described as existing behaviour.
 
-> **Phase 2 changed two rows of the §8 status table.** Invariants **8.2** (`OperationId`) and **8.3**
-> (stale-worker rejection) are now ENFORCED, by gate (ah) and `tests\Test-OperationIdentity.ps1`.
-> Older notes, this guide included, described them as TARGET — that is now out of date.
+> **These phases changed four rows of the §8 status table.** Invariants **8.2**, **8.3**, **8.6** and
+> **8.7** are now ENFORCED, by gates (ah), (ai) and (aj) and suites `Test-OperationIdentity`,
+> `Test-ConcurrencyCap` and `Test-PendingPolicy`. Older notes — this guide included — described them
+> as TARGET; that is out of date.
 
 The recommended implementation sequence remains:
 
 ```text
-1. Credential determinism          (done)
+1. Credential determinism          (done - Phase 1)
 2. Operation identity              (done - Phase 2)
 3. Stale-worker protection         (done - Phase 2)
-4. Timeout behaviour               (partially current)
-5. Scheduler concurrency           (Phase 3)
-6. Pending work                    (Phase 4)
-7. Phase/deployment policy
-8. CLI result semantics
-9. WhatIf
-10. Inventory safety
-11. Audit verification
-12. Documentation
-13. Adversarial tests
+4. Timeout behaviour               (done - per-op deadline + heartbeat)
+5. Scheduler concurrency           (done - Phase 3)
+6. Pending work                    (done - Phase 4)
+7. Phase/deployment policy         (current)
+8. CLI result semantics            (current)
+9. WhatIf                           (done)
+10. Inventory safety                (done - threshold + reset)
+11. Audit verification              (current)
+12. Documentation                   (current)
+13. Adversarial tests               (ongoing)
 ```
 
 This order is not mandatory for every task, but dependencies should be respected.

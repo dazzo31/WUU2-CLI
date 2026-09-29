@@ -441,6 +441,15 @@ function Start-UpdateCheckJob {
         # the global MaxConcurrentJobs cap did not apply to them, and EventGetUpdates took the
         # unguarded branch on every re-check (it only called this function when the row had NO
         # runspace). They now all delegate here.
+        #
+        # Both admission gates live in this function: 8.1 (one operation per computer, via
+        # Test-WuuComputerBusy) and 8.6 (the global cap, via Test-WuuConcurrencyAvailable). A caller
+        # that reaches this function has therefore already had BOTH applied - do not re-check them at
+        # a call site, or the two copies will drift.
+        #
+        # ONE JOB ENTRY PER ADMITTED OPERATION: the job list is the cap's counter, so exactly one
+        # entry may be added per admitted operation. Anything that adds a second entry for the same
+        # operation would count it twice and make the cap refuse work it has capacity for.
         [ValidateSet('Check','Download','InstallAndRecheck','AutoFlow','Restart','RemoveOffline','ServiceAction')]
         [string]$Op = 'Check',
         # Only used by 'ServiceAction' (start|stop|restart). Passed through rather than carried on
@@ -448,7 +457,10 @@ function Start-UpdateCheckJob {
         [string]$ServiceAction = ''
     )
     $ctx = $script:WuuCtx
+    # $MaxConcurrentJobs comes from the context, not the global, so the submission point and the
+    # scheduler tick read the SAME value even if a caller (or a test) rewires one of them.
     $GetUpdates = $ctx.GetUpdates; $jobs = $ctx.Jobs; $uiHash = $ctx.UiHash
+    $MaxConcurrentJobs = $ctx.MaxConcurrentJobs
     $PowerShell = $null
     
     try {
@@ -464,6 +476,25 @@ function Start-UpdateCheckJob {
         # operation finishes. Logged at INFO so a run can be reconstructed without guessing.
         if (Test-WuuComputerBusy -Row $ComputerItem) {
             Write-InfoLog "[$($ComputerItem.Computer)] submission refused: an operation is already $($ComputerItem.OpState) (op=$Op) - it stays queued for the next scheduler tick"
+            return $false
+        }
+
+        # ---- GLOBAL CONCURRENCY CAP (SS4) ------------------------------------------------------
+        # The SECOND admission gate, and the one that was missing. 8.1 bounds each computer to one
+        # operation; this bounds how many computers run at once.
+        #
+        # WHY IT BELONGS HERE AND NOT ONLY IN THE SCHEDULER: the scheduler applied the cap itself, but
+        # every console handler calls this function DIRECTLY in a loop, so the cap was never consulted
+        # on that path. A `-All check` over a large estate could therefore start one pipeline per
+        # computer with no ceiling. The scheduler's own check is kept (it stops before SUBMITTING, so
+        # the estate does not spin through rows that cannot run); this one makes the limit a property
+        # of the submission contract rather than of one caller's discipline.
+        #
+        # A refusal is a NORMAL outcome, not an error - the same contract as the per-computer gate.
+        # The caller leaves the row Pending, and the scheduler admits it on a later tick once capacity
+        # frees. Logged at INFO so a run can be reconstructed.
+        if (-not (Test-WuuConcurrencyAvailable -Jobs $jobs -MaxConcurrentJobs $MaxConcurrentJobs)) {
+            Write-InfoLog "[$($ComputerItem.Computer)] submission deferred: global concurrency cap reached ($($jobs.Count)/$MaxConcurrentJobs in flight, op=$Op) - it stays queued for the next scheduler tick"
             return $false
         }
 

@@ -667,6 +667,107 @@ function Test-WuuOperationCurrent {
     return ($rowId -ceq $OperationId)
 }
 
+function Set-WuuPendingOperation {
+    <#
+    .SYNOPSIS
+    Sets a row's queued follow-up OPERATION, applying the pending-request policy (SS7).
+    .DESCRIPTION
+    POLICY: ONE SLOT, NEWEST REQUEST WINS, AND A REPLACEMENT IS ALWAYS REPORTED.
+
+    A row has a single PendingOp slot, so a busy computer cannot hold two outstanding
+    requests. A second request must therefore be refused or replace the first. Refusing
+    would make `download` then `install` on a busy computer silently do NOTHING, which is
+    worse than doing the newer thing - so the slot is newest-wins. The caller receives the
+    replaced value and MUST report it.
+
+    THE DEFECT WAS THE SILENCE, NOT THE OVERWRITE. `download` followed by `install` left
+    `Download` destroyed while the operator was told only "queued to run when they finish".
+    Note the direction that is easy to miss: a LATER LOWER request is a DOWNGRADE.
+    `install` then `download` replaced the install with a download, so an operator who asked
+    for more got less, with no indication at all.
+
+    -OnlyIfEmpty is for INTERNAL callers. An automatic follow-up queued by the
+    download/check payloads is not an operator request, so it must never displace one: if
+    the slot is already held the follow-up is skipped (Set = $false) and NOT reported, because
+    nothing was lost. The payloads INLINE this rule rather than calling here - they run in an
+    isolated worker runspace where no module function resolves (see the note at the top of
+    this file) - so tests\Test-PendingPolicy.ps1 asserts both copies agree.
+
+    RETURNS a hashtable, never a bare boolean, because the caller needs three facts:
+      Set      [bool]   whether the slot was changed
+      Op       [string] the operation now queued ($null when nothing was set)
+      Replaced [string] the request that was displaced ($null when nothing was lost)
+    A caller that ignores Replaced reproduces the original defect; the tests assert that a
+    replacement is surfaced, not merely performed.
+    #>
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$Row,
+        [Parameter(Mandatory = $false)][string]$Op = '',
+        [switch]$OnlyIfEmpty
+    )
+
+    $noChange = @{ Set = $false; Op = $null; Replaced = $null }
+
+    if ($null -eq $Row) { return $noChange }
+    if ([string]::IsNullOrWhiteSpace($Op)) { return $noChange }
+    if ($null -eq $Row.PSObject.Properties['PendingOp']) { return $noChange }
+
+    $existing = ''
+    if ($Row.PendingOp) { $existing = [string]$Row.PendingOp }
+
+    # An internal follow-up must not displace an operator request (and loses nothing if skipped).
+    if ($OnlyIfEmpty -and $existing -ne '') { return $noChange }
+
+    # Same request again: refresh Pending (it may have been cleared) but nothing is replaced.
+    if ($existing -ceq $Op) {
+        if ($Row.PSObject.Properties['Pending']) { $Row.Pending = $true }
+        return @{ Set = $true; Op = $Op; Replaced = $null }
+    }
+
+    $Row.PendingOp = $Op
+    if ($Row.PSObject.Properties['Pending']) { $Row.Pending = $true }
+
+    $replaced = $null
+    if ($existing -ne '') { $replaced = $existing }
+    return @{ Set = $true; Op = $Op; Replaced = $replaced }
+}
+
+function Test-WuuConcurrencyAvailable {
+    <#
+    .SYNOPSIS
+    Whether a new operation may be admitted under the global concurrency cap (SS4).
+    .DESCRIPTION
+    The gate for INVARIANT 8.6. It exists because the cap used to be applied in exactly one place -
+    the scheduler tick - while every console handler called the submission point DIRECTLY. So
+    `-All check` over a large estate could start an unbounded number of pipelines; the per-computer
+    gate bounds each computer to one operation but says nothing about how many computers run at once.
+
+    WHAT THE CAP COUNTS: in-flight operations across the WHOLE estate, i.e. the number of entries in
+    `$jobs`. Because invariant 8.1 permits at most one operation per computer, `jobs.Count` is also
+    the number of computers currently working - the two readings coincide by construction, not by
+    assumption. It is NOT a per-computer bound (that is Test-WuuComputerBusy) and NOT a bound on the
+    worker pool (Wuu.Workers sizes its own pool separately).
+
+    FAIL-CLOSED ON A MISSING JOB LIST, and REFUSE AT A NON-POSITIVE CAP. The second of those is
+    deliberate consistency, not an oversight: the scheduler has always tested `$jobs.Count -ge
+    $MaxConcurrentJobs`, so a cap of 0 refuses everything there. If this function treated 0 as
+    "unlimited" the two admission paths would disagree, and which one you hit would decide whether
+    the estate ran. A misconfigured cap therefore stops work visibly rather than quietly removing the
+    limit - the safe direction for a patching tool (same reasoning as Test-PhaseFailureBlocks).
+
+    Pure, side-effect free and $null-tolerant: called from the submission point and from tests.
+    #>
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$Jobs,
+        [Parameter(Mandatory = $false)][int]$MaxConcurrentJobs = 0
+    )
+
+    if ($null -eq $Jobs) { return $false }
+    if ($MaxConcurrentJobs -le 0) { return $false }
+
+    return ([int]$Jobs.Count -lt $MaxConcurrentJobs)
+}
+
 function Test-WuuStaleWrite {
     <#
     .SYNOPSIS
@@ -889,6 +990,13 @@ Export-ModuleMember -Function @(
     'Set-WuuComputerRowColor'
     'Set-WuuSetting'
     'Test-WuuComputerBusy'
+    # SS7: the pending-request policy. Exported because the OPERATOR-facing handlers (Wuu.Core) own
+    # the reporting of a replacement, while the policy itself must live in one place; and because
+    # the payloads inline the -OnlyIfEmpty half, which tests assert against this function.
+    'Set-WuuPendingOperation'
+    # SS4: the global concurrency cap. Exported because it is consulted at the SUBMISSION POINT
+    # (Wuu.WindowsUpdate) and in the scheduler tick, and both must agree on what the cap means.
+    'Test-WuuConcurrencyAvailable'
     # SS2/SS3: operation identity. Exported because the id is CREATED at the submission point
     # (Wuu.WindowsUpdate), ENFORCED in the cleanup loop (Wuu.Core) and in the row-writers injected
     # into worker runspaces, and asserted by tests - four places that must agree on the same rule.

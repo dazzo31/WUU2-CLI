@@ -14,10 +14,23 @@ The primary architectural goal is **predictable, testable, safe remote execution
 
 Read these documents when the task touches the relevant area:
 
-* `docs/ARCHITECTURE.md`
-* `docs/STATE-MACHINE.md`
-* `docs/DEVELOPMENT.md`
-* `docs/TESTING.md`
+* `docs/ARCHITECTURE.md` — layering, entry points, admission paths, gate index
+* `docs/STATE-MACHINE.md` — target operation lifecycle vs what the code actually stores
+* `docs/DEVELOPMENT.md` — workflow, phase boundaries, completion checklist
+* `docs/TESTING.md` — suite conventions, the aggregate runner, coverage gaps
+
+**This file holds constraints only.** Everything below is a rule, a boundary, a command or a
+completion criterion — the things that must be true of your change. Long-form material lives in the
+linked documents so that it can be revised without inflating a file that agents read on every task:
+
+| If you need… | Read |
+| --- | --- |
+| why an invariant exists, and incident history | `docs/HARDENING_BETA3_FINDINGS.md`, `docs/HARDENING_P0_FINDINGS.md` |
+| the phased roadmap and what is scheduled | `docs/DEVELOPMENT.md` §6 |
+| gate-by-gate detail behind a status | `docs/ARCHITECTURE.md` appendix, then the gate itself |
+| per-suite coverage and known-untestable areas | `docs/TESTING.md` |
+
+Do not paste an incident narrative into this file. State the rule, and link the story.
 
 ### How to read those documents, and this one
 
@@ -161,28 +174,18 @@ or other WPF dependencies.
 Do not rename or delete an existing `$event*` closure as part of unrelated work — that is Phase 11
 territory, and it is listed in `docs/DEVELOPMENT.md` as a deliberate follow-on, not a side effect.
 
-Therefore:
-
-> **Do not copy an existing `$event*` closure's structure into new work, and do not "repair" one by
-> restoring GUI-era behaviour.** Route new console behaviour through the `$consoleActions.*`
-> adapters — see `docs/ARCHITECTURE.md` for the intended layering.
-
-Do not introduce new:
-
-```text
-System.Windows.*
-```
-
-or other WPF dependencies.
-
-Do not rename or delete an existing `$event*` closure as part of unrelated work — that is Phase 11
-territory, and it is listed in `docs/DEVELOPMENT.md` as a deliberate follow-on, not a side effect.
-
 ---
 
 ## 5. Windows PowerShell 5.1
 
-The application must remain compatible with **Windows PowerShell 5.1**.
+**Windows PowerShell 5.1 is the requirement.** Every shipped file carries `#Requires -Version 5.1`, and
+it is the only runtime CI validates (see `.github/workflows/validate.yml`, which fails if the host is
+not 5.x).
+
+**PowerShell 7 is a best-effort target, not a supported one.** It is exercised only on the remote
+worker paths; do not rely on it, and do not write code that requires it. The README states the same,
+and the two must not drift apart - an earlier revision of the scoped PowerShell instruction said 7.x
+"must also work", which contradicted both the README and CI.
 
 Do not use features introduced after PowerShell 5.1.
 
@@ -205,22 +208,38 @@ Some shipped files contain non-ASCII characters.
 
 These files must retain their **UTF-8 BOM**.
 
-The repository intentionally uses:
+### The setting, and the trap in it
 
-```text
-files.encoding = utf8
+`files.encoding` must be **`utf8bom`** for PowerShell files. It is set in the
+`[powershell]` block of `.vscode/settings.json`.
+
+```jsonc
+"[powershell]": { "files.encoding": "utf8bom" }   // correct
+"files.encoding": "utf8"                          // WRONG - no BOM
 ```
 
-because Windows PowerShell 5.1 can interpret BOM-less UTF-8 as ANSI.
+**In VS Code `utf8` means UTF-8 WITHOUT a BOM.** The two names are not synonyms and the difference is
+the whole requirement, so a top-level `"utf8"` cannot satisfy it. An earlier revision of the settings
+file claimed it did. The scoping is deliberate: PowerShell files need the BOM, markdown and JSON files
+should stay BOM-free.
 
-A BOM-less rewrite can cause multi-byte characters to corrupt parsing, including cases where a character effectively consumes a quote or otherwise changes source interpretation.
+Why it matters: PowerShell 5.1 reads BOM-less UTF-8 as ANSI, so a multi-byte character can consume a
+quote and change how the source is parsed - and the error surfaces far from the cause.
 
-Therefore:
+### Rules
 
 * preserve existing encoding
 * preserve BOM where present
 * avoid unnecessary whole-file rewrites
-* do not use tooling that silently changes encoding
+* do not use tooling that silently changes encoding: `Set-Content` under PowerShell 7 writes
+  **BOM-less** and will corrupt a non-ASCII file. Use `[System.IO.File]::WriteAllText` with an explicit
+  encoding, or edit in place.
+* after automated edits, inspect the resulting file if encoding may have changed - by **bytes**, not by
+  eye
+
+The requirement is enforced at byte level by `Scripts\Validate-Release.ps1` (gate af), which checks
+every shipped PowerShell file for non-ASCII bytes and a BOM. Source inspection is what caught a
+defective backup in this repo's own history; do not replace that gate with a config check.
 
 After automated edits, inspect the resulting file if encoding may have changed.
 
@@ -262,8 +281,8 @@ Status is verified by inspection, not aspiration. `ENFORCED` means there is a
 | 8.3 | Stale workers cannot modify newer operations | **ENFORCED** | Two rules — `Test-WuuOperationCurrent` (release only proven ownership) and `Test-WuuStaleWrite` (refuse only proven staleness) — mirrored in **6** sites; gate (ah); `Test-OperationIdentity` |
 | 8.4 | Terminal operations stay terminal | **TARGET — partial** | No transition guard. `Failed`/`TimedOut`/`Cancelled`/`Refused` are not even `State` values today (see §9) |
 | 8.5 | All remote execution goes through the scheduler | **ENFORCED (narrow)** | All per-computer work goes through **one submission point** `Start-UpdateCheckJob`; gate (x). "Scheduler-only" is stricter than this — see 8.6 |
-| 8.6 | Concurrency limits are absolute | **TARGET — not implemented** | The cap is checked **only in the scheduler tick** (`Start-PendingUpdateCheck`). The submission point has **no** `jobs.Count` check, and its `MaxConcurrentJobs` mention is a **comment**. Direct handlers can therefore exceed the cap. **No validator gate exists** (the only validator mention is a comment) |
-| 8.7 | Pending work is not silently discarded | **TARGET — not implemented** | `PendingOp` is overwritten in place; a second request replaces the first with nothing reported |
+| 8.6 | Concurrency limits are absolute | **ENFORCED** | `Test-WuuConcurrencyAvailable` applied at the **submission point** *and* the scheduler tick, both reading the cap from the shared context; gate (ai); `Test-ConcurrencyCap` (20 assertions, drives direct submission) |
+| 8.7 | Pending work is not silently discarded | **ENFORCED** | `Set-WuuPendingOperation`: one slot, newest wins, **replacement returned and reported**; operators use the policy, payloads inline `-OnlyIfEmpty`; gate (aj); `Test-PendingPolicy` (42 assertions) |
 | 8.8 | Credential identity is deterministic | **ENFORCED** | `Resolve-WuuOperationCredential`; no fallback on either resolver; gate (ad); `Test-CredentialDeterminism`, `Test-CredentialPropagation` |
 | 8.9 | `WhatIf` causes no remote mutation | **ENFORCED** | Returns before any handler and writes no audit record; gates (ae); `Test-WhatIfPlan`, `Test-AuditTrail` |
 | 8.10 | Connectivity failure does not delete inventory | **ENFORCED** | Consecutive-failure threshold + reset on success in `Update-WuuConnectivityState`; gate (z); `Test-ConnectivityClassification` |
@@ -272,16 +291,15 @@ Also ENFORCED but not numbered above: per-operation timeouts with a recorded dea
 (8.5-adjacent, gate (ab)); exit-code semantics (gate (aa)); workflow state rather than display state
 (gate (ac)); reboot/cancellation surfaces (gate (ag)); source encoding (gate (af)).
 
-**Read the gap column before relying on an invariant.** **8.6** (absolute cap) and **8.7** (pending
-work) are the two that matter most now: in each case the mechanism the architecture depends on does
-not exist yet, so code that relies on either is wrong in a way that does not announce itself.
+**Read the gap column before relying on an invariant.** Only **8.4** (terminal states stay terminal)
+remains TARGET, and it needs the operation **record** that identity alone does not provide — see §9 and
+[`docs/STATE-MACHINE.md`](../docs/STATE-MACHINE.md) §7.
 
-> **8.2/8.3 note (Phase 2):** these were TARGET. They are ENFORCED as of this revision. The distinction
-> matters when reading older material, and it is why 8.3 was *unreachable* rather than *safe* —
-> invariant 8.1 prevented the scenario from arising, but nothing rejected a stale result. Three paths
-> could emit one: the cleanup loop settling a force-stopped job after the computer was resubmitted, a
-> payload parked mid-write while the timeout path detached the runspace, and the out-of-band job
-> removal in `Remove-WuuComputers`.
+> **Status changed in this revision.** 8.2, 8.3 (operation identity and stale-worker rejection), 8.6
+> (the absolute cap) and 8.7 (pending work) were TARGET and are now ENFORCED. The distinction matters
+> when reading older material: 8.3 was *unreachable* rather than *safe* — 8.1 stopped the scenario from
+> arising, but nothing rejected a stale result — and 8.6's cap was applied in only one of the two
+> admission paths while its documentation claimed otherwise.
 
 ---
 
@@ -360,37 +378,49 @@ convenience functions.
 
 ---
 
-### 8.6 Concurrency limits are absolute  *(TARGET — not implemented)*
+### 8.6 Concurrency limits are absolute  *(ENFORCED)*
 
-**Target:** `MaxConcurrentJobs` is never exceeded, regardless of how work entered the system.
+`MaxConcurrentJobs` is never exceeded, regardless of how work entered the system.
 
-**Current — this one is a live defect, not just a gap:**
+**Implemented.** The cap is applied in **both** admission paths:
 
-* the cap is checked **only** in `Start-PendingUpdateCheck` (the scheduler tick);
-* `Start-UpdateCheckJob` (the submission point) has **no** `jobs.Count` check. Its only
-  `MaxConcurrentJobs` occurrence is inside a **comment which claims it counts toward the cap**;
-* the console handlers call the submission point **directly, in a loop**, so a fleet-wide operation
-  can start **more pipelines than the cap allows**;
-* **no validator gate exists** — the single validator reference is also a comment;
-* `Test-SchedulerSerialization` *does* assert `jobs.Count -le 2`, but it drives
-  `Start-PendingUpdateCheck`. That test is honest and correctly scoped; it simply does not cover the
-  direct path.
+* the scheduler tick (`Start-PendingUpdateCheck`) — as before;
+* the **submission point** (`Start-UpdateCheckJob`) — via `Test-WuuConcurrencyAvailable`, which is the
+  check that was missing. Console handlers call the submission point directly in a loop, so this is the
+  path that could exceed the cap.
 
-The combination is the hazard: a documented guarantee, plus a passing test, plus a comment asserting
-enforcement, while the enforced path is a different one. Do not add another worker-launch path; fix
-this one (Phase 3).
+Both read the cap from the shared context (`$ctx.MaxConcurrentJobs`), so one cannot be raised while the
+other still throttles at the old value. Gate (ai) asserts the wiring, including that the check runs
+BEFORE capacity is consumed (`$jobs.Add`) and before the row is marked `Running` — checking after
+admission would mark a computer busy whose pipeline never started.
+
+A refusal is a **normal outcome**, not an error: the row stays `Pending` and the scheduler admits it on
+a later tick. `Test-ConcurrencyCap` drives the real submission point and asserts that direct submission
+stops at the cap, that the cap is not a no-op, and that peak simultaneity (derived from timestamps)
+never exceeds it.
 
 ---
 
-### 8.7 Pending work must not be silently discarded  *(TARGET — not implemented)*
+### 8.7 Pending work must not be silently discarded  *(ENFORCED)*
 
-**Target:** when new work is submitted for a computer that already has pending work, the existing work
-must not simply disappear. Any replacement, merge, rejection or cancellation must be explicit and
-follow a documented policy.
+When new work is submitted for a computer that already has pending work, the existing work must not
+simply disappear. Any replacement, merge, rejection or cancellation must be explicit and follow a
+documented policy.
 
-**Current:** there is a single `PendingOp` slot, assigned in place. Reproduced: a `download` request
-against a busy computer followed by an `install` request leaves `PendingOp='InstallAndRecheck'` — the
-download request is gone and nothing reports it. The policy must be chosen and documented (Phase 4).
+**Implemented — policy: ONE SLOT, NEWEST REQUEST WINS, AND A REPLACEMENT IS ALWAYS REPORTED.**
+
+A row has a single `PendingOp` slot, so a second request must either be refused or replace the first.
+Refusing outright would make `download` then `install` silently do *nothing*, which is worse than doing
+the newer thing — so newest wins, and `Set-WuuPendingOperation` **returns the displaced value** so the
+caller can report it. That return value is the fix: the defect was the **silence**, not the overwrite.
+
+Note the direction that is easy to miss — a later **lower** request is a DOWNGRADE. `install` then
+`download` destroyed the install, so an operator who asked for more got less, unreported.
+
+`-OnlyIfEmpty` keeps an **automatic** follow-up (the payloads' auto-download / auto-install tails) from
+displacing an **operator** request. The payloads run in isolated runspaces where no module function
+resolves, so they inline that rule; gate (aj) asserts both copies read the slot, and
+`Test-PendingPolicy` drives each shipped condition against the function.
 
 ---
 
@@ -469,46 +499,38 @@ A retry creates a new `OperationId`.
 ### What the code actually stores today
 
 There is **no operation record**, so the target model above has nowhere to live. What exists is two
-fields on the computer row:
+fields on the computer row — `State` (a display/workflow label) and `OpState` (`Idle`/`Running`, which
+is what the per-computer gate reads).
 
-| Field | Actual values written by the code | Meaning |
-| --- | --- | --- |
-| `State` | `Queued`, `Connecting`, `Connected`, `Checking`, `UpdatesFound`, `Downloading`, `Installing`, `RebootRequired`, `Rebooting`, `Complete`, `Error`, `Timeout`, `Offline` | a *workflow/presentation* label |
-| `OpState` | `Idle`, `Running` | whether an operation pipeline is in flight — this is what the per-computer gate reads |
+The four things that will trip you up:
 
-Consequences to respect when writing code:
-
-* **`Failed`, `TimedOut`, `Cancelled` and `Refused` are not `State` values.** The code uses `Error` and
-  `Timeout` for failure and timeout. Do not write the target names into `State` on the assumption they
-  are already used.
+* **`Failed`, `TimedOut`, `Cancelled` and `Refused` are not `State` values.** The code writes `Error` and
+  `Timeout`. Do not use the target names on the assumption they exist.
 * There is **no `Cancelled`** state at all.
-* `State` is a display-oriented label, so decisions must not be made from it — that was a real defect
-  (gate (ac)); `Test-PhaseCompletion` now decides from workflow state plus `CheckConcluded`.
-* `Refused` exists as an **exit code (7)** and an audit outcome, not as a row state.
+* `State` is display-oriented — decisions must not be made from it (this was a real defect, gate (ac)).
+* `Refused` is an **exit code (7)** and an audit outcome, not a row state.
+
+Full value lists, the field-by-field mapping and the consequences are in
+[`docs/STATE-MACHINE.md`](../docs/STATE-MACHINE.md) §11.
 
 ---
 
 ## 10. Timeout and race handling
 
-Timeouts must be operation-specific.
+Timeouts must be operation-specific: the deadline is recorded on the row **at submission** and read by
+the cleanup loop, never recomputed from a start time. Never solve a race with a `Start-Sleep`.
 
-Do not solve races using arbitrary `Start-Sleep` calls.
-
-The following race must be safe:
+The races that must stay safe are the three in
+[`docs/STATE-MACHINE.md`](../docs/STATE-MACHINE.md) §9. The one to remember when touching timeout,
+cancellation or retry:
 
 ```text
-Operation A
-    ↓
-Running
-    ↓
-Timed out
-    ↓
-Operation B created
-    ↓
-Operation B running
-    ↓
-late worker from A completes
+Operation A → TimedOut → Operation B running → late worker from A completes
 ```
+
+A must not modify B. That is enforced by operation identity (§8.3): compare the identity, and route
+the write through the existing choke point. Do not infer ownership from a computer name or a
+timestamp — the name is the row's key, so a dead operation still resolves a live row.
 
 The late worker from A must not modify B's state.
 
@@ -527,18 +549,22 @@ Do not assume timing based on testing convenience.
 
 ## 11. Scheduler responsibilities
 
+**Status: TARGET, partly current.** The list below is where responsibility is meant to live. Read the
+notes before assuming a line is implemented, and see §8 for the per-invariant status.
+
 The scheduler owns execution policy such as:
 
-* admission
-* queueing
-* per-computer concurrency
-* global concurrency
-* worker startup
-* operation deadlines
-* completion handling
-* timeout handling
-* cancellation
-* operation identity validation
+* admission — **current**, and split by design: the scheduler tick (`Start-PendingUpdateCheck`) and
+  the submission point (`Start-UpdateCheckJob`) both apply the cap (§8.6)
+* queueing — **partial**: `Pending` is a flag drained by the tick, not a real queue (§8.7)
+* per-computer concurrency — **current** (§8.1, `Test-WuuComputerBusy`)
+* global concurrency — **current** (§8.6, `Test-WuuConcurrencyAvailable`)
+* worker startup — **current**
+* operation deadlines — **current** (per-op budget, recorded at submission)
+* completion handling — **current** (cleanup loop)
+* timeout handling — **current** (cleanup loop, per-op deadline + heartbeat)
+* cancellation — **partial**: no `Cancelled` state exists; see §9
+* operation identity validation — **current** (§8.2/8.3)
 
 The scheduler does **not** belong in the CLI presentation layer.
 
@@ -546,17 +572,26 @@ The scheduler does **not** belong in the CLI presentation layer.
 
 ## 12. Worker responsibilities
 
+**Status: TARGET, partly current.** The prohibitions are the contract; the notes say which are
+enforced.
+
 A worker executes one operation and returns a result.
 
 A worker must not decide:
 
-* global concurrency policy
-* whether another operation should start
-* credential fallback
-* replacement-operation policy
-* whether a timed-out operation should become active again
+* global concurrency policy — **enforced**: the cap is checked before admission, never in a worker
+* whether another operation should start — **enforced by construction**: the only submission point is
+  outside the worker runspace
+* credential fallback — **enforced** (§8.8)
+* replacement-operation policy — **enforced**: `Set-WuuPendingOperation` owns it (§8.7)
+* whether a timed-out operation should become active again — **enforced**: terminal state is written by
+  the cleanup loop, identity-guarded (§8.3)
 
 Workers must return enough information for the scheduler/state store to make the appropriate state transition.
+
+> The payloads run in isolated runspaces and cannot call module functions, so they **inline** the rules
+> they used to violate. Gate (ah) and `tests\Test-OperationIdentity.ps1` assert each inlined copy
+> against the module function, because a drifted copy is invisible to every other check here.
 
 ---
 
@@ -673,13 +708,19 @@ For fleet operations, preserve the distinction between:
 
 ## 17. Testing
 
-There is no Pester requirement.
+There is no Pester requirement. Suites are `tests\Test-*.ps1`, each exiting 0/1 and printing
+`PASS:`/`FAIL:` lines.
 
-The repository uses:
+**Run them through the aggregate runner, not a `ForEach-Object` loop:**
 
-```text
-tests\Test-*.ps1
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Invoke-TestSuites.ps1
 ```
+
+The runner captures each suite's exit code, classifies `SKIP` separately from `PASS`, imposes a
+per-suite timeout, and **returns non-zero if any suite failed**. The naive loop it replaces discarded
+every exit code, so a failing tree reported success. Add `-Json` for a machine-readable summary, or
+`-Suite <name>` for one suite.
 
 The following are GUI leftovers and are excluded from the CLI test workflow:
 
@@ -688,9 +729,14 @@ tests\Test-ColumnResize.ps1
 tests\Test-DragResize.ps1
 ```
 
-`Test-DragResize.ps1` can hang because it uses a blocking dispatcher pump.
+`Test-DragResize.ps1` can hang because it uses a blocking dispatcher pump — which is exactly why the
+runner kills a suite on a deadline instead of waiting for it.
 
 Do not "fix" these tests as part of unrelated CLI work.
+
+**A suite must be able to fail.** `Test-ModuleImport.ps1` used to print `MISSING <cmd>` in red and exit
+0, so every runner counted it as a pass. If you add a check, prove it fails when the thing it checks is
+broken.
 
 ### `Test-RemoteTask.ps1` skips without elevation — this is correct
 
@@ -820,14 +866,46 @@ the only thing that revealed it.
 
 ```
 1. COMMIT first, so the work is recoverable.       (preferred)
-2. Or copy the file aside, and restore FROM the copy:
-       Copy-Item $f "$env:TEMP\backup-$(Split-Path $f -Leaf)" -Force
+2. Or back the file up, and restore FROM the backup:
+       Copy-Item -LiteralPath $f -Destination $backupDir -Force     # $backupDir is UNIQUE per run
        ... experiment ...
-       Copy-Item "$env:TEMP\backup-..." $f -Force     # NOT git checkout
-3. Verify the restore: git status must show the file as MODIFIED again
-   (if it no longer appears modified, the restore reverted your work).
+       Copy-Item -LiteralPath (Join-Path $backupDir (Split-Path $f -Leaf)) -Destination $f -Force
+3. Verify the restore BY HASH - not by looking, and not by `git status` alone.
 4. Re-run the tests after restoring.
 ```
+
+### Why a unique directory, and why a hash
+
+Two failure modes that a basename-based backup does not catch:
+
+* **Collisions.** `"$env:TEMP\backup-$(Split-Path $f -Leaf)"` uses only the ORIGINAL basename and
+  `-Force`. Two files with the same name from different directories overwrite each other's backups, and
+  two runs of the same experiment reuse the same path - so the second `Copy-Item` can capture an
+  already-modified file and "restore" the experiment into place. Use a per-run directory:
+
+  ```powershell
+  $backupDir = Join-Path $env:TEMP ("wuu-backup-{0}" -f ([guid]::NewGuid().ToString('N').Substring(0,8)))
+  New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+  ```
+
+* **False verification.** `git status` showing the file as **modified** proves only that the working
+  tree DIFFERS from `HEAD` - not that the earlier changes survived. A restore that reverted the work and
+  then applied an unrelated edit still shows as modified. Compare the **hash**, which is the only
+  evidence that the bytes are the ones you backed up:
+
+  ```powershell
+  $before = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash
+  Copy-Item -LiteralPath $f -Destination (Join-Path $backupDir (Split-Path $f -Leaf)) -Force
+  # ... experiment ...
+  Copy-Item -LiteralPath (Join-Path $backupDir (Split-Path $f -Leaf)) -Destination $f -Force
+  $after = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash
+  if ($after -ne $before) { throw "restore FAILED: $f does not match the backup" }
+  ```
+
+  `Copy-Item` preserves bytes (including a UTF-8 BOM), which is why it is the prescribed tool. A
+  `Set-Content` / `Out-File` round-trip does not: it can strip the BOM and re-encode, changing the
+  bytes of a file containing non-ASCII text (§6). Never back up or restore by reading text and writing
+  it back.
 
 Additional rules:
 
@@ -835,9 +913,13 @@ Additional rules:
   what would be lost. If anything uncommitted would be lost, stop and report it.
 * Never use `git checkout` / `git reset` / `git clean` to resolve a merge or rebase conflict in this
   repository without explicit instruction.
-* When preserving a file, set the encoding explicitly
-  (`[System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($true)))`) — a
-  `Set-Content` restore strips a BOM and corrupts files that contain non-ASCII text (§6).
+* When a backup must be written as text rather than copied, set the encoding explicitly
+  (`[System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($true)))`) and verify
+  with a hash - a `Set-Content` restore strips a BOM and corrupts files that contain non-ASCII text
+  (§6).
+* Keep the verification in the experiment script, not in your head. Both tautology passes in the
+  hardening work used this pattern; the hash check is what makes "I restored it" a fact rather than a
+  claim.
 
 ---
 
@@ -860,7 +942,9 @@ Stop and report instead of guessing if any of the following occurs:
 * existing tests fail unexpectedly
 * two sources of truth disagree
 * the intended state transition is ambiguous
-* a worker can mutate state without an `OperationId`
+* **you are about to ADD an unguarded worker write** — a write that acts on behalf of a job without
+  proving ownership (see §8.3). Existing guarded writes are not a stop condition; adding a new
+  unguarded one is.
 * two operations can execute concurrently for one computer
 * credential identity is unclear
 * timeout/retry ownership is unclear
@@ -873,29 +957,49 @@ Stop and report instead of guessing if any of the following occurs:
 
 Do not silently choose one interpretation.
 
+### Working on timeout, cancellation or retry paths
+
+These are the paths where ownership gets lost, so they carry extra requirements rather than a stop:
+
+1. **Identify the owner.** Which operation does this write belong to, and can the code PROVE it
+   (compare an identity) rather than infer it (compare a name or a timestamp)?
+2. **Do not add unguarded writes.** Route the write through the existing choke point, or mirror the
+   established guard. Gate (ah) will fail if a guard copy drifts.
+3. **Add a late-completion test.** Prove the superseded writer cannot touch the replacement's state.
+   `tests\Test-OperationIdentity.ps1` is the model.
+
+> An earlier revision made "a worker can mutate state without an `OperationId`" an unconditional stop
+> condition. That is a standing property of any large codebase rather than a decision point, so it
+> fired during ordinary maintenance and blocked work on the current architecture. The actionable form
+> is above: it constrains what you ADD and what you must TEST.
+
 ---
 
 ## 20. Historical failure modes
 
-These failures have occurred or are specifically guarded against in this project.
+Regressions this project has actually suffered. Treat each as a live hazard, and note the invariant it
+maps to — the story behind any of them is in the findings docs (§1).
 
-Treat them as regression hazards:
-
-1. CLI code reading WPF state.
-2. Direct `Read-Host` causing automated/scripted runs to hang.
-3. Incorrect `Mutating` flags bypassing audit requirements.
-4. PowerShell 7-only syntax entering a PowerShell 5.1 project.
-5. BOM removal corrupting non-ASCII source.
-6. Scheduler bypass creating uncontrolled remote execution.
-7. Two operations executing for the same computer.
-8. A stale worker overwriting a newer operation.
-9. Credential fallback silently changing authentication identity.
-10. A timed-out worker completing later and corrupting replacement state.
-11. Pending work being silently overwritten.
-12. Connectivity failure deleting inventory.
-13. A completed-but-failed operation being treated as successful.
-14. Console/UI state becoming an accidental second source of truth.
-15. Generated `dist` files being edited instead of source files.
+| # | Failure | Invariant / guard |
+| --- | --- | --- |
+| 1 | CLI code reading WPF state | §4; gate (r) |
+| 2 | Direct `Read-Host` hanging scripted runs | §7 |
+| 3 | Wrong `Mutating` flag bypassing audit | §14 |
+| 4 | PowerShell 7-only syntax in a 5.1 project | §5 |
+| 5 | BOM removal corrupting non-ASCII source | §6; gate (af) |
+| 6 | Scheduler bypass → uncontrolled remote execution | §8.5; gate (x) |
+| 7 | Two operations for one computer | §8.1; gates (u)/(v)/(w) |
+| 8 | Stale worker overwriting a newer operation | §8.3; gate (ah) |
+| 9 | Credential fallback changing authentication identity | §8.8; gate (ad) |
+| 10 | Timed-out worker completing later and corrupting replacement state | §8.3; gate (ah) |
+| 11 | Pending work silently overwritten | §8.7; gate (aj) |
+| 12 | Connectivity failure deleting inventory | §8.10; gate (z) |
+| 13 | Completed-but-failed operation treated as successful | §16; gate (aa) |
+| 14 | Console state becoming a second source of truth | §13; gate (ac) |
+| 15 | Generated `dist` files edited instead of source | §2 |
+| 16 | Concurrency cap not applied at admission | §8.6; gate (ai) |
+| 17 | A test that cannot fail (red output, exit 0) | §17 |
+| 18 | A runner that discards suite exit codes | §17; `Invoke-TestSuites.ps1` |
 
 ---
 

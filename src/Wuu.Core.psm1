@@ -1167,11 +1167,22 @@ $DownloadUpdates = {
             if($downloadedUpdates -and -not $alreadyAutoFlow -and -not $alreadyPending){
                 # Queue install as a follow-up (nested BeginInvoke on this busy runspace
                 # would silently never run the install payload).
+                #
+                # SS7: this is an INTERNAL follow-up, so it must NOT displace an operator's queued
+                # request - the automatic install is optional, the operator's request is not. This
+                # inlines Set-WuuPendingOperation -OnlyIfEmpty because the payload runs in an
+                # isolated worker runspace where no module function resolves; a test asserts the two
+                # agree. Do not "simplify" this to a bare assignment: that is the silent-replacement
+                # defect (an operator's queued check/download would vanish).
+                $existingRequest = ''
+                if ($Computer.PSObject.Properties['PendingOp'] -and $Computer.PendingOp) { $existingRequest = [string]$Computer.PendingOp }
+                if ($existingRequest -eq '') {
                     $computer.Status = 'Auto-install of downloaded updates queued...'
                     $computer.State = 'Installing'
                     $Computer.PendingOp = 'InstallAndRecheck'
                     $Computer.Pending   = $true
-                if ($stateStore) { $stateStore.Touch() }
+                    if ($stateStore) { $stateStore.Touch() }
+                }
             }
         }
     }
@@ -1940,11 +1951,19 @@ $GetUpdates = {
             # Queue a follow-up download instead of nested-BeginInvoke on this busy runspace
             # (a second pipeline started from inside the runspace silently never runs).
             # If AutoInstall is also on, run the full unattended chain in ONE later pipeline.
+            #
+            # SS7: an INTERNAL follow-up must not displace an operator's queued request. Same inlined
+            # rule as the auto-install tail above - the payload runs in an isolated runspace where no
+            # module function resolves. See Set-WuuPendingOperation.
+            $existingRequestAd = ''
+            if ($Computer.PSObject.Properties['PendingOp'] -and $Computer.PendingOp) { $existingRequestAd = [string]$Computer.PendingOp }
+            if ($existingRequestAd -eq '') {
                 $computer.Status = 'Auto-download of available updates queued...'
                 $computer.State = 'Downloading'
                 $Computer.PendingOp = if ($stateStore.Settings.AutoInstall) { 'AutoFlow' } else { 'Download' }
                 $Computer.Pending   = $true
-            if ($stateStore) { $stateStore.Touch() }
+                if ($stateStore) { $stateStore.Touch() }
+            }
         }
     }
     Catch{
@@ -3436,14 +3455,17 @@ $consoleActions.EventToggleSettings = {
 $consoleActions.EventGetUpdates = {
     $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Check which computers? ("all" for every row, Enter to cancel)')
     if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
-    $started = 0; $deferred = 0; $skipped = 0
+    $started = 0; $deferred = 0; $skipped = 0; $replaced = @()
     foreach ($r in $rows) {
         # One operation per computer (SS3): a computer already working is left queued, NOT submitted
         # to. Set Pending so the scheduler starts it as soon as the current operation finishes -
         # a plain skip would lose the operator's request.
         if (Test-WuuComputerBusy -Row $r) {
-            $r.Pending = $true
-            if (-not $r.PendingOp) { $r.PendingOp = 'Check' }
+            # SS7: the slot holds ONE request, so a second one replaces the first. -OnlyIfEmpty keeps
+            # this a REQUEST rather than a queue: an existing operator request is never displaced by
+            # a plain re-check, so nothing is lost here.
+            $pendingResult = Set-WuuPendingOperation -Row $r -Op 'Check' -OnlyIfEmpty
+            if ($pendingResult.Replaced) { $replaced += ($r.Computer + ' (' + $pendingResult.Replaced + ')') }
             $deferred++
             continue
         }
@@ -3454,6 +3476,9 @@ $consoleActions.EventGetUpdates = {
     if ($stateStore) { $stateStore.Touch() }
     Write-Host ("  Update check queued for {0} computer(s)." -f $started) -ForegroundColor Green
     if ($deferred) { Write-Host ("  {0} already busy - queued to run when they finish." -f $deferred) -ForegroundColor Yellow }
+    if ($replaced.Count) {
+        Write-Host ("  {0} had a queued request NOT replaced (the existing request is kept): {1}" -f $replaced.Count, ($replaced -join ', ')) -ForegroundColor DarkGray
+    }
     if ($skipped) { Write-Host ("  {0} could not be submitted (see the error log)." -f $skipped) -ForegroundColor Red }
 }
 
@@ -3463,7 +3488,7 @@ $consoleActions.EventDownloadUpdates = {
     if (-not (Read-WuuYesNo -Prompt "Download updates to $($rows.Count) computer(s)?" -Default $true)) {
         Write-Host '  Cancelled.' -ForegroundColor Yellow; return
     }
-    $started = 0; $deferred = 0; $uptodate = 0
+    $started = 0; $deferred = 0; $uptodate = 0; $replaced = @()
     foreach ($r in $rows) {
         # Nothing to do - answer immediately rather than queuing an operation that will no-op.
         if ($r.Available -eq $r.Downloaded) {
@@ -3472,8 +3497,11 @@ $consoleActions.EventDownloadUpdates = {
             continue
         }
         if (Test-WuuComputerBusy -Row $r) {
-            $r.Pending = $true
-            $r.PendingOp = 'Download'
+            # SS7: this DISPLACES any queued request, and a displacement is reported. `install` then
+            # `download` on a busy computer used to replace the install with a download silently, so
+            # an operator who asked for MORE got less with no indication. See Set-WuuPendingOperation.
+            $pendingResult = Set-WuuPendingOperation -Row $r -Op 'Download'
+            if ($pendingResult.Replaced) { $replaced += ($r.Computer + ' (' + $pendingResult.Replaced + ' -> Download)') }
             $deferred++
             continue
         }
@@ -3484,6 +3512,9 @@ $consoleActions.EventDownloadUpdates = {
     if ($stateStore) { $stateStore.Touch() }
     Write-Host ("  Download started for {0} computer(s)." -f $started) -ForegroundColor Green
     if ($deferred) { Write-Host ("  {0} already busy - queued to run when they finish." -f $deferred) -ForegroundColor Yellow }
+    if ($replaced.Count) {
+        Write-Host ("  {0} had a queued request REPLACED by this one (one request per computer): {1}" -f $replaced.Count, ($replaced -join ', ')) -ForegroundColor Yellow
+    }
     if ($uptodate) { Write-Host ("  {0} had nothing to download." -f $uptodate) -ForegroundColor DarkGray }
 }
 
@@ -3493,11 +3524,13 @@ $consoleActions.EventInstallUpdates = {
     if (-not (Read-WuuYesNo -Prompt "Install updates on $($rows.Count) computer(s)?" -Default $false)) {
         Write-Host '  Cancelled.' -ForegroundColor Yellow; return
     }
-    $started = 0; $deferred = 0
+    $started = 0; $deferred = 0; $replaced = @()
     foreach ($r in $rows) {
         if (Test-WuuComputerBusy -Row $r) {
-            $r.Pending = $true
-            $r.PendingOp = 'InstallAndRecheck'
+            # SS7: displaces any queued request - including a queued DOWNLOAD, which this upgrade of
+            # it would have destroyed silently before. A replacement is reported below.
+            $pendingResult = Set-WuuPendingOperation -Row $r -Op 'InstallAndRecheck'
+            if ($pendingResult.Replaced) { $replaced += ($r.Computer + ' (' + $pendingResult.Replaced + ' -> InstallAndRecheck)') }
             $deferred++
             continue
         }
@@ -3508,6 +3541,9 @@ $consoleActions.EventInstallUpdates = {
     if ($stateStore) { $stateStore.Touch() }
     Write-Host ("  Install started for {0} computer(s)." -f $started) -ForegroundColor Green
     if ($deferred) { Write-Host ("  {0} already busy - queued to run when they finish." -f $deferred) -ForegroundColor Yellow }
+    if ($replaced.Count) {
+        Write-Host ("  {0} had a queued request REPLACED by this one (one request per computer): {1}" -f $replaced.Count, ($replaced -join ', ')) -ForegroundColor Yellow
+    }
 }
 
 $consoleActions.EventRestartComputer = {

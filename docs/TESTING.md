@@ -109,7 +109,7 @@ A skipped test proves nothing. When quoting evidence, say "skipped in this envir
 | Single submission point (8.5) | **asserted** | shape check, plus validator gate (x) |
 | `WhatIf` (8.9) | **asserted** | validator gate (ae) |
 | Connectivity ≠ deletion (8.10) | **asserted** | threshold + reset |
-| Timeouts (8.7/§8 ab) | **asserted** | deadline recorded and enforced by the cleanup loop |
+| Timeouts (gate ab) | **asserted** | deadline recorded at submission and enforced by the cleanup loop |
 | Exit codes | **asserted** | validator gate (aa) |
 | Workflow state vs display state | **asserted** | validator gate (ac) |
 | Reboot / cancellation | **asserted** | validator gate (ag) |
@@ -197,10 +197,19 @@ These do not exist. Their absence is why the corresponding invariant is TARGET r
 | Target invariant | Test to write | Why it cannot pass today |
 | --- | --- | --- |
 | 8.4 terminal states are terminal | every transition out of `Complete`/`Failed`/`TimedOut`/`Cancelled`/`Refused` is rejected | no transition guard exists, and four of those names are not `State` values |
-| 8.6 absolute concurrency cap | N+1 direct submissions to `Start-UpdateCheckJob` leave `jobs.Count -le MaxConcurrentJobs` | the cap lives only in the scheduler tick |
-| 8.7 pending work is not discarded | a second request while busy is queued or reported, never silently dropped | one slot, overwritten in place |
 
-**8.2 and 8.3 are no longer on this list.** Phase 2 implemented them:
+**8.2, 8.3, 8.6 and 8.7 are no longer on this list** — they are implemented and enforced:
+
+| Invariant | Suite | Assertions |
+| --- | --- | --- |
+| 8.2 operation identity, 8.3 stale-worker rejection | `tests\Test-OperationIdentity.ps1` | 61 |
+| 8.6 absolute concurrency cap | `tests\Test-ConcurrencyCap.ps1` | 20 |
+| 8.7 pending-request policy | `tests\Test-PendingPolicy.ps1` | 42 |
+
+Each has a validator gate alongside it ((ah), (ai), (aj)). The identity and pending suites use a
+**differential**: they extract each shipped guard condition from source and drive it on a truth table
+against the function it must mirror, so an inlined copy that drifts fails. The cap suite drives the
+**real submission point** — the path the cap was missing on — rather than the scheduler.
 `tests\Test-OperationIdentity.ps1` (61 assertions) proves operation identity exists and that a proven
 stale writer is refused. Its core is a differential that extracts each of the six shipped guard
 conditions from source and drives it on a truth table, so an inlined copy that drifts from the module

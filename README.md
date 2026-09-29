@@ -418,20 +418,29 @@ behind each — including the ones that were wrong first — is in
 Run the regression suites (all headless, no admin required):
 
 ```powershell
-Get-ChildItem .\tests\Test-*.ps1 | Where-Object { $_.Name -notin @('Test-ColumnResize.ps1','Test-DragResize.ps1') } | ForEach-Object {
-    powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File $_.FullName
-}
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Invoke-TestSuites.ps1
 ```
+
+The runner captures each suite's exit code, distinguishes `SKIP` from `PASS`, imposes a per-suite
+timeout, and **exits non-zero if any suite failed** — so it is safe to use as a CI gate. `-Json` emits
+a machine-readable summary; `-Suite <name>` runs one suite; `-TimeoutSeconds` raises the deadline.
+
+> **Do not replace it with a `ForEach-Object` loop.** That is the pattern it was written to fix: the
+> loop printed each suite's output but discarded every exit code, so a failing tree reported success.
 
 All suites are headless and need no admin. **`Test-RemoteTask` skips** (exit 0 with a `SKIP:` marker)
 when it is not elevated, because it registers a SYSTEM scheduled task; run it from an elevated prompt
-to exercise it. A per-suite timeout with straggler cleanup is worth wrapping around the loop — one
-hung suite should not stall a full run.
+to exercise it. The runner reports skips separately, because a skip is not a failure but it is also
+not coverage — if you are validating something only that suite covers, say it was skipped rather than
+claiming it passed.
+
+CI runs both gates on every push and pull request: the release validator (structure) and the suite
+runner (behaviour). See [`.github/workflows/validate.yml`](.github/workflows/validate.yml).
 
 > **Two stale suites:** `tests\Test-ColumnResize.ps1` and `tests\Test-DragResize.ps1` are GUI-edition
 > leftovers that exercise WPF column drag-resize, which does not exist here. ColumnResize fails on
 > its missing WPF assemblies; **DragResize hangs** (blocking dispatcher pump). Both should be deleted,
-> and both are excluded from the loop above.
+> and both are excluded by the runner. The timeout exists because of DragResize.
 
 Build a release zip:
 

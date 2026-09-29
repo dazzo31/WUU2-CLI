@@ -379,7 +379,10 @@ Gates that correspond to §8 invariants:
 | Invariant | Gate |
 | --- | --- |
 | 8.1 one operation per computer | (u), (v), (w) |
+| 8.2 operation identity / 8.3 stale writers | (ah) |
 | 8.5 single submission point | (x) |
+| 8.6 absolute concurrency cap | (ai) |
+| 8.7 pending-request policy | (aj) |
 | 8.8 credential determinism | (ad) |
 | 8.9 WhatIf | (ae) |
 | 8.10 inventory vs connectivity | (z) |
@@ -388,5 +391,6 @@ Gates covering adjacent behaviour: (ab) per-operation timeouts, (aa) exit codes,
 display state, (ag) reboot/cancellation, (af) source encoding, (r) no GUI control member in shipped
 source, (s)/(t) scheduler and settings read the store.
 
-**No gate exists for 8.4, 8.6 or 8.7** — which is why their status is TARGET. Gate (ah) covers 8.2/8.3
-(operation identity and stale-writer rejection), added in Phase 2.
+**No gate exists for 8.4 only** — which is why its status is TARGET. Gate (ah) covers 8.2/8.3
+(operation identity and stale-writer rejection), **(ai)** covers 8.6 (the absolute concurrency cap) and
+**(aj)** covers 8.7 (the pending-request policy).

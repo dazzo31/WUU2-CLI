@@ -303,10 +303,20 @@ foreach ($pair in @(
 $deferBody = [regex]::Match($coreRaw, '\$consoleActions\.EventDownloadUpdates = \{[\s\S]*?\n\}').Value
 # SINGLE-quoted pattern. In a double-quoted string `$r` INTERPOLATES, and `$r` holds a command result
 # object in this test - so the pattern became garbage and the check failed on correct code. PowerShell
-# escapes with a backtick, not a backslash, so `\.` alone does not protect a `$`. Second time in this
-# pass that an interpolating pattern produced a false failure.
-if ($deferBody -match '\$r\.Pending = \$true' -and $deferBody -match '\$r\.PendingOp = ''Download''') {
-    Ok 'the download handler really defers (sets Pending + PendingOp) - the plan is truthful'
+# escapes with a backtick, not a backslash, so `\.` alone does not protect a `$`.
+#
+# TWO ACCEPTABLE FORMS, because the SS7 pending-policy work moved the assignment out of the handler:
+# the handler may assign Pending/PendingOp itself, OR it may delegate to Set-WuuPendingOperation (which
+# sets both). Asserting only the literal form failed CORRECT code; asserting only the function name
+# would prove nothing. The invariant is unchanged: a deferred request must end up Pending.
+$deferDirect = ($deferBody -match '\$r\.Pending = \$true' -and $deferBody -match "\`$r\.PendingOp = 'Download'")
+# The policy lives in Wuu.State, so read it from there - this test only loads Wuu.Core.
+$pendingPolicyBody = [regex]::Match((Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw), 'function Set-WuuPendingOperation[\s\S]*?\n\}').Value
+$deferViaPolicy = ($deferBody -match "Set-WuuPendingOperation -Row \`$r -Op 'Download'") -and
+                  ($pendingPolicyBody -match '\$Row\.PendingOp = \$Op') -and
+                  ($pendingPolicyBody -match '\$Row\.Pending = \$true')
+if ($deferDirect -or $deferViaPolicy) {
+    Ok 'the download handler really defers (sets Pending + PendingOp, directly or via the SS7 policy) - the plan is truthful'
 } else {
     Bad 'the download handler does not defer - the plan claims it does'
 }

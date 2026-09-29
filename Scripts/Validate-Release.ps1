@@ -1300,8 +1300,23 @@ if ($cmdRawP -match "\`$Verb -in @\('restart', 'service'\)\)\s*\{\s*'refuse'") {
     Fail "the plan's busy policy is not refuse-for-restart/service - it could promise a reboot it will not perform (SS11)"
 }
 # Deferring handlers must actually set Pending, or the plan's 'queue' action is a lie.
-if ($coreRawP -match 'if \(Test-WuuComputerBusy -Row \$r\) \{[^}]*\$r\.Pending = \$true') {
-    Pass 'the deferring handlers really set Pending, so the plan''s queue action is truthful (SS11)'
+#
+# Two acceptable forms, and the SECOND one is why this check was widened: after the SS7 pending-policy
+# work, a handler delegates to Set-WuuPendingOperation instead of assigning Pending itself. The
+# invariant is unchanged - a deferred request must end up Pending - so it is now asserted in two
+# halves: the handler routes through the policy, AND the policy sets Pending. Checking only for the
+# literal assignment would have failed correct code (it did), and checking only for the function name
+# would prove nothing at all.
+#
+# The state source is read HERE rather than reused from gate (aj), which is defined further down this
+# file - referencing it would be $null at this point and the check would silently pass a broken
+# invariant. (It failed loudly instead, which is how this was found.)
+$stateRawP = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+$handlerSetsPending = [bool]($coreRawP -match 'if \(Test-WuuComputerBusy -Row \$r\) \{[\s\S]{0,400}?\$r\.Pending = \$true')
+$handlerUsesPolicy = [bool]($coreRawP -match "Set-WuuPendingOperation -Row \`$r -Op '(Download|InstallAndRecheck)'")
+$policySetsPending = [bool]((Get-WuuFunctionBody $stateRawP 'Set-WuuPendingOperation') -match '\$Row\.Pending = \$true')
+if ($handlerSetsPending -or ($handlerUsesPolicy -and $policySetsPending)) {
+    Pass 'the deferring handlers really set Pending (directly or via the SS7 policy), so the plan''s queue action is truthful (SS11)'
 } else {
     Fail "a deferring handler no longer sets Pending - the plan would claim a request is honoured later when it is dropped (SS11)"
 }
@@ -1587,6 +1602,149 @@ if ($removeIdxA -gt 0) {
     }
 } else {
     Fail 'could not locate the out-of-band job removal path'
+}
+
+# (ai) GLOBAL CONCURRENCY CAP (brief SS4 / invariant 8.6). The cap used to be applied in ONE place -
+#      the scheduler tick - while every console handler calls the submission point DIRECTLY in a loop.
+#      The per-computer gate bounds each computer to one operation; it says nothing about how many
+#      computers run at once, so `-All` over a large estate could start one pipeline per computer with
+#      no ceiling. The only `MaxConcurrentJobs` mention inside the submission point was a COMMENT, and
+#      this file had NO gate for the cap at all (its one mention was also a comment).
+#
+#      A gate cannot prove the runtime bound; tests\Test-ConcurrencyCap.ps1 drives the real submission
+#      point and asserts admission stops at the cap (and that it is not a no-op). What this gate
+#      asserts is the WIRING: the predicate exists, it is consulted AT the submission point, both
+#      admission paths read the cap from the same source, and it cannot be satisfied by a comment.
+$stateRawI = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+$wupdRawI = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+
+if ($stateRawI -notmatch 'function\s+Test-WuuConcurrencyAvailable\s*\{') {
+    Fail 'Test-WuuConcurrencyAvailable is missing - the global cap has no testable predicate (SS4)'
+} else {
+    Pass 'the global concurrency cap has a single testable predicate (SS4)'
+}
+
+# A cap of 0 or a negative cap must REFUSE, matching the scheduler's `-ge` test. If the predicate
+# treated a non-positive cap as "unlimited" the two admission paths would disagree.
+$capBodyI = Get-WuuFunctionBody $stateRawI 'Test-WuuConcurrencyAvailable'
+# The presence of `-le 0` is NOT the invariant: a tautology experiment that changed only the RETURN
+# value (`$false` -> `$true`) kept `-le 0` intact and slipped past the first version of this check.
+# The invariant is that a non-positive cap REFUSES, so the whole guard-and-return is asserted.
+if ($capBodyI -notmatch 'if \(\$MaxConcurrentJobs -le 0\) \{ return \$false \}') {
+    Fail 'the cap predicate does not REFUSE a non-positive cap - a misconfigured cap would silently become unlimited, and the scheduler and the submission point would disagree (SS4)'
+}
+if ($capBodyI -notmatch 'if \(\$null -eq \$Jobs\) \{ return \$false \}') {
+    Fail 'the cap predicate does not fail closed on a missing job list (SS4)'
+}
+
+# The check must be AT THE SUBMISSION POINT, not only in the scheduler. Get-WuuFunctionBody slices to
+# the next top-level 'function ', so this window is the submission function only.
+$submitBodyI = Get-WuuTextWithoutComments -Text (Get-WuuFunctionBody $wupdRawI 'Start-UpdateCheckJob')
+if ($submitBodyI -notmatch 'Test-WuuConcurrencyAvailable') {
+    Fail 'the submission point does not consult the global cap - console handlers call it directly in a loop, so the cap would not apply to them (SS4/8.6)'
+} else {
+    Pass 'the submission point consults the global cap (SS4/8.6)'
+}
+# The refusal must come BEFORE capacity is consumed. The real boundary is `$jobs.Add`, not the
+# `OpState = 'Running'` line, and the difference is not academic: a tautology experiment that left the
+# check present but moved it below `$jobs.Add` passed an `OpState`-anchored ordering test (7 of the
+# suite's assertions caught it, but the gate did not). Checking after the add means the row is
+# admitted and MARKED BUSY while the pipeline was never started - the computer is then stuck until the
+# next cleanup pass, and the job list briefly over-counts, throttling an estate that has capacity.
+$capCheckAtI = $submitBodyI.IndexOf('Test-WuuConcurrencyAvailable')
+$capRefuseAtI = $submitBodyI.IndexOf('global concurrency cap reached')
+$addJobAtI = $submitBodyI.IndexOf('$jobs.Add(')
+$markRunningAtI = $submitBodyI.IndexOf("OpState = 'Running'")
+if ($capRefuseAtI -lt 0) {
+    Fail 'the global-cap refusal is not logged - an operator cannot distinguish "throttled" from "never ran" (SS4)'
+} elseif ($addJobAtI -lt 0) {
+    Fail 'could not locate the job admission in the submission point'
+} elseif ($capCheckAtI -gt $addJobAtI) {
+    Fail 'the global cap is checked AFTER $jobs.Add - the operation has already consumed capacity and can be marked busy without its pipeline ever starting (SS4)'
+} elseif ($markRunningAtI -ge 0 -and $capCheckAtI -gt $markRunningAtI) {
+    Fail 'the global cap is checked AFTER OpState is set to Running - a refused operation would leave its computer permanently busy, which is worse than the missing cap it fixed (SS4)'
+} else {
+    Pass 'the global cap is checked, and refuses, before capacity is consumed or the operation is marked Running (SS4)'
+}
+# Both admission paths must read the cap from the same place, or one could be raised while the other
+# still throttles at the old value.
+if ($submitBodyI -notmatch '\$MaxConcurrentJobs = \$ctx\.MaxConcurrentJobs') {
+    Fail 'the submission point does not take the cap from the shared context - it could disagree with the scheduler tick about the same estate (SS4)'
+} elseif ($wupdRawI -notmatch '\$MaxConcurrentJobs = \$ctx\.MaxConcurrentJobs') {
+    Fail 'the scheduler tick does not take the cap from the shared context (SS4)'
+} else {
+    Pass 'both admission paths read the cap from the same context value (SS4)'
+}
+
+# (aj) PENDING-REQUEST POLICY (brief SS7 / invariant 8.7). A row has ONE PendingOp slot, so a second
+#      request to a busy computer silently destroyed the first: `download` then `install` left the
+#      Download gone while the operator was told only "queued to run when they finish". The direction
+#      that is easy to miss is the DOWNGRADE - `install` then `download` destroyed the install, so an
+#      operator who asked for more got less with no indication at all.
+#
+#      THE POLICY: one slot, newest request wins, and a replacement is ALWAYS REPORTED. Refusing a
+#      second request outright would make `download` then `install` silently do nothing.
+$stateRawJ = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+$coreRawJ = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+
+if ($stateRawJ -notmatch 'function\s+Set-WuuPendingOperation\s*\{') {
+    Fail 'Set-WuuPendingOperation is missing - the pending-request policy has no single implementation (SS7)'
+} else {
+    Pass 'the pending-request policy has a single implementation (SS7)'
+}
+# It must RETURN the replaced value, and it must actually CAPTURE it. A tautology experiment that left
+# `Replaced = $replaced` in place while deleting the `$replaced = $existing` assignment kept this check
+# passing (`$replaced` simply stayed $null) - presence of the field is not the invariant; the capture
+# is. Both halves asserted.
+$pendingBodyJ = Get-WuuFunctionBody $stateRawJ 'Set-WuuPendingOperation'
+if ($pendingBodyJ -notmatch '\$replaced = \$existing') {
+    Fail 'Set-WuuPendingOperation no longer CAPTURES the displaced request - it would return a null Replaced and the caller could not report the replacement, which was the actual defect (SS7)'
+} elseif ($pendingBodyJ -notmatch 'Replaced = \$replaced') {
+    Fail 'Set-WuuPendingOperation does not return the replaced request (SS7)'
+}
+# -OnlyIfEmpty must be a real GUARD, not merely mentioned. Asserting the word alone passed a mutant
+# that kept `if ($OnlyIfEmpty ...)` but evaluated it as $false.
+if ($pendingBodyJ -notmatch "if \(\`$OnlyIfEmpty -and \`$existing -ne ''\) \{ return \`$noChange \}") {
+    Fail 'Set-WuuPendingOperation lost its -OnlyIfEmpty GUARD - an internal follow-up could displace an operator request (SS7)'
+} else {
+    Pass 'the policy captures the displaced request and guards -OnlyIfEmpty (SS7)'
+}
+
+# No operator-facing handler may assign PendingOp directly. That bare assignment IS the defect.
+$handlersWithBareAssign = @()
+$coreCodeJ = Get-WuuTextWithoutComments -Text $coreRawJ
+foreach ($h in @('EventGetUpdates', 'EventDownloadUpdates', 'EventInstallUpdates')) {
+    $m = [regex]::Match($coreCodeJ, ('\$consoleActions\.' + $h + ' = \{[\s\S]{0,2600}'))
+    if (-not $m.Success) { continue }
+    if ($m.Value -match '\$r\.PendingOp = ') { $handlersWithBareAssign += $h }
+    if ($m.Value -notmatch 'Set-WuuPendingOperation') { $handlersWithBareAssign += ($h + ' (does not use the policy)') }
+}
+if ($handlersWithBareAssign.Count) {
+    Fail ('handler(s) still assign PendingOp directly instead of using the policy - a second request would silently destroy the first: ' + ($handlersWithBareAssign -join ' | '))
+} else {
+    Pass 'all 3 operator-facing handlers route through the pending policy (SS7)'
+}
+# The two handlers that CAN displace must report it. A reported policy is the whole point.
+foreach ($h in @('EventDownloadUpdates', 'EventInstallUpdates')) {
+    $m = [regex]::Match($coreCodeJ, ('\$consoleActions\.' + $h + ' = \{[\s\S]{0,2600}'))
+    if ($m.Success -and $m.Value -notmatch 'REPLACED by this one') {
+        Fail "$h can displace a queued request but does not report the replacement - that is the silent overwrite with a tidier implementation (SS7)"
+    }
+}
+# The payloads run in ISOLATED runspaces and must inline -OnlyIfEmpty: READ the existing request, then
+# queue only when it is empty. Asserted as a PAIR of facts, because matching the guard text alone
+# passed a mutant that replaced the condition with `if ($true)` - the text `if ($existingRequestAd -eq
+# '')` disappeared but the surrounding shape did not, and a presence-only check cannot tell the two
+# apart. Comments are excluded, because the explanation quotes the rule.
+$payloadGuards = ([regex]::Matches($coreRawJ, "if \(\`$existingRequest(Ad)? -eq ''\) \{")).Count
+$payloadReads = ([regex]::Matches($coreRawJ, "if \(\`$Computer\.PSObject\.Properties\['PendingOp'\] -and \`$Computer\.PendingOp\) \{ \`$existingRequest(Ad)? = ")).Count
+$payloadInCode = ([regex]::Matches($coreCodeJ, "if \(\`$existingRequest(Ad)? -eq ''\) \{")).Count
+if ($payloadInCode -lt 2) {
+    Fail "only $payloadInCode payload guard(s) present in CODE (comments excluded) - an automatic follow-up could displace an operator's queued request (SS7)"
+} elseif ($payloadReads -lt 2) {
+    Fail "only $payloadReads payload guard(s) READ the existing request - a guard that does not read the slot cannot detect a collision, and could be satisfied by a constant (SS7)"
+} else {
+    Pass "both payload follow-ups read the existing request and queue only when it is empty ($payloadInCode/2, $payloadReads/2) (SS7)"
 }
 
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
