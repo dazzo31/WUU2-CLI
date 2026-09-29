@@ -1460,5 +1460,134 @@ if ($connCode -notmatch 'PSObject\.Properties\[''Resolves''\]') {
 }
 if (-not $failed) { Pass 'cancellation surfaces, and both probe-result shapes, are intact (SS16)' }
 
+# (ah) OPERATION IDENTITY (brief SS2/SS3). Invariant 8.1 makes a stale worker UNREACHABLE, not SAFE:
+#      nothing compared an operation identity, so nothing rejected a stale result. Three paths can
+#      emit one - the cleanup loop settling a force-stopped job after the computer was resubmitted,
+#      a payload parked mid-write when the timeout path detaches the runspace, and the out-of-band
+#      job removal in Remove-WuuComputers.
+#
+#      The rule is written in SIX places: one module function plus five inlined copies, because the
+#      cleanup loop and the injected worker writer run in isolated runspaces where no module function
+#      resolves. An inlined copy that drifts is invisible to every other check in this file, so this
+#      gate asserts the COPIES EXIST and that the two functions have the SHAPE they are documented to
+#      have. The behavioural equivalence of all six is asserted by tests\Test-OperationIdentity.ps1,
+#      which extracts each shipped condition and drives it on a truth table - a gate cannot do that
+#      without re-implementing the comparison, which is the thing that could drift.
+$stateRawA = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+$wupdRawA = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+$coreRawA = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+
+# The row must carry the identity, defaulting to empty (nothing owns a fresh row).
+if ($stateRawA -notmatch "OperationId\s*=\s*''") {
+    Fail 'the row contract has no OperationId field - no writer can prove which operation it belongs to (SS2)'
+} else {
+    Pass 'the row contract carries an operation identity (SS2)'
+}
+
+# The generator must exist and must NOT be a bare timestamp or the computer name.
+if ($stateRawA -notmatch 'function New-WuuOperationId') {
+    Fail 'New-WuuOperationId is missing - operations have no identity to compare (SS2)'
+} elseif ($stateRawA -notmatch 'NewGuid') {
+    Fail 'the operation identity is not guaranteed unique (no GUID component) - two submissions could collide (SS2)'
+} else {
+    Pass 'operation identities are unique and independent of the computer name (SS2)'
+}
+
+# Both rules must exist and must be exported: the id is created in Wuu.WindowsUpdate, enforced in
+# Wuu.Core and asserted by tests.
+foreach ($fn in @('Test-WuuOperationCurrent', 'Test-WuuStaleWrite')) {
+    # `function Name {` - NOT `function Name(`. PowerShell functions take no parentheses at the
+    # declaration site, and requiring one made this gate report both functions "missing" while they
+    # were present. The check was wrong, not the code.
+    if ($stateRawA -notmatch ("function\s+{0}\s*\{{" -f [regex]::Escape($fn))) {
+        Fail "$fn is missing - a stale writer has nothing to consult (SS3)"
+    }
+    if ($stateRawA -notmatch ("'" + [regex]::Escape($fn) + "'")) {
+        Fail "$fn is not exported - the submission point, the cleanup loop and the tests cannot all agree on one rule (SS3)"
+    }
+}
+
+# The two rules must NOT collapse into one. A release needs "proven current" (an unattributed job
+# must not unlock a row it cannot name); a write needs only "proven stale" (list loading writes rows
+# that have no operation). A future simplification of either into the other would look harmless.
+$currentBody = Get-WuuFunctionBody $stateRawA 'Test-WuuOperationCurrent'
+$staleBody = Get-WuuFunctionBody $stateRawA 'Test-WuuStaleWrite'
+if ($currentBody -notmatch '-ceq' -or $staleBody -notmatch '-cne') {
+    Fail 'the release and write identity rules no longer differ in polarity - collapsing them either deadlocks a computer (release too strict) or unlocks it while busy (write too strict) (SS3)'
+} elseif ($staleBody -match '-ceq') {
+    Fail 'Test-WuuStaleWrite compares with -ceq - it would then refuse the WRONG writes (the owner instead of the superseded operation) (SS3)'
+} else {
+    Pass 'the release rule requires proven ownership and the write rule refuses only proven staleness (SS3)'
+}
+
+# The submission point must create the identity BEFORE BeginInvoke, and put it on the JOB entry -
+# the cleanup loop holds the job, not the row.
+$submitBodyA = Get-WuuTextWithoutComments -Text (Get-WuuFunctionBody $wupdRawA 'Start-UpdateCheckJob')
+$idAt = $submitBodyA.IndexOf('New-WuuOperationId')
+$beginAt = $submitBodyA.IndexOf('BeginInvoke()')
+if ($idAt -lt 0) {
+    Fail 'the submission point does not create an operation identity (SS2)'
+} elseif ($beginAt -ge 0 -and $idAt -gt $beginAt) {
+    Fail 'the operation identity is created AFTER BeginInvoke - the payload can start on its own thread first, and a legitimate writer would be judged stale against the previous id (SS2)'
+} elseif ($submitBodyA -notmatch 'OperationId = \$operationId') {
+    Fail 'the job entry does not carry the operation identity - the cleanup loop holds only (Computer, Runspace, StartTime) and cannot tell which operation it is settling (SS3)'
+} elseif ($submitBodyA -notmatch "SetVariable\('WuuOperationId'") {
+    Fail 'the identity is not injected into the worker runspace - the payload writer could never attribute its writes, so the guard would never fire (SS3)'
+} else {
+    Pass 'the identity is created before BeginInvoke, carried on the job entry, and injected into the worker (SS2/SS3)'
+}
+
+# All three cleanup-loop release paths must be identity-guarded. Counted by their job-entry read:
+# each pass must read OperationId off BOTH the job entry and the row before mutating.
+$loopBodyA = Get-WuuTextWithoutComments -Text (Get-WuuFunctionBody $coreRawA 'Start-WuuApplication')
+if (-not $loopBodyA) { $loopBodyA = $coreRawA }
+$guardedReleases = ([regex]::Matches($coreRawA, "PSObject\.Properties\['OperationId'\]\) \{ \`$jobOpId")).Count +
+                   ([regex]::Matches($coreRawA, "PSObject\.Properties\['OperationId'\]\) \{ \`$toOpId")).Count
+if ($guardedReleases -lt 3) {
+    Fail "only $guardedReleases of 3 cleanup-loop release path(s) read the job identity - an unguarded pass releases the lock of whatever operation now owns the row (SS3)"
+} else {
+    Pass "all 3 cleanup-loop release paths are identity-guarded ($guardedReleases/3) (SS3)"
+}
+
+# The writer choke point - both copies - must refuse a proven-stale write.
+$writerCore = Get-WuuTextWithoutComments -Text (Get-WuuFunctionBody $coreRawA 'SafeUpdateListViewItem')
+if ($writerCore -notmatch '-cne \$writerOpId') {
+    Fail 'the module-scope row writer has no staleness guard - a superseded payload would restamp the current operation (SS3)'
+} else {
+    Pass 'the module-scope row writer refuses a proven-stale write (SS3)'
+}
+$injectedWriter = Get-WuuTextWithoutComments -Text ([regex]::Match($wupdRawA, "SetVariable\('SafeUpdateListViewItemScript'[\s\S]{0,3000}").Value)
+if ($injectedWriter -notmatch '-cne \$writerOpId') {
+    Fail 'the runspace-injected row writer has no staleness guard - the copy the PAYLOAD actually uses is unprotected (SS3)'
+} elseif ($injectedWriter -notmatch 'WuuOperationId') {
+    Fail 'the injected writer does not read $WuuOperationId, so every payload write is unattributed and the guard can never fire (SS3)'
+} else {
+    Pass 'the injected worker writer refuses a proven-stale write and reads its own identity (SS3)'
+}
+
+# The timeout path must DETACH the runspace before releasing the lock. Without it, a resubmission in
+# the async Stop() window inherits a torn-down runspace while the old payload still writes through it.
+if ($coreRawA -notmatch "Properties\['Runspace'\]\) \{ \`$toRow\.Runspace = \`$null \}") {
+    Fail 'the timeout path does not detach the row runspace before releasing the lock - a resubmission can build against a runspace that is still draining, and the old payload keeps writing through it (SS3)'
+} else {
+    Pass 'the timeout path detaches the runspace before releasing the lock (SS3)'
+}
+
+# The out-of-band removal path must release the lock AND retire the identity.
+$removeIdxA = $coreRawA.IndexOf('Failed to remove job from list')
+if ($removeIdxA -gt 0) {
+    $removeWindow = $coreRawA.Substring($removeIdxA, [Math]::Min(2500, $coreRawA.Length - $removeIdxA))
+    # Anchored on the CODE token (the catch-block message), then searched for the retirement line.
+    # The window is generous because the explanatory comment between them is long, and the
+    # explanatory text is exactly what made an earlier revision of this check fail on correct code.
+    if ($removeWindow -notmatch "OperationId'\]\) \{ \`$Computer\.OperationId = ''") {
+        Fail 'the out-of-band job removal does not retire the operation identity - a late writer could present a valid token for a job that no longer exists (SS3)'
+    } else {
+        Pass 'the out-of-band job removal releases the lock and retires the identity (SS3)'
+    }
+} else {
+    Fail 'could not locate the out-of-band job removal path'
+}
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

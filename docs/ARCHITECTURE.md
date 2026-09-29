@@ -87,11 +87,10 @@ direct path. Do not read it as covering submission.
 | `TimeoutExpiresAt` / `TimeoutSource` / `OpName` | deadline recorded at submission | enforced by the cleanup loop |
 | `LastHeartbeatAt` / `Heartbeats` | liveness | shown in the status table |
 | `CheckConcluded` | `$null` / `$false` / `$true` | three-state workflow predicate for phase gating |
-| `CredentialEpoch` / `CredentialIdentity` | the identity a reused runspace was built with | invalidates a stale runspace |
-
+| `CredentialEpoch` / `CredentialIdentity` | the identity a reused runspace was built with | invalidates a stale runspace || OperationId | the operation that currently owns this row | **added in Phase 2** — see B10 |
 Notes that matter when writing code:
 
-* there is **no operation record** and **no `OperationId`**; per-computer state is the only granularity;
+* there is **no operation record** (RequestedAction, CreatedAt, Deadline, Result and AuditContext as one object); `OperationId` **does** exist as a row field, but per-computer state is the only granularity;
 * **no `Cancelled` state exists**, and failure/timeout use `Error` / `Timeout` rather than
   `Failed` / `TimedOut`;
 * `State` is display-oriented, so decisions must come from workflow fields (this was a real defect —
@@ -267,11 +266,17 @@ Computer A
   Operation 1's worker finally returns   ← must not update Operation 2
 ```
 
-Every mutation caused by an asynchronous worker must therefore establish
-`worker.OperationId == current.OperationId` before applying its result.
+Every mutation caused by an asynchronous worker must therefore establish which operation it belongs
+to before applying its result.
 
-**Current:** not implemented. Invariant 8.1 makes the scenario *unreachable*; nothing rejects a stale
-result, so there is no guard to test and no protection if 8.1 is ever relaxed.
+**Current: implemented (Phase 2).** `New-WuuOperationId` creates the identity; it is stamped on the
+row, carried on the job entry, and injected into the worker runspace. Two rules enforce it —
+`Test-WuuOperationCurrent` (release only proven ownership) and `Test-WuuStaleWrite` (refuse only
+proven staleness) — mirrored in six sites. See
+[`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8.3.
+
+**Still TARGET:** the operation **record** in §B7. Identity exists; the object it would live on does
+not, and per-computer row fields remain the only granularity.
 
 ### B11. Credential architecture
 
@@ -383,4 +388,5 @@ Gates covering adjacent behaviour: (ab) per-operation timeouts, (aa) exit codes,
 display state, (ag) reboot/cancellation, (af) source encoding, (r) no GUI control member in shipped
 source, (s)/(t) scheduler and settings read the store.
 
-**No gate exists for 8.2, 8.3, 8.4, 8.6 or 8.7** — which is why their status is TARGET.
+**No gate exists for 8.4, 8.6 or 8.7** — which is why their status is TARGET. Gate (ah) covers 8.2/8.3
+(operation identity and stale-writer rejection), added in Phase 2.

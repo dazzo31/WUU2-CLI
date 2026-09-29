@@ -196,11 +196,15 @@ These do not exist. Their absence is why the corresponding invariant is TARGET r
 
 | Target invariant | Test to write | Why it cannot pass today |
 | --- | --- | --- |
-| 8.2 unique operation identity | two operations on one computer receive distinct ids | there is no `OperationId` |
-| 8.3 stale worker rejection | a worker holding an old id cannot mutate the current operation | nothing compares identities |
-| 8.4 terminal states are terminal | every transition out of `Complete`/`Failed`/`TimedOut`/`Cancelled`/`Refused` is rejected | no transition guard exists |
+| 8.4 terminal states are terminal | every transition out of `Complete`/`Failed`/`TimedOut`/`Cancelled`/`Refused` is rejected | no transition guard exists, and four of those names are not `State` values |
 | 8.6 absolute concurrency cap | N+1 direct submissions to `Start-UpdateCheckJob` leave `jobs.Count -le MaxConcurrentJobs` | the cap lives only in the scheduler tick |
 | 8.7 pending work is not discarded | a second request while busy is queued or reported, never silently dropped | one slot, overwritten in place |
+
+**8.2 and 8.3 are no longer on this list.** Phase 2 implemented them:
+`tests\Test-OperationIdentity.ps1` (61 assertions) proves operation identity exists and that a proven
+stale writer is refused. Its core is a differential that extracts each of the six shipped guard
+conditions from source and drives it on a truth table, so an inlined copy that drifts from the module
+function fails.
 
 Rules for these tests:
 
@@ -212,7 +216,9 @@ Rules for these tests:
 
 ## Sequencing
 
-The operation record (Phase 2) is a prerequisite for 8.2, 8.3 and 8.4. The admission cap (Phase 3) and
-the pending-work policy (Phase 4) are independent and can land first.
+Phase 2 introduced the operation identity, so the release/write rules now have something to compare.
+The admission cap (Phase 3) and the pending-work policy (Phase 4) are independent and can land first.
+Terminal-state protection (Phase 6) still needs the operation **record** (§7 of the state machine),
+not merely the identity.
 
 See `docs/DEVELOPMENT.md` for the phase boundaries.

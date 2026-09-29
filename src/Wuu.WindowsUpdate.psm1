@@ -143,6 +143,35 @@ function New-ComputerRunspace {
                 $targetRow = $stateStore.ByName[$ComputerName.ToLowerInvariant()]
                 if (-not $targetRow) { return }
 
+                # SS3: STALE-WRITER GUARD. Identical rule to the module-scope SafeUpdateListViewItem
+                # in Wuu.Core.psm1 - keep both in sync (tests\Test-OperationIdentity.ps1 drives both
+                # and asserts they agree).
+                #
+                # This is the writer the PAYLOAD uses, so it is the one that can be parked mid-write
+                # when the timeout path detaches the runspace. Refuse only a PROVEN staleness: a row
+                # that names an operation, and a writer naming a different one. An unattributed write
+                # is still allowed (list loading writes rows that have no operation).
+                #
+                # The writer's identity comes from $WuuOperationId, injected by Start-UpdateCheckJob
+                # for the operation THIS runspace is currently running. Reading it here (rather than
+                # only from the properties hashtable) is what makes the guard effective: the payload
+                # does not pass an OperationId in its property bags.
+                $writerOpId = ''
+                if ($Properties -and $Properties.ContainsKey('OperationId')) { $writerOpId = [string]$Properties['OperationId'] }
+                if ($writerOpId -eq '' -and $WuuOperationId) { $writerOpId = [string]$WuuOperationId }
+                $rowOpId = ''
+                if ($targetRow.PSObject.Properties['OperationId']) { $rowOpId = [string]$targetRow.OperationId }
+                if ($rowOpId -ne '' -and $writerOpId -ne '' -and $rowOpId -cne $writerOpId) {
+                    # Language constructs only - no Write-WarningLog here (isolated runspace), so the
+                    # refusal goes to the injected log script, which is a plain Add-Content append.
+                    try {
+                        if ($WriteLogFileScript) {
+                            & $WriteLogFileScript ("[{0}] [WARN] [{1}] stale row write refused: the row belongs to operation '{2}', writer is '{3}'" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $ComputerName, $rowOpId, $writerOpId)
+                        }
+                    } catch { }
+                    return
+                }
+
                 foreach ($propertyName in $Properties.Keys) {
                     $targetRow.$propertyName = $Properties[$propertyName]
                 }
@@ -512,12 +541,47 @@ function Start-UpdateCheckJob {
         }
         $PowerShell.Runspace = $ComputerItem.Runspace
 
+        # SS2/SS3: OPERATION IDENTITY, stamped BEFORE the pipeline can run.
+        #
+        # Order matters: BeginInvoke returns immediately and the payload may start executing on its
+        # own thread before this function resumes. Anything the payload or the cleanup loop reads to
+        # decide "am I still current?" must therefore already be in place. Setting the id after
+        # BeginInvoke would open a window where the row still carries the PREVIOUS operation's id,
+        # and a legitimate writer would be judged stale.
+        #
+        # Set on the ROW (so the gate, the renderer and the cleanup loop can all see it) and copied
+        # onto the JOB ENTRY (so the cleanup loop can compare the two without re-deriving anything
+        # from timing - the exact defect this phase closes).
+        $operationId = New-WuuOperationId -Computer $ComputerItem.Computer
+        if ($ComputerItem.PSObject.Properties['OperationId']) { $ComputerItem.OperationId = $operationId }
+
+        # Hand the identity to the WORKER, so the payload's row-writers can attribute their writes.
+        # Without this the injected SafeUpdateListViewItemScript has no way to prove which operation
+        # it is acting for, and the guard could only ever refuse a write that named a different id
+        # explicitly - which no payload does. Set on every submission: the runspace is REUSED, so the
+        # value must be refreshed or a later operation would write under the previous identity.
+        try {
+            if ($ComputerItem.Runspace) {
+                $ComputerItem.Runspace.SessionStateProxy.SetVariable('WuuOperationId', $operationId)
+            }
+        } catch {
+            # Informational only: a runspace that refuses the variable leaves the payload's writes
+            # unattributed (permitted by the guard's asymmetry), so this must not block submission.
+            Write-WarningLog "Could not stamp the operation identity into the runspace for $($ComputerItem.Computer): $($_.Exception.Message)"
+        }
+
         #Save handle so we can later end the runspace
         $temp = New-Object PSObject -Property @{
-            PowerShell = $PowerShell
-            Runspace = $PowerShell.BeginInvoke()
-            StartTime = Get-Date
-            Computer = $ComputerItem.Computer
+            PowerShell  = $PowerShell
+            Runspace    = $PowerShell.BeginInvoke()
+            StartTime   = Get-Date
+            Computer    = $ComputerItem.Computer
+            # The identity of the operation this job IS. Without it the cleanup loop holds only
+            # (Computer, Runspace, StartTime) and cannot tell which operation it is settling - so a
+            # job stopped on timeout and settled later would release the lock of whatever operation
+            # had since taken the computer.
+            OperationId = $operationId
+            Op          = $Op
         }
 
         $jobs.Add($temp) | Out-Null

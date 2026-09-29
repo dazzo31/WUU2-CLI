@@ -55,6 +55,8 @@ ROW CONTRACT (the computer object all payloads already use)
   RebootRequired    [bool]
   Pending           [bool]
   PendingOp         [string]  'Download' | 'AutoFlow' | 'InstallAndRecheck' | $null
+  OpState           [string]  'Idle' | 'Queued' | 'Running'  - may another operation be submitted?
+  OperationId       [string]  identity of the operation that CURRENTLY owns this row (SS2/SS3)
   RetryCount        [int]
   RetryAt           [datetime] $null
   Runspace          [runspace] per-computer runspace (persistent by design)
@@ -117,6 +119,23 @@ function New-WuuComputerRow {
         # operator sees an operation that was accepted, reported as submitted, and never ran.
         OpState         = 'Idle'
         OpStartedAt     = $null
+        # SS2/SS3: OPERATION IDENTITY. A unique token for the operation that currently owns this
+        # row, stamped at submission and compared by every writer that acts on behalf of a job.
+        #
+        # WHY A GENERATED TOKEN AND NOT THE COMPUTER NAME OR OpStartedAt: the row is keyed by
+        # computer NAME, and every injected row-writer resolves its target by name from the store.
+        # So a writer belonging to a FINISHED operation still finds a valid row - possibly the one
+        # a NEWER operation now owns - and writes into it. The computer name cannot distinguish
+        # those two operations, and a timestamp is not an identity (two submissions can share one).
+        #
+        # WHY IT IS NEEDED EVEN THOUGH OpState SERIALIZES OPERATIONS: OpState (8.1) prevents an
+        # operation from STARTING while another runs. It does nothing about a writer that has
+        # already LEFT - the cleanup loop settling a job out of order, a pipeline force-stopped and
+        # still draining, or a job removed out-of-band and re-submitted. Each of those writes on
+        # behalf of an operation the row no longer belongs to.
+        #
+        # See Test-WuuOperationCurrent - the single predicate those writers all consult.
+        OperationId     = ''
         # SS12: consecutive connectivity failures. Inventory membership is NOT a connectivity status -
         # a single lost ICMP packet (or a host that simply blocks echo, the Windows Firewall default)
         # used to delete the row, after which the computer silently stopped being patched.
@@ -580,6 +599,117 @@ function Test-WuuComputerBusy {
     return $false
 }
 
+function New-WuuOperationId {
+    <#
+    .SYNOPSIS
+    Creates a unique operation identity (SS2).
+    .DESCRIPTION
+    Every submitted operation gets one of these, stamped on the row AND on the job entry, so a
+    writer can prove which operation it is acting for.
+
+    Deliberately NOT the computer name (a computer runs many operations over its life) and not a
+    timestamp (two submissions can share one, and clock resolution is not an identity). The counter
+    exists so two ids created inside the same clock tick are still distinct; the GUID is what makes
+    collision across processes and restarts impossible.
+
+    Language constructs only: this may be called from the submission point, which can be reached
+    from a console handler.
+    #>
+    param([string]$Computer = '')
+
+    $n = 1
+    if ($script:WuuOperationSequence) { $n = [int]$script:WuuOperationSequence + 1 }
+    $script:WuuOperationSequence = $n
+
+
+    $prefix = if ($Computer) { $Computer.ToLowerInvariant() } else { 'op' }
+    return ('{0}:{1}:{2}:{3}' -f $prefix, $PID, $n, ([guid]::NewGuid().ToString('N').Substring(0, 12)))
+}
+
+function Test-WuuOperationCurrent {
+    <#
+    .SYNOPSIS
+    Whether the operation identified by $OperationId still owns this row (SS3).
+    .DESCRIPTION
+    The single staleness predicate. Every writer that acts on behalf of a JOB - the cleanup loop's
+    three exit paths, and the row-writers injected into worker runspaces - asks this before
+    mutating, so a writer belonging to a superseded operation cannot overwrite the state of the
+    operation that replaced it.
+
+    THE DEFECT THIS CLOSES: the cleanup loop settles jobs in the order it notices them, and holds
+    no identity - only (Computer, Runspace, StartTime). If operation A is force-stopped on timeout
+    and the computer is resubmitted as B before the loop next visits A's entry, A's pass releases
+    the row's OpState ('Idle'), clears B's deadline and writes A's terminal status - onto B. B is
+    then unguarded: a third submission is admitted while B still runs, and the runspace discards it
+    silently. Nothing in that sequence inspects an identity, so nothing detects it.
+
+    FALSE MEANS 'DO NOT WRITE'. Callers must treat $false as a refusal, not as an error: a stale
+    writer is an expected outcome of a stopped or superseded operation, not a fault to report.
+
+    Returns $false when either side is empty. Two unknowns are not evidence of a match - the whole
+    point of this predicate is to refuse a write that cannot be PROVEN current.
+
+    Read-only, side-effect free and $null-tolerant: it is called from the cleanup thread and from
+    tests, and a lookup miss must be a clean $false rather than an exception.
+    #>
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$Row,
+        [Parameter(Mandatory = $false)][AllowNull()][string]$OperationId
+    )
+
+    if ($null -eq $Row) { return $false }
+    if ($null -eq $Row.PSObject.Properties['OperationId']) { return $false }
+    if ([string]::IsNullOrEmpty($OperationId)) { return $false }
+
+    $rowId = [string]$Row.OperationId
+    if ([string]::IsNullOrEmpty($rowId)) { return $false }
+
+    return ($rowId -ceq $OperationId)
+}
+
+function Test-WuuStaleWrite {
+    <#
+    .SYNOPSIS
+    Whether a row write must be REFUSED because the writer belongs to a superseded operation (SS3).
+    .DESCRIPTION
+    The second of the two identity rules, and deliberately NOT the same as Test-WuuOperationCurrent.
+    Conflating them is a real hazard, so the difference is stated explicitly:
+
+      Test-WuuOperationCurrent  - "is this writer still the owner?"  ($true only when the ids MATCH)
+      Test-WuuStaleWrite        - "is this write PROVEN stale?"      ($true only when both ids exist
+                                    and DIFFER)
+
+    They disagree in exactly one direction, on purpose. When the row carries no operation (a row
+    loaded from configuration, or a startup path) Test-WuuOperationCurrent says 'not current' - which
+    is correct for a RELEASE decision, because an unattributed job must not unlock a row whose owner
+    it cannot name. But a WRITE must still be permitted in that case, or list loading and initial
+    population would be silently discarded.
+
+    So: releases use "proven current"; writes use "not proven stale". A write is refused only when
+    the row names an operation AND the writer names a different one - the case that is provably a
+    superseded operation overwriting its replacement.
+
+    Returns $false (permit) whenever either side is unknown. That asymmetry is the whole point; do
+    not 'simplify' this into a negation of Test-WuuOperationCurrent.
+
+    Read-only, side-effect free, $null-tolerant: called from the injected worker writer, whose own
+    inlined copy is asserted against this function by tests\Test-OperationIdentity.ps1.
+    #>
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$Row,
+        [Parameter(Mandatory = $false)][AllowNull()][string]$OperationId
+    )
+
+    if ($null -eq $Row) { return $false }
+    if ($null -eq $Row.PSObject.Properties['OperationId']) { return $false }
+    if ([string]::IsNullOrEmpty($OperationId)) { return $false }
+
+    $rowId = [string]$Row.OperationId
+    if ([string]::IsNullOrEmpty($rowId)) { return $false }
+
+    return ($rowId -cne $OperationId)
+}
+
 function Test-WuuPhaseFailureBlocks {
     <#
     .SYNOPSIS Whether a settled failure on this row should BLOCK the next phase (SS9).
@@ -759,6 +889,12 @@ Export-ModuleMember -Function @(
     'Set-WuuComputerRowColor'
     'Set-WuuSetting'
     'Test-WuuComputerBusy'
+    # SS2/SS3: operation identity. Exported because the id is CREATED at the submission point
+    # (Wuu.WindowsUpdate), ENFORCED in the cleanup loop (Wuu.Core) and in the row-writers injected
+    # into worker runspaces, and asserted by tests - four places that must agree on the same rule.
+    'New-WuuOperationId'
+    'Test-WuuOperationCurrent'
+    'Test-WuuStaleWrite'
     'Test-WuuPhaseFailureBlocks'
     'Set-WuuPhaseFailurePolicy'
     'Update-WuuConnectivityState'

@@ -161,7 +161,84 @@ never `git checkout` on uncommitted work.
 
 ---
 
-## Phase 2 — Stale-worker / race correctness
+## Phase 2 — Stale-worker / race correctness (PASS)
 
-*(in progress)*
+### The rule
+
+> An operation has an identity, and a writer acting on behalf of one operation may never modify state
+> owned by another. Invariant 8.1 makes the stale-writer scenario **unreachable**; identity makes it
+> **rejected**, which is what survives if 8.1 is ever relaxed.
+
+### Reachability — established before writing any code
+
+8.1 serializes operations, so the naive story ("a retry while the old worker runs") cannot happen. The
+race is real via a different route, and it needed three findings:
+
+1. **The cleanup loop releases locks without knowing which operation it is settling.** It holds only
+   `(Computer, Runspace, StartTime)`. It settles jobs in the order it *notices* them.
+2. **`$PowerShell.Stop()` is asynchronous.** On timeout the loop calls `Stop()`, disposes, sets
+   `$runspace.Runspace = $null`, drops the deadline and **releases the lock** — but the runspace may
+   take seconds to actually tear down, and the loop keeps iterating throughout. A resubmission in that
+   window gets a fresh identity, and the loop's next pass stamps the OLD operation's timeout text on
+   the NEW operation and releases its lock. A third submission is then admitted against a runspace that
+   is still draining — and the runspace silently discards it (the measured platform behaviour behind
+   8.1). So the failure mode 8.1 exists to prevent is reachable *through 8.1's own release path*.
+3. **`Remove-WuuComputers` bypasses the cleanup loop entirely** (`$jobs.Remove($job)` out-of-band), so
+   none of the loop's three release sites ever run for those jobs. It dropped the row, so no leak was
+   observable — the lock release was correct *by coincidence*, not by construction.
+
+### What changed
+
+* **`New-WuuOperationId`** (`Wuu.State.psm1`) — computer prefix + `$PID` + a monotonic counter + a GUID
+  fragment. Created **before** `BeginInvoke`, stamped on the row, copied onto the **job entry**, and
+  injected into the worker runspace as `$WuuOperationId`.
+* **`Test-WuuOperationCurrent`** — the release rule: "*proven owner?*". Empty either side ⇒ `$false`.
+* **`Test-WuuStaleWrite`** — the write rule: "*proven stale?*". Empty either side ⇒ `$false` (permit).
+  Kept separate from the release rule on purpose; see below.
+* **Three cleanup-loop release paths guarded** (failed `EndInvoke`, normal completion, timeout), each
+  inlined with language constructs only because the loop runs in an isolated runspace.
+* **Both row-writer choke points guarded** — module-scope `SafeUpdateListViewItem` and the
+  runspace-injected copy the payload actually uses — with the injected copy reading `$WuuOperationId`.
+* **Timeout path detaches `$Row.Runspace`** before releasing the lock.
+* **`Remove-WuuComputers`** now releases the lock, clears the deadline, retires the identity and
+  detaches the runspace.
+
+### The design decision worth keeping: two rules, not one
+
+The first implementation used a single predicate and the differential test failed — correctly. A
+**release** needs "proven ownership" (an unattributed job must not unlock a row it cannot name), but a
+**write** needs only "proven staleness" (list loading writes rows that have no operation). Collapsing
+them breaks one side: a strict write rule discards startup writes; a lenient release rule unlocks a
+busy computer. This is now asserted explicitly in the suite and documented in §8.3.
+
+### Verification
+
+* `tests\Test-OperationIdentity.ps1` — **61 assertions**. The core is a **differential**: it extracts
+  each of the six shipped guard conditions from source, evaluates them on a 6-case truth table, and
+  compares against the function they must mirror. An inlined copy that drifts fails. Includes a
+  tautology check (a polarity flip must be detected) and the asymmetry assertions.
+* Validator gate **(ah)** — 10 checks: the row field, the generator's uniqueness, both functions'
+  existence/export/polarity, creation-before-`BeginInvoke`, the job-entry stamp, the runspace
+  injection, 3/3 guarded releases, both writer copies, runspace detachment, and identity retirement.
+* **Tautology pass (4 experiments, each restored from a `Copy-Item` backup — never `git checkout`:**
+  removing the writer guard condition, flipping the release polarity, removing the identity injection,
+  and moving id creation after `BeginInvoke`. **All four were caught by both the gate and the suite.**
+* Gate **4/4** deadline clears (the SS5 trap fired on the new release site and was satisfied properly,
+  not weakened). Suite **28 pass / 1 skip / 0 fail**.
+
+### Mistakes made during this phase (recorded, not hidden)
+
+Four of my own checks were wrong before the code was. The guard logic was never at fault:
+
+1. The differential matched `if (<condition>)` and executed it as a statement — an `if` with no body
+   fails to parse, my `catch` turned that into `$false`, and every site looked "drifted".
+2. `-replace '\$rowOpId'` — the `$` is a regex **end-of-string anchor**, so nothing was substituted,
+   both operands stayed `$null`, and every condition evaluated `$true`.
+3. `& $guard` where `$guard` came from `[scriptblock]::Create(...)` returns **the scriptblock**, not
+   its result, so `[bool]` of it was always `$true`. (Verified with a minimal repro.)
+4. Gate (ah) required `function Name(` — PowerShell declares functions as `function Name {`.
+
+Each was diagnosed by isolating it, not by guessing, and (2)/(3) are now written up in the suite so
+the next reader does not repeat them. Note the pattern: **every one was a false failure on correct
+code** — the same failure class as matching the comment describing the code.
 

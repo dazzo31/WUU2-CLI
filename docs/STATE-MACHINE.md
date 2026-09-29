@@ -2,13 +2,17 @@
 
 > ## Status: this is the TARGET model
 >
-> **Nothing in §2–§10 is implemented today.** There is no operation record and no `OperationId`, so
-> the state machine below has nowhere to live. What the code actually stores is in §11 — read that
-> first if you are writing code.
+> **Nothing in §2–§6 is implemented today.** There is no operation **record**, so the state machine
+> below has nowhere to live — an operation's state is a per-computer `State`/`OpState` pair, not a
+> lifecycle. What the code actually stores is in §11; read that first if you are writing code.
+>
+> **The operation identity does exist** (Phase 2): `OperationId` is created per submission and both
+> release and write rules enforce it (§7). Identity is not a state machine, though — terminal-state
+> protection and the transition table above still need the record.
 >
 > The authoritative status of each invariant is in
 > [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8. The work to implement
-> this model is Phases 2–5 of the hardening plan (see `docs/DEVELOPMENT.md`).
+> this model is Phases 4 and 6 of the hardening plan (see `docs/DEVELOPMENT.md`).
 >
 > Do not write code that assumes these states exist, and do not describe them as current behaviour.
 
@@ -129,23 +133,31 @@ Operation A remains `TimedOut`; it must never be converted into Operation B.
 
 ---
 
-# 7. Operation identity (TARGET)
+# 7. Operation identity (CURRENT for the identity, TARGET for the operation record)
 
-Every operation has a unique identity, and a state mutation originating from asynchronous work must be
+**The identity now exists (Phase 2).** Every submission creates a `OperationId` via
+`New-WuuOperationId`, stamps it on the row and on the job entry, and injects it into the worker
+runspace as `$WuuOperationId`. A state mutation originating from asynchronous work is therefore
 associated with it:
 
 ```powershell
-if ($worker.OperationId -ne $current.OperationId) {
-    # stale result
-    # do not modify current operation
-}
+# the rule, in Wuu.State:
+Test-WuuOperationCurrent -Row $current -OperationId $worker.OperationId   # release only if owned
+Test-WuuStaleWrite      -Row $current -OperationId $writer.OperationId    # refuse only if provably stale
 ```
 
-The implementation may use a stronger abstraction, but the invariant must remain.
+These are **two rules, not one**, and deliberately so - see
+[`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8.3 for the asymmetry and
+why collapsing them breaks a side.
 
-**Current:** no identity exists. Invariant 8.1 (one operation per computer) makes the scenario
-unreachable, which is why this has not caused a visible failure — and why it is untested rather than
-safe.
+The rule is written in **six** places, because the cleanup loop and the injected row-writer run in
+isolated runspaces where no module function resolves. Gate (ah) asserts each copy exists;
+`tests\Test-OperationIdentity.ps1` drives each shipped condition so a drifted copy fails.
+
+**What is still TARGET:** the **operation RECORD** in §7's list (RequestedAction, CredentialContext,
+CreatedAt, Result, AuditContext as one object). Identity exists; the record it would live on does not.
+Per-computer row fields remain the only granularity, so §4's transition table and §5's terminal-state
+rejections above are still not implementable - they need that record.
 
 ---
 
@@ -192,9 +204,11 @@ timeout → retry → new operation running → old worker completes
 
 The old worker must not modify the new operation.
 
-**Current:** Case C cannot arise (8.1 permits one operation per computer). Cases A and B are
-*partially* handled by the cleanup loop's ordering — a settled completion is evaluated before the
-deadline — but that is a timing arrangement in one loop, not an identity-checked guarantee.
+**Current:** Case C is now **guarded** (Phase 2): the old worker holds a different `OperationId, so
+both the release rule (`Test-WuuOperationCurrent`) and the write rule (`Test-WuuStaleWrite`) stop it
+touching the new operation's row. Cases A and B are additionally protected by the cleanup loop's
+ordering, but that ordering is a timing arrangement in one loop; the identity check is what makes the
+rejection deliberate rather than incidental.
 
 ---
 
@@ -213,6 +227,10 @@ A cancellation must not accidentally cancel a replacement operation, so it shoul
 **Current:** there is **no `Cancelled` state**. Cancellation exists as (a) an exit code (7), (b) a
 queued-work clear on an unreachable computer, and (c) `Pending` being dropped. None of these is an
 operation lifecycle transition.
+
+The association this section asks for now **exists** (Phase 2): a cancellation or release can name the
+`OperationId` it belongs to, which is what stops it cancelling a replacement operation. What is still
+missing is the `Cancelled` state itself, and that needs the operation record.
 
 ---
 
@@ -234,6 +252,7 @@ Alongside these, the fields that behave like the target model's per-operation da
 | `LastHeartbeatAt`, `Heartbeats` | liveness, so "slow" is distinguishable from "stuck" |
 | `CheckConcluded` | three-state workflow predicate (`$null` = not established) used by phase gating |
 | `CredentialEpoch`, `CredentialIdentity` | the identity a reused runspace was built with |
+| `OperationId` | the operation that CURRENTLY owns this row, stamped at submission (Phase 2) |
 
 Mapping from the target names to what exists:
 

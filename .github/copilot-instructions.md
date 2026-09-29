@@ -258,8 +258,8 @@ Status is verified by inspection, not aspiration. `ENFORCED` means there is a
 | # | Invariant | Status | Evidence / gap |
 | --- | --- | --- | --- |
 | 8.1 | One active operation per computer | **ENFORCED** | `Test-WuuComputerBusy` gate at the submission point; gate (u); `Test-ComputerBusy`, `Test-SchedulerSerialization` |
-| 8.2 | Every operation has a unique `OperationId` | **TARGET — not implemented** | `OperationId` appears **nowhere** in `src\`; **0** test assertions |
-| 8.3 | Stale workers cannot modify newer operations | **TARGET — not implemented** | No identity comparison exists. 8.1 prevents the *scenario*; nothing rejects a stale result |
+| 8.2 | Every operation has a unique `OperationId` | **ENFORCED** | `New-WuuOperationId` (GUID-based) in `Wuu.State`; created **before** `BeginInvoke`, carried on the job entry, injected into the worker runspace; gate (ah); `Test-OperationIdentity` (61 assertions) |
+| 8.3 | Stale workers cannot modify newer operations | **ENFORCED** | Two rules — `Test-WuuOperationCurrent` (release only proven ownership) and `Test-WuuStaleWrite` (refuse only proven staleness) — mirrored in **6** sites; gate (ah); `Test-OperationIdentity` |
 | 8.4 | Terminal operations stay terminal | **TARGET — partial** | No transition guard. `Failed`/`TimedOut`/`Cancelled`/`Refused` are not even `State` values today (see §9) |
 | 8.5 | All remote execution goes through the scheduler | **ENFORCED (narrow)** | All per-computer work goes through **one submission point** `Start-UpdateCheckJob`; gate (x). "Scheduler-only" is stricter than this — see 8.6 |
 | 8.6 | Concurrency limits are absolute | **TARGET — not implemented** | The cap is checked **only in the scheduler tick** (`Start-PendingUpdateCheck`). The submission point has **no** `jobs.Count` check, and its `MaxConcurrentJobs` mention is a **comment**. Direct handlers can therefore exceed the cap. **No validator gate exists** (the only validator mention is a comment) |
@@ -272,8 +272,16 @@ Also ENFORCED but not numbered above: per-operation timeouts with a recorded dea
 (8.5-adjacent, gate (ab)); exit-code semantics (gate (aa)); workflow state rather than display state
 (gate (ac)); reboot/cancellation surfaces (gate (ag)); source encoding (gate (af)).
 
-**Read the gap column before relying on an invariant.** 8.2/8.3 and 8.6/8.7 are the four that matter
-most, because in each case the mechanism the architecture depends on does not exist yet.
+**Read the gap column before relying on an invariant.** **8.6** (absolute cap) and **8.7** (pending
+work) are the two that matter most now: in each case the mechanism the architecture depends on does
+not exist yet, so code that relies on either is wrong in a way that does not announce itself.
+
+> **8.2/8.3 note (Phase 2):** these were TARGET. They are ENFORCED as of this revision. The distinction
+> matters when reading older material, and it is why 8.3 was *unreachable* rather than *safe* —
+> invariant 8.1 prevented the scenario from arising, but nothing rejected a stale result. Three paths
+> could emit one: the cleanup loop settling a force-stopped job after the computer was resubmitted, a
+> payload parked mid-write while the timeout path detached the runspace, and the out-of-band job
+> removal in `Remove-WuuComputers`.
 
 ---
 
@@ -286,27 +294,45 @@ bypass it.
 
 ---
 
-### 8.2 Every operation has an identity  *(TARGET — not implemented)*
+### 8.2 Every operation has an identity  *(ENFORCED — Phase 2)*
 
-**Target:** every remote operation has a unique `OperationId`, retained across the request, queued
-state, running state, worker execution, completion/failure, timeout/cancellation and audit record.
+Every remote operation has a unique `OperationId`, retained across the request, queued state, running
+state, worker execution, completion/failure, timeout/cancellation and audit record.
 
-**Current:** no such field exists. Do not assume one. If a change needs operation identity, adding it
-is the change — see Phase 2/5 in `docs/DEVELOPMENT.md`.
+**Implemented.** `New-WuuOperationId` (computer prefix + process id + a monotonic counter + a 12-char
+GUID fragment) is created **before** `BeginInvoke`, because the payload can start on its own thread
+immediately — an identity stamped afterwards would leave a window in which a legitimate writer is
+judged stale against the previous id. It is set on the row, on the **job entry** (the cleanup loop
+holds the job, not the row), and injected into the worker runspace as `$WuuOperationId`.
 
-Do not use only the computer name as operation identity.
+Do not use the computer name or a timestamp as operation identity. The name is the row's *key*, so a
+writer belonging to a finished operation still resolves a valid row; a timestamp is not unique.
 
----
+### 8.3 Stale workers cannot modify newer operations  *(ENFORCED — Phase 2)*
 
-### 8.3 Stale workers cannot modify newer operations  *(TARGET — not implemented)*
+A worker belonging to an old operation must never overwrite state belonging to a newer operation.
 
-**Target:** a worker belonging to an old operation must never overwrite state belonging to a newer
-operation for the same computer — particularly after `timeout → retry` or `cancel → retry`.
+**Implemented as TWO rules, deliberately not one.** Do not collapse them:
 
-**Current:** this is *unreachable* rather than *protected*. Because 8.1 permits only one operation per
-computer, the scenario does not arise — but nothing inspects an operation identity, so there is no
-guard, no test, and no protection if 8.1 is ever relaxed. Note the trap: a test whose name mentions
-stale workers while driving only the per-computer gate asserts nothing about staleness.
+| Rule | Question | Used by |
+| --- | --- | --- |
+| `Test-WuuOperationCurrent` | is this writer the **proven owner**? | the three cleanup-loop **release** paths |
+| `Test-WuuStaleWrite` | is this write **proven stale**? | the two **row-writer** choke points |
+
+They differ in one direction on purpose: against a row that names no operation, the release rule says
+"not current" (an unattributed job must not unlock a row it cannot name) while the write rule says
+"permit" (list loading writes rows that have no operation). Making either into the other breaks one
+side — a strict write rule discards startup writes; a lenient release rule unlocks a busy computer.
+
+The rule is written in **six** places because the cleanup loop and the injected worker writer run in
+isolated runspaces where no module function resolves. Gate (ah) asserts every copy exists;
+`Test-OperationIdentity` extracts each shipped condition and drives it on a truth table so a drifted
+copy fails.
+
+Also part of 8.3: the timeout path **detaches the row's runspace** before releasing the lock. The
+guards stop a stale *writer*; detaching stops a resubmission from inheriting a runspace that is still
+draining after the asynchronous `$PowerShell.Stop()`, while the old payload keeps writing through its
+own module-scope store reference.
 
 ---
 

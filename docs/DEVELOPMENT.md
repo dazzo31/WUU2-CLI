@@ -9,11 +9,14 @@
 > * **CURRENT** — the workflow, commands and constraints that are true today.
 > * **TARGET** — the invariants and behaviour the project is working toward.
 >
-> **Phases 2–6 of the hardening plan are implementation work, not established behaviour.** The
-> invariants they describe (operation identity, stale-worker protection, terminal-state protection,
-> the absolute concurrency cap, the pending-work policy) **do not exist in the code today**. Read the
-> status table in [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8 before
-> assuming any invariant is real.
+> **Phases 3, 4 and 6 of the hardening plan are implementation work, not established behaviour.**
+> The invariants they describe (the absolute concurrency cap, the pending-work policy, terminal-state
+> protection) **do not exist in the code today**. Read the status table in
+> [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8 before assuming any
+> invariant is real.
+>
+> Phase 1 (credential determinism) and Phase 2 (operation identity and stale-worker rejection) are
+> **done and ENFORCED** — invariants 8.2 and 8.3 moved from TARGET to ENFORCED when Phase 2 landed.
 >
 > Do not describe an unimplemented invariant as current behaviour. When implementing a change, work
 > toward the target invariant without assuming it already exists.
@@ -130,21 +133,25 @@ This is the single most important section in this document for avoiding false cl
 | --- | --- | --- |
 | 0 | Baseline capture | **done** |
 | 1 | Deterministic credential identity (no silent fallback) | **done** |
-| 2 | Operation identity (`OperationId`) | **not started** |
+| 2 | Operation identity + stale-worker rejection | **done** |
 | 3 | Absolute concurrency cap at admission | **not started** — currently exploitable |
 | 4 | Pending-work policy | **not started** |
-| 5 | Stale-worker protection | **not started** — blocked on Phase 2 |
-| 6 | Terminal-state protection | **not started** — blocked on Phase 2 |
+| 5 | Stale-worker protection (extended: retry/cancel paths) | **partly done in Phase 2** |
+| 6 | Terminal-state protection | **not started** — blocked on the operation record |
 
-**Phases 2–6 are not implemented.** Anything they introduce must not be described as existing
+**Phases 3, 4 and 6 are not implemented.** Anything they introduce must not be described as existing
 behaviour, and any documentation, comment or test that implies otherwise is a defect to fix.
+
+> **Phase 2 changed two rows of the §8 status table.** Invariants **8.2** (`OperationId`) and **8.3**
+> (stale-worker rejection) are now ENFORCED, by gate (ah) and `tests\Test-OperationIdentity.ps1`.
+> Older notes, this guide included, described them as TARGET — that is now out of date.
 
 The recommended implementation sequence remains:
 
 ```text
 1. Credential determinism          (done)
-2. Operation identity              (Phase 2)
-3. Stale-worker protection         (Phase 5)
+2. Operation identity              (done - Phase 2)
+3. Stale-worker protection         (done - Phase 2)
 4. Timeout behaviour               (partially current)
 5. Scheduler concurrency           (Phase 3)
 6. Pending work                    (Phase 4)

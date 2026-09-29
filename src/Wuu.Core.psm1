@@ -845,6 +845,32 @@ function SafeUpdateListViewItem {
         $targetRow = $stateStore.ByName[$ComputerName.ToLowerInvariant()]
         if (-not $targetRow) { return }
 
+        # SS3: STALE-WRITER GUARD.
+        #
+        # This is the choke point every payload uses to write row state, and it resolves its target
+        # by COMPUTER NAME - which is the row's key, not an identity. So a payload that outlives its
+        # operation still finds a live row: it may be the one a newer operation now owns (the timeout
+        # path detaches the runspace precisely so this happens on a detached object, but a writer can
+        # still be parked mid-write when the detach lands). Writing then would let a superseded
+        # operation restamp State/Status/Colour on the operation that replaced it.
+        #
+        # The guard is deliberately ASYMMETRIC: it refuses only the case it can PROVE is stale (a
+        # row that names an operation, and a writer naming a different one). An unattributed write is
+        # still permitted, because startup/import paths legitimately write rows that have no
+        # operation, and refusing those would break list loading. Proven-stale is refused; merely
+        # unattributed is allowed.
+        #
+        # A refusal is logged, not silent: otherwise "the guard held" and "the write never happened"
+        # look identical to an operator reading the log.
+        $writerOpId = ''
+        if ($Properties -and $Properties.ContainsKey('OperationId')) { $writerOpId = [string]$Properties['OperationId'] }
+        $rowOpId = ''
+        if ($targetRow.PSObject.Properties['OperationId']) { $rowOpId = [string]$targetRow.OperationId }
+        if ($rowOpId -ne '' -and $writerOpId -ne '' -and $rowOpId -cne $writerOpId) {
+            Write-WarningLog "[$ComputerName] stale row write refused: the row belongs to operation '$rowOpId', writer is '$writerOpId'"
+            return
+        }
+
         foreach ($propertyName in $Properties.Keys) {
             $targetRow.$propertyName = $Properties[$propertyName]
         }
@@ -967,6 +993,29 @@ $removeEntry = {
                     Write-WarningLog "Failed to remove job from list for $($Computer.Computer): $($_.Exception.Message)"
                 }
             }
+
+            # SS3: this path removes a job OUT OF BAND - no cleanup-loop pass sees it, so the
+            # loop's three guarded release sites never run for this job. The row is dropped below
+            # (Remove-WuuComputerRow), so the lock cannot leak here today. It is cleared anyway so
+            # the invariant holds by construction rather than by the coincidence that this caller
+            # deletes the row: any future path that stops a job this way but KEEPS the row would
+            # otherwise leave it permanently 'Running', and a permanently-busy computer is never
+            # scheduled again.
+            if ($Computer.PSObject.Properties['OpState']) {
+                $Computer.OpState = 'Idle'
+                $Computer.OpStartedAt = $null
+                # Same trap the cleanup loop guards (SS5): releasing the lock without clearing the
+                # deadline leaves one in the past, and the NEXT operation on this computer would be
+                # judged expired on its first loop pass and killed immediately.
+                if ($Computer.PSObject.Properties['TimeoutExpiresAt']) { $Computer.TimeoutExpiresAt = $null }
+                if ($Computer.PSObject.Properties['TimeoutSource']) { $Computer.TimeoutSource = '' }
+                if ($Computer.PSObject.Properties['OpName']) { $Computer.OpName = '' }
+                if ($Computer.PSObject.Properties['LastHeartbeatAt']) { $Computer.LastHeartbeatAt = $null }
+            }
+            # Retire the identity with the operation, so a late writer cannot present a valid token
+            # for a job that no longer exists.
+            if ($Computer.PSObject.Properties['OperationId']) { $Computer.OperationId = '' }
+            if ($Computer.PSObject.Properties['Runspace']) { $Computer.Runspace = $null }
             
             # Close and dispose the runspace
             if ($Computer.Runspace) {
@@ -2289,6 +2338,22 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                             if ($stateStore) {
                                 $failedRow = $stateStore.ByName[[string]$runspace.Computer.ToLowerInvariant()]
                                 if ($failedRow) {
+                                    # SS3: STALE-WRITER GUARD. This pass settles a job that FAILED,
+                                    # but the row may already belong to a different operation (the
+                                    # job was stopped and the computer resubmitted before the loop
+                                    # next visited this entry). Writing here would clear the NEW
+                                    # operation's lock and overwrite its status.
+                                    #
+                                    # Inlined rather than calling Test-WuuOperationCurrent: this runs
+                                    # on the cleanup thread, an isolated runspace where no module
+                                    # function resolves. The rule mirrors the function exactly, and
+                                    # tests\Test-OperationIdentity.ps1 compares the two on identical
+                                    # inputs so they cannot drift.
+                                    $jobOpId = ''
+                                    if ($runspace.PSObject.Properties['OperationId']) { $jobOpId = [string]$runspace.OperationId }
+                                    $rowOpId = ''
+                                    if ($failedRow.PSObject.Properties['OperationId']) { $rowOpId = [string]$failedRow.OperationId }
+                                    if ($rowOpId -ne '' -and $jobOpId -ne '' -and $rowOpId -ceq $jobOpId) {
                                     $failedRow.State = 'Error'
                                     $failedRow.UpdatesStatus = 'Error'
                                     $failedRow.Status = "Operation did not run - another operation held the computer's runspace. Retry when it is idle."
@@ -2302,6 +2367,12 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                                     if ($failedRow.PSObject.Properties['OpName']) { $failedRow.OpName = '' }
                                     if ($failedRow.PSObject.Properties['LastHeartbeatAt']) { $failedRow.LastHeartbeatAt = $null }
                                     $stateStore.Touch()
+                                    } else {
+                                        # A refusal is not silence. Without this line the operator
+                                        # cannot tell "the guard refused a stale write" from "the
+                                        # operation never ended".
+                                        & $WriteLogFileScript "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [WARN] [$($runspace.Computer)] stale operation '$jobOpId' refused: the row now belongs to '$rowOpId' - its lock and status are left untouched"
+                                    }
                                 }
                             }
                         } catch { }
@@ -2316,10 +2387,22 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                     # failure). This is the pair to Start-UpdateCheckJob setting OpState='Running';
                     # if it is missed here the computer would be permanently 'busy' and never
                     # schedulable again. Language constructs only - runs on the cleanup thread.
+                    #
+                    # SS3: IDENTITY-GUARDED. "Release on every completion path" is only correct for
+                    # the operation that OWNS the row. This job may have finished after another
+                    # operation had already taken the computer (it was stopped and settled late), in
+                    # which case releasing here grants a second operation while the current one still
+                    # runs - and the runspace silently discards it. The guard is what makes the
+                    # release safe on every path rather than merely present on every path.
                     try {
                         if ($stateStore) {
                             $doneRow = $stateStore.ByName[[string]$runspace.Computer.ToLowerInvariant()]
                             if ($doneRow -and $doneRow.PSObject.Properties['OpState']) {
+                                $jobOpId2 = ''
+                                if ($runspace.PSObject.Properties['OperationId']) { $jobOpId2 = [string]$runspace.OperationId }
+                                $rowOpId2 = ''
+                                if ($doneRow.PSObject.Properties['OperationId']) { $rowOpId2 = [string]$doneRow.OperationId }
+                                if ($rowOpId2 -ne '' -and $jobOpId2 -ne '' -and $rowOpId2 -ceq $jobOpId2) {
                                 $doneRow.OpState = 'Idle'
                                 $doneRow.OpStartedAt = $null
                                 # SS5: the operation is over, so its deadline goes with it. Leaving
@@ -2329,6 +2412,9 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                                 if ($doneRow.PSObject.Properties['TimeoutSource']) { $doneRow.TimeoutSource = '' }
                                 if ($doneRow.PSObject.Properties['OpName']) { $doneRow.OpName = '' }
                                 $stateStore.Touch()
+                                } else {
+                                    & $WriteLogFileScript "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [WARN] [$($runspace.Computer)] stale operation '$jobOpId2' finished but the row belongs to '$rowOpId2' - lock NOT released (releasing it would admit a second operation while the current one still runs)"
+                                }
                             }
                         }
                     } catch { }
@@ -2414,13 +2500,46 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                     # timeout. Without this the row stays 'Running' forever and Test-WuuComputerBusy
                     # refuses every future submission for that computer - a permanently unschedulable
                     # machine, which is worse than the timeout it was recovering from.
+                    #
+                    # SS3: IDENTITY-GUARDED. This is the path that MAKES the stale-writer race
+                    # reachable, so the guard matters most here. A job is stopped and queued for
+                    # removal, but its runspace may take seconds to tear down - and the cleanup loop
+                    # keeps running throughout. If the computer is resubmitted in that window, the
+                    # row belongs to the NEW operation by the time this pass settles the old one. An
+                    # unguarded release here would admit a third submission against a runspace that
+                    # is still draining, and the runspace discards it silently.
                     try {
                         if ($stateStore) {
                             $toRow = $stateStore.ByName[[string]$timedOutComputer.ToLowerInvariant()]
                             if ($toRow -and $toRow.PSObject.Properties['OpState']) {
-                                $toRow.OpState = 'Idle'
-                                $toRow.OpStartedAt = $null
-                                $stateStore.Touch()
+                                $toOpId = ''
+                                if ($runspace.PSObject.Properties['OperationId']) { $toOpId = [string]$runspace.OperationId }
+                                $toRowId = ''
+                                if ($toRow.PSObject.Properties['OperationId']) { $toRowId = [string]$toRow.OperationId }
+                                if ($toRowId -ne '' -and $toOpId -ne '' -and $toRowId -ceq $toOpId) {
+                                    # SS3 (the half that makes this path SAFE, not just guarded):
+                                    # detach the runspace from the row BEFORE releasing the lock.
+                                    #
+                                    # The guard below only stops a stale WRITER. It does not stop the
+                                    # row from pointing at a runspace we have just torn down - and
+                                    # $PowerShell.Stop() is asynchronous, so the payload may still be
+                                    # draining. A resubmission arriving in that window would find
+                                    # Runspace=$null, build a FRESH one, and the computer's row would
+                                    # then hold a new runspace while the old payload was still writing
+                                    # into it through its own module-scope $StateStore. Two writers,
+                                    # one row, different runspaces - the case the per-computer
+                                    # runspace normally prevents by construction.
+                                    #
+                                    # Clearing it means a resubmission cannot silently inherit a
+                                    # dying runspace, and the superseded payload writes into a
+                                    # detached object rather than the live row.
+                                    if ($toRow.PSObject.Properties['Runspace']) { $toRow.Runspace = $null }
+                                    $toRow.OpState = 'Idle'
+                                    $toRow.OpStartedAt = $null
+                                    $stateStore.Touch()
+                                } else {
+                                    & $WriteLogFileScript "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [WARN] [$timedOutComputer] stale operation '$toOpId' timed out but the row belongs to '$toRowId' - lock NOT released"
+                                }
                             }
                         }
                     } catch { }
@@ -2436,6 +2555,18 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                     try {
                         $timedOutRow = $stateStore.ByName[$timedOutComputer.ToLowerInvariant()]
                         if ($timedOutRow) {
+                            # SS3: the terminal status is written ONLY if this job still owns the row.
+                            # The lock-release above is guarded separately and the two must agree: a
+                            # row that kept its lock must not have been given another operation's
+                            # timeout text either, or the operator sees "Timed out" on a computer that
+                            # is actively running the replacement operation.
+                            $toStatusOpId = ''
+                            if ($runspace.PSObject.Properties['OperationId']) { $toStatusOpId = [string]$runspace.OperationId }
+                            $toStatusRowId = ''
+                            if ($timedOutRow.PSObject.Properties['OperationId']) { $toStatusRowId = [string]$timedOutRow.OperationId }
+                            if ($toStatusRowId -eq '' -or $toStatusOpId -eq '' -or $toStatusRowId -cne $toStatusOpId) {
+                                throw "stale timeout write refused for '$($timedOutComputer)': the row belongs to '$toStatusRowId', not '$toStatusOpId'"
+                            }
                             # SS5: report WHICH operation and WHICH budget, not a bare "10 minutes".
                             # "Timed out" without "doing what, after how long" is not actionable -
                             # the operator cannot tell a genuinely stuck service action from an
