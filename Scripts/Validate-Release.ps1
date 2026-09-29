@@ -640,5 +640,174 @@ if ($navRaw -notmatch "NotePropertyName Reason -NotePropertyValue ''") {
     Fail 'the guided workflow never clears the change reason - later mutations would inherit it'
 } else { Pass 'the guided workflow consumes each change reason (no reason is silently reused)' }
 
+# (r) NO SHIPPED SOURCE MAY READ A GUI CONTROL MEMBER.
+#
+#     This is the highest-value gate in this file. Three P0 defects and one total scheduler failure
+#     all had the same shape: live code reading `$uiHash.<Control>` in an edition where `$uiHash` is
+#     an EMPTY hashtable. Nothing threw, because Wuu.Core has no Set-StrictMode - a missing hashtable
+#     key is $null, and `@($null)` is an empty list. Concretely:
+#
+#       * AutoDownload/AutoInstall gates: `if ($null -and ...)`      -> never fired
+#       * AutoReboot gate:                `-not $null`               -> always returned early
+#       * Start-PendingUpdateCheck:       `@($null)` -> no items     -> the QUEUE WAS DEAD
+#       * Test-PhaseCompletion:           `@($null)` -> count 0      -> every phase reported complete
+#       * $eventAuditWSUSUpdates:         `@($null)` -> no rows      -> silent no-op
+#
+#     Two tests passed throughout because they HAND-BUILT the missing GUI objects, so they supplied
+#     the dependency they were meant to be exercising. That is why this is checked in the validator
+#     against shipped source, not left to a test suite.
+#
+#     Comments are stripped with the tokenizer: the modules' own history notes quote these members
+#     deliberately when explaining the migration, and a '#.*$' regex would also eat '#' inside
+#     strings and subexpressions (the false-positive class documented at gate 2).
+$guiMemberHits = @()
+foreach ($f in $files) {
+    if ($f.Name -eq 'Validate-Release.ps1') { continue }
+    $code2 = Get-WuuCodeWithoutComments -Path $f.FullName
+    if ($code2 -match '\$uiHash\.\w*(List[Vv]iew|CheckBox|TextBox|Menu|GridView)') {
+        $guiMemberHits += $f.Name
+    }
+}
+if ($guiMemberHits.Count) {
+    Fail ('shipped source reads a GUI control member - in this edition $uiHash is empty, so the read is silently $null and the behaviour is dead: ' + (($guiMemberHits | Select-Object -Unique) -join ', '))
+} else { Pass 'no shipped source reads a GUI control member (no silent-$null dead behaviour)' }
+
+# (s) The scheduler and phase gating must read the STATE STORE, not a display collection. Checked
+#     separately from (r) so a regression that swapped Listview for some other non-store collection
+#     is also caught.
+#
+#     Matched against RAW text with a bounded window, NOT the token-stripped text: the tokenizer
+#     discards newlines (it rebuilds from token content joined by spaces), so a `.*?\n\}` body
+#     pattern can never match there. A window after the function name is simpler and has no
+#     escaping traps.
+$wupdRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+foreach ($fn in @('Start-PendingUpdateCheck', 'Test-PhaseCompletion')) {
+    $idx = $wupdRaw.IndexOf("function $fn")
+    if ($idx -lt 0) { Fail "could not locate function $fn in Wuu.WindowsUpdate.psm1" }
+    else {
+        $window = $wupdRaw.Substring($idx, [Math]::Min(4000, $wupdRaw.Length - $idx))
+        if ($window -notmatch 'Get-WuuComputerRow') {
+            Fail "$fn does not read the state store (Get-WuuComputerRow) - the queue/phase gate would be empty"
+        }
+    }
+}
+if (-not $failed) { Pass 'scheduler and phase gating read the state store, not a display collection' }
+
+# (t) The three auto-setting gates must read $stateStore.Settings. A revert to a GUI member is
+#     already caught by (r); this catches a revert to something else entirely (a hard-coded $true,
+#     or a different variable).
+#
+#     TWO escaping traps here, and this gate hit both in sequence - worth recording because the
+#     failure mode of each was a FALSE FAILURE, which is how a gate gets disabled by whoever is
+#     trying to ship:
+#       1. In a DOUBLE-quoted PowerShell string, `\$` is NOT an escape - the backslash survives and
+#          the variable interpolates to ''. The pattern silently became `\.Settings\.AutoDownload`.
+#       2. Even correctly single-quoted, a bare `$stateStore` in a REGEX is an end-of-line ANCHOR,
+#          so it can never match mid-line. It must be `\$stateStore`.
+#     Both directions are why this pattern is single-quoted with -f AND backslash-escaped.
+$coreRaw4 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+foreach ($setting in @('AutoDownload', 'AutoInstall', 'AutoReboot')) {
+    $pattern = '\$stateStore\.Settings\.{0}\b' -f $setting
+    if ($coreRaw4 -notmatch $pattern) {
+        Fail "no gate reads `$stateStore.Settings.$setting - that automatic behaviour cannot be controlled"
+    }
+}
+if (-not $failed) { Pass 'all three automatic behaviours are gated on $stateStore.Settings' }
+
+# (u) ONE OPERATION PER COMPUTER (brief SS3). Two properties, because either alone can be defeated:
+#     the submission path must consult the gate, AND the gate must exist and be exported. A gate that
+#     is never called is decoration; a call to a missing function is a runtime failure.
+#
+#     Function bodies are extracted by finding the next top-level "function " to EOF, NOT by a fixed
+#     character window. A 3000-char window silently truncated Start-UpdateCheckJob (6143 chars after
+#     the comments were added) and reported a FALSE FAILURE - the same trap as the token-stripped
+#     `\n\}` pattern earlier. Slicing to the next function has no size assumption.
+function Get-WuuFunctionBody([string]$Text, [string]$Name) {
+    $i = $Text.IndexOf("function $Name")
+    if ($i -lt 0) { return '' }
+    $next = $Text.IndexOf("`nfunction ", $i + 10)
+    if ($next -lt 0) { return $Text.Substring($i) }
+    return $Text.Substring($i, $next - $i)
+}
+
+$supBody = Get-WuuFunctionBody $wupdRaw 'Start-UpdateCheckJob'
+if (-not $supBody) { Fail 'could not locate Start-UpdateCheckJob' }
+else {
+    # The gate must be consulted BEFORE the submission, and the row must be marked Running.
+    if ($supBody -notmatch 'Test-WuuComputerBusy') {
+        Fail 'Start-UpdateCheckJob does not consult Test-WuuComputerBusy - a second operation on a busy computer would be silently discarded'
+    }
+    elseif ($supBody -notmatch "OpState\s*=\s*'Running'") {
+        Fail 'Start-UpdateCheckJob does not mark the computer Running - the gate could never say busy'
+    }
+}
+$stateRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+if ($stateRaw -notmatch 'function Test-WuuComputerBusy') { Fail 'Test-WuuComputerBusy is not defined' }
+elseif ($stateRaw -notmatch "'Test-WuuComputerBusy'") { Fail 'Test-WuuComputerBusy is not exported (Start-UpdateCheckJob could not resolve it)' }
+if (-not $failed) { Pass 'one operation per computer is enforced at the submission point (SS3)' }
+
+# (v) The scheduler must not treat Pending as "busy". Its input queue IS the Pending rows, so doing
+#     so would make it skip every row it was handed, for ever - a deadlock that still passes a
+#     naive "does it read the store" check. The -IgnorePending switch is what prevents it.
+$schedBody = Get-WuuFunctionBody $wupdRaw 'Start-PendingUpdateCheck'
+if (-not $schedBody) { Fail 'could not locate Start-PendingUpdateCheck' }
+else {
+    if ($schedBody -match 'Test-WuuComputerBusy' -and $schedBody -notmatch 'IgnorePending') {
+        Fail 'the scheduler consults Test-WuuComputerBusy without -IgnorePending - it would skip every Pending row for ever'
+    }
+    # The gate must run BEFORE Pending is cleared, or a refusal loses the request.
+    $gateAt = $schedBody.IndexOf('Test-WuuComputerBusy')
+    $clearAt = $schedBody.IndexOf('$item.Pending = $false')
+    if ($gateAt -ge 0 -and $clearAt -ge 0 -and $gateAt -gt $clearAt) {
+        Fail 'the scheduler clears Pending BEFORE checking busy - a refused request would be lost'
+    }
+}
+if (-not $failed) { Pass 'the scheduler does not deadlock on its own Pending queue' }
+
+# (w) OpState must be RELEASED on every path a job can leave the queue, or a computer becomes
+#     permanently 'busy' and unschedulable - worse than the timeout it was recovering from.
+$coreRaw5 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+$releaseCount = ([regex]::Matches($coreRaw5, "OpState\s*=\s*'Idle'")).Count
+if ($releaseCount -gt 0) {
+    # Two release sites are expected: the completion/failure path and the timeout path.
+    if ($releaseCount -lt 3) {
+        Fail "only $releaseCount OpState release site(s) found in Wuu.Core - each job-exit path needs one or a computer stays permanently busy"
+    } else { Pass "per-computer operation state is released on every job-exit path ($releaseCount sites)" }
+} elseif ($coreRaw5 -match 'OpState\s*=\s*''Running''') {
+    Fail 'Wuu.Core sets OpState=Running but never releases it - computers would stay permanently busy'
+} else { Pass 'per-computer operation state released in the cleanup loop' }
+
+# (x) ONE SUBMISSION POINT (brief SS4). Every per-computer operation must go through
+#     Start-UpdateCheckJob. A handler that composes its own [powershell]::Create().AddScript(...)
+#     .BeginInvoke() bypasses the per-computer gate AND the global MaxConcurrentJobs cap - which is
+#     exactly how EventGetUpdates took an unguarded branch on every re-check, and how four other
+#     handlers submitted to busy runspaces without the gate being able to see them.
+#
+#     The check counts per-computer submission sites in Wuu.Core. The two BeginInvoke calls that are
+#     legitimately NOT submissions are allowed by name:
+#       * $searchPS / $rebootPS - bounded sub-pipelines INSIDE the update payload, not job submissions;
+#       * $jobCleanup.PowerShell - the cleanup runspace, started once at wiring time.
+$coreCode3 = Get-WuuCodeWithoutComments -Path (Join-Path $root 'src\Wuu.Core.psm1')
+$allowed = @('$searchHandle', '$rebootHandle', '$jobCleanup.Thread')
+$badSubmits = @()
+foreach ($line in ($coreCode3 -split "`n")) {
+    if ($line -match '\.BeginInvoke\(') {
+        $isAllowed = $false
+        foreach ($a in $allowed) { if ($line -match [regex]::Escape($a)) { $isAllowed = $true } }
+        if (-not $isAllowed) { $badSubmits += $line.Trim() }
+    }
+}
+if ($badSubmits.Count) {
+    Fail ("per-computer submission(s) outside Start-UpdateCheckJob - these bypass the operation gate and the global cap: " + ($badSubmits -join ' | '))
+} else { Pass 'all per-computer operations go through the single submission point (SS4)' }
+
+# ...and the submission function must actually support the ops the handlers now request, or a
+# delegation would fail at runtime with an invalid ValidateSet argument.
+$supBody2 = Get-WuuFunctionBody $wupdRaw 'Start-UpdateCheckJob'
+foreach ($op in @('Restart', 'RemoveOffline', 'ServiceAction')) {
+    if ($supBody2 -notmatch "'$op'") { Fail "Start-UpdateCheckJob cannot accept the '$op' op - the console handlers delegate to it" }
+}
+if (-not $failed) { Pass 'the submission point supports every op the console handlers delegate' }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

@@ -22,13 +22,16 @@ $probe = Get-Command Write-InfoLog -ErrorAction SilentlyContinue
 if (-not $probe) { Write-Host 'FAIL: Write-InfoLog not resolvable after Import-WuuModules' -ForegroundColor Red; exit 1 }
 Write-Host 'PASS: cross-module command resolution (Write-InfoLog visible)' -ForegroundColor Green
 
-# Minimal UI state. A no-op Dispatcher stub lets Start-UpdateCheckJob's catch path
-# (which we are not exercising) complete without a real WPF control.
-$global:uiHash = [hashtable]::Synchronized(@{})
-$fakeItems = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-$noOpDispatcher = New-Object PSObject
-$null = Add-Member -InputObject $noOpDispatcher -MemberType ScriptMethod -Name Invoke -Value { param($priority, $action) & $action } -Force
-$global:uiHash.ListView = [pscustomobject]@{ Items = $fakeItems; Dispatcher = $noOpDispatcher }
+# The queue now lives in the STATE STORE. This test used to hand-build a fake `uiHash.ListView`
+# with an ObservableCollection and then assert the drain worked - which is exactly the object the
+# PRODUCTION code was missing (nothing in src/ ever assigns a ListView; $uiHash is an empty
+# hashtable). So the suite passed for two releases while Start-PendingUpdateCheck was a no-op in
+# the real app: an operation queued by auto-download was never started, Phase-E retries were never
+# promoted, and phase gating never applied to queued items.
+#
+# A test that supplies the object under test's dependencies FROM ITSELF cannot fail the way the app
+# can. It now drives the same store the console uses.
+$stateStore = New-WuuStateStore
 $global:jobs = [system.collections.arraylist]::Synchronized((New-Object System.Collections.ArrayList))
 $global:backgroundProcessing = [hashtable]::Synchronized(@{ Suspended = $false })
 $global:MaxConcurrentJobs = 10
@@ -52,13 +55,19 @@ $global:CredentialCache = @{}
 $global:PerformanceThreshold = @{ CPUPercent = 80; MemoryMB = 1024; NetworkLatencyMs = 1000 }
 $global:EnableEnhancedErrorHandling = $false
 
-$item = New-Object PSObject -Property @{ Computer = 'localhost'; Phase = 'Phase 1'; Pending = $true; Runspace = $null; Status = 'Initializing...' }
-$fakeItems.Add($item)
+$row = New-WuuComputerRow -Computer 'localhost' -Phase 'Phase 1'
+$row.Pending = $true
+$row.Status = 'Initializing...'
+$row.Runspace = $null
+Add-WuuComputerRow -Store $stateStore -Row $row | Out-Null
+$item = $row
 
 $getUpdatesPayload = { param($ComputerItem) 'payload-ran' }
 
 Initialize-WuuWindowsUpdateContext -Context @{
-    UiHash                      = $global:uiHash
+    # UiHash is deliberately NOT supplied: the console edition has no GUI state, and passing a
+    # populated one here is what hid the defect this suite now guards against.
+    StateStore                  = $stateStore
     Jobs                        = $global:jobs
     UpdatesHash                 = $global:updatesHash
     PerformanceHash             = $global:performanceHash
@@ -81,11 +90,42 @@ Initialize-WuuWindowsUpdateContext -Context @{
     BackgroundProcessing        = $global:backgroundProcessing
 }
 
+# Single source of truth for this suite's verdict. Declared ONCE, before anything can set it -
+# assigning $fail=$false after the guard below would silently erase its failure.
 $fail = $false
+
+# --- Guard: no SHIPPED source may read a GUI control member -----------------------------------
+# This is the assertion that would have caught the real defect. The drain test above is only
+# meaningful if production code and the test agree on where the queue lives; the two had silently
+# diverged, and the test hid it by building the missing object itself.
+#
+# Comments MUST be stripped with the tokenizer, not a '#.*$' regex or a "starts with #" test. The
+# modules carry block comments (<# ... #>) and doc blocks that quote these very member names when
+# explaining the migration - a naive filter flags all eight of them, and a '#.*$' regex additionally
+# eats '#' inside strings and subexpressions (the false-positive class Validate-Release.ps1
+# documents). PSParser knows what a comment is.
+$srcFiles = @(Get-ChildItem (Join-Path $root 'src') -Filter *.psm1)
+$guiReads = @()
+foreach ($f in $srcFiles) {
+    $tkErrs = $null
+    $tokens = [System.Management.Automation.PSParser]::Tokenize((Get-Content $f.FullName -Raw), [ref]$tkErrs)
+    foreach ($t in $tokens) {
+        if ($t.Type -eq 'Comment') { continue }
+        if ($t.Content -match '\$uiHash\.\w*(List[Vv]iew|CheckBox|TextBox|Menu)') {
+            $guiReads += ("{0}: {1}" -f $f.Name, $t.Content)
+        }
+    }
+}
+if ($guiReads.Count) {
+    Write-Host ('FAIL: shipped source reads a GUI control member ({0}):' -f $guiReads.Count) -ForegroundColor Red
+    $guiReads | ForEach-Object { Write-Host ("    {0}" -f $_) -ForegroundColor Red }
+    $fail = $true
+} else {
+    Write-Host 'PASS: no shipped source reads a GUI control member (queue lives in the state store)' -ForegroundColor Green
+}
 
 # BEFORE the fix: $script:WuuCtx was never initialized -> Start-PendingUpdateCheck no-ops.
 Start-PendingUpdateCheck
-
 if ($global:jobs.Count -eq 0) {
     Write-Host 'FAIL: Start-PendingUpdateCheck drained nothing into $jobs (item stuck at Initializing)' -ForegroundColor Red
     $fail = $true
@@ -105,8 +145,10 @@ foreach ($j in @($global:jobs)) {
 }
 
 # Drain a second item to prove the path is repeatable (phase gating sees no blockers)
-$item2 = New-Object PSObject -Property @{ Computer = 'localhost'; Phase = 'Phase 1'; Pending = $true; Runspace = $null; Status = 'Initializing...' }
-$fakeItems.Add($item2)
+$item2 = New-WuuComputerRow -Computer 'localhost2' -Phase 'Phase 1'
+$item2.Pending = $true
+$item2.Status = 'Initializing...'
+Add-WuuComputerRow -Store $stateStore -Row $item2 | Out-Null
 Start-PendingUpdateCheck
 if ($global:jobs.Count -ge 1) {
     Write-Host ("PASS: second drain works - {0} job(s)" -f $global:jobs.Count) -ForegroundColor Green

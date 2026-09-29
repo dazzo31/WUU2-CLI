@@ -1034,7 +1034,20 @@ $DownloadUpdates = {
         if ($stateStore) { $stateStore.Touch() }
         
         #Auto-install if enabled and there are downloaded updates ready for installation
-        if($uiHash.AutoInstallCheckBox.IsChecked -and $computer.Downloaded -gt 0){
+        #
+        # Reads the CONSOLE settings model, not a GUI control. This gate used to read
+        # $uiHash.AutoInstallCheckBox.IsChecked, which is $null in this edition (the synchronized
+        # hashtable has no such key), so `if ($null -and ...)` was ALWAYS FALSE and auto-install
+        # never fired regardless of the operator's setting. It failed silently because Wuu.Core has
+        # no Set-StrictMode - every other src/ module has one, which is why the omission survived.
+        #
+        # NOTE the same function already used $stateStore.Settings.AutoInstall a few lines below
+        # (to choose PendingOp): the migration was begun and abandoned mid-function, leaving the
+        # gate on the old source and the decision on the new one. They now agree.
+        #
+        # If $stateStore is somehow absent the condition is false: no automatic action. Every
+        # degraded path here fails toward "do nothing unattended", which is the safe direction.
+        if($stateStore.Settings.AutoInstall -and $computer.Downloaded -gt 0){
             #Check if there are any updates that are downloaded and don't require user input
             $downloadedUpdates = $updatesHash[$Computer.computer] | Where-Object {$_.IsDownloaded -and $_.InstallationBehavior.CanRequestUserInput -eq $false}
             
@@ -1796,7 +1809,11 @@ $GetUpdates = {
         }
         
         #Auto-download if enabled and there are updates available
-        if($uiHash.AutoDownloadCheckBox.IsChecked -and $computer.Available -gt 0 -and $computer.Available -gt $computer.Downloaded){
+        #
+        # $uiHash.AutoDownloadCheckBox.IsChecked was $null here, so this gate was ALWAYS FALSE and
+        # auto-download never fired. Replaced with the console settings model, matching the
+        # $stateStore.Settings.AutoInstall read used for PendingOp immediately below.
+        if($stateStore.Settings.AutoDownload -and $computer.Available -gt 0 -and $computer.Available -gt $computer.Downloaded){
             # Queue a follow-up download instead of nested-BeginInvoke on this busy runspace
             # (a second pipeline started from inside the runspace silently never runs).
             # If AutoInstall is also on, run the full unattended chain in ONE later pipeline.
@@ -1991,7 +2008,14 @@ $RestartComputer = {
     Param ($Computer,$afterInstall)
     try{
         # Avoid auto reboot if not enabled and required
-        if($afterInstall -and -not $uiHash.AutoRebootCheckBox.IsChecked){return}
+        #
+        # $uiHash.AutoRebootCheckBox.IsChecked was $null, and `-not $null` is $TRUE - so this
+        # guard returned early on EVERY after-install restart, whether or not the operator had
+        # AutoReboot enabled. Auto-reboot has therefore never worked in this edition. The console
+        # settings model fixes it.
+        # Note the failure direction is still safe if $stateStore is absent: `-not $null` is $true,
+        # so an unattended reboot is still refused rather than performed unexpectedly.
+        if($afterInstall -and -not $stateStore.Settings.AutoReboot){return}
         if($afterInstall -and -not $Computer.RebootRequired){return}
         # Update status
             $computer.Status = 'Restarting... Waiting for computer to shutdown.'
@@ -2146,12 +2170,48 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [ERROR] Failed to cleanup job for computer $($runspace.Computer): $($_.Exception.Message)"
                         & $WriteLogFileScript $logEntry
+
+                        # A failed EndInvoke is how a SILENTLY DISCARDED pipeline surfaces (the
+                        # runspace was already busy, so the work never ran - see Test-ComputerBusy).
+                        # The log line above is not enough: the row must say so too, or the operator
+                        # sees an operation that was accepted and then simply never happened.
+                        # Written with language constructs only, from the store's own hashtable -
+                        # this runs on the cleanup thread, where no module function resolves.
+                        try {
+                            if ($stateStore) {
+                                $failedRow = $stateStore.ByName[[string]$runspace.Computer.ToLowerInvariant()]
+                                if ($failedRow) {
+                                    $failedRow.State = 'Error'
+                                    $failedRow.UpdatesStatus = 'Error'
+                                    $failedRow.Status = "Operation did not run - another operation held the computer's runspace. Retry when it is idle."
+                                    $failedRow.Color = 'Error'
+                                    $failedRow.OpState = 'Idle'
+                                    $failedRow.OpStartedAt = $null
+                                    $stateStore.Touch()
+                                }
+                            }
+                        } catch { }
                     }
                     # Always dispose and drop the job so a failed EndInvoke is not retried forever
                     try { $runspace.powershell.dispose() } catch { $null = $_ }
                     $runspace.Runspace = $null
                     $runspace.powershell = $null
                     $jobsToRemove += $runspace
+
+                    # Release the per-computer operation lock on EVERY completion path (success or
+                    # failure). This is the pair to Start-UpdateCheckJob setting OpState='Running';
+                    # if it is missed here the computer would be permanently 'busy' and never
+                    # schedulable again. Language constructs only - runs on the cleanup thread.
+                    try {
+                        if ($stateStore) {
+                            $doneRow = $stateStore.ByName[[string]$runspace.Computer.ToLowerInvariant()]
+                            if ($doneRow -and $doneRow.PSObject.Properties['OpState']) {
+                                $doneRow.OpState = 'Idle'
+                                $doneRow.OpStartedAt = $null
+                                $stateStore.Touch()
+                            }
+                        }
+                    } catch { }
                     
                 }
                 # Check for jobs that have been running too long (timeout after 10 minutes)
@@ -2166,6 +2226,21 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                     $runspace.Runspace = $null
                     $runspace.powershell = $null
                     $jobsToRemove += $runspace
+
+                    # Release the per-computer operation lock when a job is force-stopped on
+                    # timeout. Without this the row stays 'Running' forever and Test-WuuComputerBusy
+                    # refuses every future submission for that computer - a permanently unschedulable
+                    # machine, which is worse than the timeout it was recovering from.
+                    try {
+                        if ($stateStore) {
+                            $toRow = $stateStore.ByName[[string]$timedOutComputer.ToLowerInvariant()]
+                            if ($toRow -and $toRow.PSObject.Properties['OpState']) {
+                                $toRow.OpState = 'Idle'
+                                $toRow.OpStartedAt = $null
+                                $stateStore.Touch()
+                            }
+                        }
+                    } catch { }
                     
 
                     # Update computer status to show timeout.
@@ -2416,20 +2491,17 @@ $eventAddAD = { #Add computers from Active Directory (console edition)
 
 #region System Management
 $eventRemoveOfflineComputer = {
-    (Get-WuuComputerRow -Store $stateStore) | ForEach-Object {
-        if (-not $_.Runspace) {
-            $item = $_
-            try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
-                Write-ErrorLog "Failed to create runspace for $($item.Computer): $($_.Exception.Message)"
-                return
-            }
-        }
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($RemoveOfflineComputer).AddArgument($_)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+    # Routed through Start-UpdateCheckJob so this shares the per-computer gate and the global
+    # MaxConcurrentJobs cap (SS4). It used to compose its own pipeline, which meant a computer
+    # mid-check could have a connectivity probe submitted to a busy runspace - silently discarded,
+    # AND it did not count toward the concurrency limit.
+    $deferred = 0
+    foreach ($row in @(Get-WuuComputerRow -Store $stateStore)) {
+        if (Test-WuuComputerBusy -Row $row) { $deferred++; continue }
+        $row.Pending = $false
+        [void](Start-UpdateCheckJob -ComputerItem $row -Op 'RemoveOffline')
     }
+    if ($deferred) { Write-Host ("  {0} computer(s) were busy - connectivity test skipped for them." -f $deferred) -ForegroundColor Yellow }
 }
 #endregion
 
@@ -2651,7 +2723,16 @@ $eventShowInstalledUpdates = {
 }
 $eventAuditWSUSUpdates = {
     # Audit WSUS-approved updates and compare with Windows Update count
-    ForEach ($Computer in $uiHash.Listview.SelectedItems){
+    #
+    # Console edition: targets come from the state store via Read-WuuSelection, not from
+    # $uiHash.Listview.SelectedItems. That member is $null here (nothing in src/ ever assigns it),
+    # so `ForEach ($Computer in @($null))` iterated nothing and this operation was a silent no-op
+    # from the console AND from `wuu audit wsus`. Read-WuuSelection is the same selector every other
+    # console handler uses, and the command surface already queues its -Computer answer for it
+    # (see the 'audit' entry in Get-WuuCommandTable), so scripting behaviour is preserved.
+    $targets = @(Read-WuuSelection -Store $stateStore -Prompt 'Audit WSUS state for which computers?')
+    if ($targets.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    ForEach ($Computer in $targets){
         $comResult = Invoke-RemoteComWithTimeout -ComputerName $Computer.computer -TimeoutSeconds 60 -ScriptBlock {
             param($ComputerName)
             try {
@@ -2775,21 +2856,16 @@ $eventWUServiceAction = {
     Param ($Action, $TargetComputer)
     # Console edition: when called from the interactive menu the target(s) are already
     # resolved; fall back to the store's full list otherwise.
+    # Routed through Start-UpdateCheckJob (SS4) so a service action cannot be submitted to a busy
+    # runspace - where it would be silently discarded - and so it counts toward the global cap.
     $targets = if ($TargetComputer) { @($TargetComputer) } else { @(Get-WuuComputerRow -Store $stateStore) }
-    $targets | ForEach-Object {
-        if (-not $_.Runspace) {
-            $item = $_
-            try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
-                Write-ErrorLog "Failed to create runspace for $($item.Computer): $($_.Exception.Message)"
-                return
-            }
-        }
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($WUServiceAction).AddArgument($_).AddArgument($Action)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+    $deferred = 0
+    foreach ($row in $targets) {
+        if (Test-WuuComputerBusy -Row $row) { $deferred++; continue }
+        $row.Pending = $false
+        [void](Start-UpdateCheckJob -ComputerItem $row -Op 'ServiceAction' -ServiceAction $Action)
     }
+    if ($deferred) { Write-Host ("  {0} computer(s) were busy - service action skipped for them." -f $deferred) -ForegroundColor Yellow }
 }
 
 # Windows Update Service Action ScriptBlock
@@ -3010,22 +3086,25 @@ $consoleActions.EventToggleSettings = {
 $consoleActions.EventGetUpdates = {
     $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Check which computers? ("all" for every row, Enter to cancel)')
     if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
+    $started = 0; $deferred = 0; $skipped = 0
     foreach ($r in $rows) {
-        if ($r.PSObject.Properties['RetryCount']) { $r.RetryCount = 0; $r.RetryAt = $null }
-        if (-not $r.Runspace) {
-            if ($r.PSObject.Properties['Pending']) { $r.Pending = $false }
-            [void](Start-UpdateCheckJob -ComputerItem $r)
-        } else {
-            $temp = New-Object PSObject -Property @{
-                PowerShell = $null; Runspace = $null; StartTime = Get-Date; Computer = $r.Computer
-            }
-            $temp.PowerShell = [powershell]::Create().AddScript($GetUpdates).AddArgument($r)
-            $temp.PowerShell.Runspace = $r.Runspace
-            $temp.Runspace = $temp.PowerShell.BeginInvoke()
-            $jobs.Add($temp) | Out-Null
+        # One operation per computer (SS3): a computer already working is left queued, NOT submitted
+        # to. Set Pending so the scheduler starts it as soon as the current operation finishes -
+        # a plain skip would lose the operator's request.
+        if (Test-WuuComputerBusy -Row $r) {
+            $r.Pending = $true
+            if (-not $r.PendingOp) { $r.PendingOp = 'Check' }
+            $deferred++
+            continue
         }
+        if ($r.PSObject.Properties['RetryCount']) { $r.RetryCount = 0; $r.RetryAt = $null }
+        $r.Pending = $false
+        if (Start-UpdateCheckJob -ComputerItem $r -Op 'Check') { $started++ } else { $skipped++ }
     }
-    Write-Host "  Queued update check for $($rows.Count) computer(s)." -ForegroundColor Green
+    if ($stateStore) { $stateStore.Touch() }
+    Write-Host ("  Update check queued for {0} computer(s)." -f $started) -ForegroundColor Green
+    if ($deferred) { Write-Host ("  {0} already busy - queued to run when they finish." -f $deferred) -ForegroundColor Yellow }
+    if ($skipped) { Write-Host ("  {0} could not be submitted (see the error log)." -f $skipped) -ForegroundColor Red }
 }
 
 $consoleActions.EventDownloadUpdates = {
@@ -3034,23 +3113,28 @@ $consoleActions.EventDownloadUpdates = {
     if (-not (Read-WuuYesNo -Prompt "Download updates to $($rows.Count) computer(s)?" -Default $true)) {
         Write-Host '  Cancelled.' -ForegroundColor Yellow; return
     }
+    $started = 0; $deferred = 0; $uptodate = 0
     foreach ($r in $rows) {
-        if (-not $r.Runspace) {
-            try { $r.Runspace = New-ComputerRunspace -ComputerItem $r } catch {
-                Write-ErrorLog "Failed to create runspace for $($r.Computer): $($_.Exception.Message)"; continue
-            }
-        }
+        # Nothing to do - answer immediately rather than queuing an operation that will no-op.
         if ($r.Available -eq $r.Downloaded) {
             $r.Status = if ($r.Available -eq 0) { 'Up-to-Date - No updates available for download.' } else { 'All available updates are already downloaded.' }
-            if ($stateStore) { $stateStore.Touch() }
+            $uptodate++
             continue
         }
-        $temp = "" | Select-Object PowerShell, Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($DownloadUpdates).AddArgument($r)
-        $temp.PowerShell.Runspace = $r.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+        if (Test-WuuComputerBusy -Row $r) {
+            $r.Pending = $true
+            $r.PendingOp = 'Download'
+            $deferred++
+            continue
+        }
+        $r.Pending = $false
+        [void](Start-UpdateCheckJob -ComputerItem $r -Op 'Download')
+        $started++
     }
+    if ($stateStore) { $stateStore.Touch() }
+    Write-Host ("  Download started for {0} computer(s)." -f $started) -ForegroundColor Green
+    if ($deferred) { Write-Host ("  {0} already busy - queued to run when they finish." -f $deferred) -ForegroundColor Yellow }
+    if ($uptodate) { Write-Host ("  {0} had nothing to download." -f $uptodate) -ForegroundColor DarkGray }
 }
 
 $consoleActions.EventInstallUpdates = {
@@ -3059,20 +3143,21 @@ $consoleActions.EventInstallUpdates = {
     if (-not (Read-WuuYesNo -Prompt "Install updates on $($rows.Count) computer(s)?" -Default $false)) {
         Write-Host '  Cancelled.' -ForegroundColor Yellow; return
     }
+    $started = 0; $deferred = 0
     foreach ($r in $rows) {
-        if (-not $r.Runspace) {
-            try { $r.Runspace = New-ComputerRunspace -ComputerItem $r } catch {
-                Write-ErrorLog "Failed to create runspace for $($r.Computer): $($_.Exception.Message)"; continue
-            }
+        if (Test-WuuComputerBusy -Row $r) {
+            $r.Pending = $true
+            $r.PendingOp = 'InstallAndRecheck'
+            $deferred++
+            continue
         }
-        $temp = "" | Select-Object PowerShell, Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($InstallUpdates).AddArgument($r)
-        $temp.PowerShell.AddScript($RestartComputer).AddArgument($r).AddArgument($true)
-        $temp.PowerShell.AddScript($GetUpdates).AddArgument($r)
-        $temp.PowerShell.Runspace = $r.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+        $r.Pending = $false
+        [void](Start-UpdateCheckJob -ComputerItem $r -Op 'InstallAndRecheck')
+        $started++
     }
+    if ($stateStore) { $stateStore.Touch() }
+    Write-Host ("  Install started for {0} computer(s)." -f $started) -ForegroundColor Green
+    if ($deferred) { Write-Host ("  {0} already busy - queued to run when they finish." -f $deferred) -ForegroundColor Yellow }
 }
 
 $consoleActions.EventRestartComputer = {
@@ -3083,19 +3168,22 @@ $consoleActions.EventRestartComputer = {
     if (-not (Read-WuuYesNo -Prompt 'Confirm restart?' -Default $false)) {
         Write-Host '  Cancelled.' -ForegroundColor Yellow; return
     }
+    $started = 0; $deferred = 0
     foreach ($r in $rows) {
-        if (-not $r.Runspace) {
-            try { $r.Runspace = New-ComputerRunspace -ComputerItem $r } catch {
-                Write-ErrorLog "Failed to create runspace for $($r.Computer): $($_.Exception.Message)"; continue
-            }
+        if (Test-WuuComputerBusy -Row $r) {
+            # A restart is the one operation that must NOT be silently deferred: the operator
+            # explicitly confirmed it for these computers. Reported per computer instead.
+            Write-Host ("    {0} is busy ({1}) - restart NOT queued; re-run when it is idle." -f $r.Computer, $r.OpState) -ForegroundColor Yellow
+            $deferred++
+            continue
         }
-        $temp = "" | Select-Object PowerShell, Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($RestartComputer).AddArgument($r).AddArgument($false)
-        $temp.PowerShell.AddScript($GetUpdates).AddArgument($r)
-        $temp.PowerShell.Runspace = $r.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+        $r.Pending = $false
+        [void](Start-UpdateCheckJob -ComputerItem $r -Op 'Restart')
+        $started++
     }
+    if ($stateStore) { $stateStore.Touch() }
+    Write-Host ("  Restart started for {0} computer(s)." -f $started) -ForegroundColor Green
+    if ($deferred) { Write-Host ("  {0} skipped because they were busy." -f $deferred) -ForegroundColor Yellow }
 }
 
 $consoleActions.EventRemoveOfflineComputer = {
@@ -3242,6 +3330,11 @@ $wuuContext = @{
     DownloadUpdates             = $DownloadUpdates
     InstallUpdates              = $InstallUpdates
     RestartComputer             = $RestartComputer
+    # Exposed so the last two per-computer operations (remove-offline, service action) can go
+    # through Start-UpdateCheckJob like everything else, instead of composing their own
+    # [powershell]::Create() + BeginInvoke and thereby bypassing the per-computer gate (SS4).
+    RemoveOfflineComputer       = $RemoveOfflineComputer
+    WUServiceAction             = $WUServiceAction
     BackgroundProcessing        = $global:backgroundProcessing
     # Console edition: the state store worker runspaces write progress into.
     StateStore                  = $stateStore

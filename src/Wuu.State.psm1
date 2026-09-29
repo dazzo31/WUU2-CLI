@@ -100,6 +100,23 @@ function New-WuuComputerRow {
         Runspace        = $null
         Pending         = $true
         PendingOp       = $null
+        # Per-computer OPERATION state (SS3 of the hardening brief). 'Idle' | 'Queued' | 'Running'.
+        # Distinct from State, which is the DISPLAY/workflow label ('Queued','Checking',...). This
+        # one answers exactly one question - may another operation be submitted to this runspace? -
+        # and is what Test-WuuComputerBusy answers.
+        #
+        # WHY IT IS NEEDED AT ALL: submitting [powershell]::BeginInvoke to a runspace that already
+        # has a pipeline running is silently discarded. Measured:
+        #     BeginInvoke   -> returns a handle
+        #     handle        -> completes normally
+        #     EndInvoke     -> throws "The pipeline was not run because a pipeline is already
+        #                      running. Pipelines cannot be run concurrently."
+        #     InvocationState -> 'Failed'
+        #     output/errors -> NONE while running; the discard is invisible until EndInvoke
+        # So a second operation on a busy computer does not merely queue - it VANISHES, and the
+        # operator sees an operation that was accepted, reported as submitted, and never ran.
+        OpState         = 'Idle'
+        OpStartedAt     = $null
         TimeoutExpiresAt = $null
         TimeoutSource   = ''
         RetryCount      = 0
@@ -129,8 +146,24 @@ function New-WuuStateStore {
       $uiHash.AutoDownloadCheckBox.IsChecked  ->  $stateStore.Settings.AutoDownload
       $uiHash.AutoInstallCheckBox.IsChecked   ->  $stateStore.Settings.AutoInstall
       $uiHash.AutoRebootCheckBox.IsChecked    ->  $stateStore.Settings.AutoReboot
-    (Verified by grep: those three are the ONLY $uiHash members payloads need for
-    behaviour - every other uiHash member is menu wiring or ListView/Window chrome.)
+
+    CORRECTION (2026-09-29). The three lines above were aspirational, not descriptive, and this
+    note asserted a migration that had only been half done. The payloads went on READING the
+    checkbox members - which are $null in this edition, because $uiHash is created empty
+    ([hashtable]::Synchronized(@{})) and no console code ever populates those keys. The result was
+    a silent, total failure of all three automatic behaviours:
+
+        AutoDownload:  if ($null -and ...)          -> always $false  -> never downloaded
+        AutoInstall:   if ($null -and ...)          -> always $false  -> never installed
+        AutoReboot:    if (... -and -not $null)     -> always $true   -> always returned early
+
+    Nothing failed loudly, because Wuu.Core.psm1 has no Set-StrictMode - a missing property on a
+    hashtable is $null, not an error. Every other src/ module does set it, which is why the
+    omission was easy to miss. All three gates now read $stateStore.Settings.* and there are no
+    live reads of a GUI control anywhere in src/.
+
+    Verified by grep: those three WERE the only $uiHash members payloads needed for behaviour -
+    every other uiHash member is menu wiring or ListView/Window chrome.
     #>
     $rows = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
     $byName = [hashtable]::Synchronized(@{})
@@ -266,6 +299,63 @@ function Set-WuuSetting {
     return $Value
 }
 
+function Test-WuuComputerBusy {
+    <#
+    .SYNOPSIS Whether an operation may be submitted for this computer right now (SS3).
+    .DESCRIPTION
+    The single authority on "is this computer already running an operation?". Every submission path
+    consults it, so the answer cannot differ between the console, the guided workflow and the
+    command surface.
+
+    WHY A GATE RATHER THAN TRUSTING THE RUNSPACE: the runspace does NOT protect itself. Submitting
+    BeginInvoke while a pipeline is active is ACCEPTED, the handle completes normally, and the work is
+    DISCARDED - EndInvoke then throws "The pipeline was not run because a pipeline is already
+    running. Pipelines cannot be run concurrently." (measured; see the OpState field note). Nothing
+    about that failure is visible at submission time, so the check has to happen beforehand.
+
+    Deliberately consults BOTH signals:
+      * OpState - set by Start-UpdateCheckJob for every real submission;
+      * Pending - set by the auto-download / auto-install tails, which queue a FOLLOW-UP operation
+                  rather than submitting one immediately. A queued follow-up must block a direct
+                  submission too, or the direct one wins the runspace and the queued one is then
+                  discarded.
+
+    -IgnorePending exists for the SCHEDULER, and without it the scheduler deadlocks. Its input queue
+    IS "the rows with Pending set", so treating Pending as busy would make it skip every row it was
+    given, for ever, and nothing would ever run. The scheduler is the consumer of Pending - it
+    clears the flag and submits - so for it the only question is whether an OpState is already in
+    flight. Direct submissions (console handlers) keep the default behaviour and defer to the
+    queued follow-up.
+
+    Read-only and side-effect free on purpose: it is called from the scheduler, from console
+    handlers, and from tests, so it must never mutate. The CALLER decides what to do about a busy
+    computer (queue it, skip it, or tell the operator) because those differ per caller.
+
+    NOT [Parameter(Mandatory)]: a $null row is the ordinary result of a lookup miss in a loop, and
+    Mandatory rejects it at BINDING time - before the null guard below can run - with "Cannot bind
+    argument to parameter 'Row' because it is null". The guard is what makes a miss a clean $false
+    instead of an exception in the middle of a dispatch loop.
+    #>
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$Row,
+        [switch]$IgnorePending
+    )
+
+    if ($null -eq $Row) { return $false }
+    if ($null -eq $Row.PSObject.Properties['OpState']) { return $false }
+
+    $state = [string]$Row.OpState
+    if ($state -eq 'Running' -or $state -eq 'Queued') { return $true }
+
+    # A queued follow-up (the auto chain) also means the runspace is spoken for - unless the caller
+    # IS the scheduler that is about to consume that flag.
+    if (-not $IgnorePending) {
+        if ($Row.PSObject.Properties['Pending'] -and $Row.Pending) { return $true }
+    }
+
+    return $false
+}
+
 function New-WuuOperatorContext {
     <#
     .SYNOPSIS
@@ -298,5 +388,6 @@ Export-ModuleMember -Function @(
     'Get-WuuComputerRow'
     'Set-WuuComputerRowColor'
     'Set-WuuSetting'
+    'Test-WuuComputerBusy'
     'New-WuuOperatorContext'
 )

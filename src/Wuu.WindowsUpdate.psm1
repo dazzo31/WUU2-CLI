@@ -392,14 +392,39 @@ function Start-UpdateCheckJob {
         # the inner payload silently never runs and EndInvoke throws "pipeline already
         # running" (root cause of auto-download/auto-install doing nothing). Chained
         # ops run sequentially inside one BeginInvoke, exactly like $eventInstallUpdates.
-        [ValidateSet('Check','Download','InstallAndRecheck','AutoFlow')]
-        [string]$Op = 'Check'
+        #
+        # THIS IS THE ONLY PLACE A PER-COMPUTER OPERATION IS SUBMITTED (SS3/SS4). The console
+        # handlers in Wuu.Core used to compose their own [powershell]::Create() + BeginInvoke per
+        # computer, which meant: the per-computer gate could not see them (they never set OpState),
+        # the global MaxConcurrentJobs cap did not apply to them, and EventGetUpdates took the
+        # unguarded branch on every re-check (it only called this function when the row had NO
+        # runspace). They now all delegate here.
+        [ValidateSet('Check','Download','InstallAndRecheck','AutoFlow','Restart','RemoveOffline','ServiceAction')]
+        [string]$Op = 'Check',
+        # Only used by 'ServiceAction' (start|stop|restart). Passed through rather than carried on
+        # the row, so the op stays explicit at the submission call site.
+        [string]$ServiceAction = ''
     )
     $ctx = $script:WuuCtx
     $GetUpdates = $ctx.GetUpdates; $jobs = $ctx.Jobs; $uiHash = $ctx.UiHash
     $PowerShell = $null
     
     try {
+        # ---- ONE OPERATION PER COMPUTER (SS3) --------------------------------------------------
+        # Refuse to submit while this computer already has an operation in flight. Without this
+        # check the submission below is ACCEPTED and then SILENTLY DISCARDED: BeginInvoke returns a
+        # handle, the handle completes, and only EndInvoke reports "The pipeline was not run because
+        # a pipeline is already running" - by which time the operator has been told the operation
+        # was queued. Measured; see Test-ComputerBusy.
+        #
+        # A refusal here is a normal outcome, not an error: the scheduler re-considers the row on
+        # the next tick, and the auto-flow chain sets Pending so it is picked up after the current
+        # operation finishes. Logged at INFO so a run can be reconstructed without guessing.
+        if (Test-WuuComputerBusy -Row $ComputerItem) {
+            Write-InfoLog "[$($ComputerItem.Computer)] submission refused: an operation is already $($ComputerItem.OpState) (op=$Op) - it stays queued for the next scheduler tick"
+            return $false
+        }
+
         if (-not $ComputerItem.Runspace) {
             $ComputerItem.Runspace = New-ComputerRunspace -ComputerItem $ComputerItem
         }
@@ -423,6 +448,20 @@ function Start-UpdateCheckJob {
                 $PowerShell.AddScript($ctx.RestartComputer).AddArgument($ComputerItem).AddArgument($true) | Out-Null
                 $PowerShell.AddScript($GetUpdates).AddArgument($ComputerItem) | Out-Null
             }
+            'Restart'            {
+                # Manual restart: RestartComputer($false) = "not afterInstall", so the AUTO-reboot
+                # setting must not suppress it. Then re-check, matching the old handler which
+                # appended a check to the restart pipeline.
+                $PowerShell.AddScript($ctx.RestartComputer).AddArgument($ComputerItem).AddArgument($false) | Out-Null
+                $PowerShell.AddScript($GetUpdates).AddArgument($ComputerItem) | Out-Null
+            }
+            'RemoveOffline'      {
+                # Connectivity probe; the payload removes the row itself when unreachable.
+                $PowerShell.AddScript($ctx.RemoveOfflineComputer).AddArgument($ComputerItem) | Out-Null
+            }
+            'ServiceAction'      {
+                $PowerShell.AddScript($ctx.WUServiceAction).AddArgument($ComputerItem).AddArgument($ServiceAction) | Out-Null
+            }
             default              { $PowerShell.AddScript($GetUpdates).AddArgument($ComputerItem) | Out-Null }   # 'Check'
         }
         $PowerShell.Runspace = $ComputerItem.Runspace
@@ -436,6 +475,16 @@ function Start-UpdateCheckJob {
         }
 
         $jobs.Add($temp) | Out-Null
+
+        # Mark the computer as Running. Cleared by the job-cleanup loop when this pipeline
+        # completes, or when the 10-minute timeout path disposes it - both are the only places a
+        # job leaves $jobs, so OpState cannot get stuck at Running. Set on the row (not in the runspace)
+        # because the gate is consulted from the scheduler thread, not from the worker.
+        if ($ComputerItem.PSObject.Properties['OpState']) {
+            $ComputerItem.OpState = 'Running'
+            $ComputerItem.OpStartedAt = Get-Date
+        }
+        if ($ctx.StateStore) { $ctx.StateStore.Touch() }
         return $true
     } catch {
         # In a catch block $_ is the ErrorRecord, not the computer item
@@ -472,26 +521,60 @@ function Start-UpdateCheckJob {
 }
 
 function Start-PendingUpdateCheck {
+    <#
+    .SYNOPSIS The scheduler tick: promotes due retries and starts queued operations.
+    .DESCRIPTION
+    Reads the queue from the STATE STORE, not from a GUI control.
+
+    This function previously iterated `$uiHash.Listview.Items`. In this edition `$uiHash` is an
+    empty synchronized hashtable (Wuu.Core.psm1: `$global:uiHash = [hashtable]::Synchronized(@{})`)
+    and NOTHING in src/ ever assigns a ListView to it - the only assignments in the repository are in
+    tests, which hand-built a fake one. So `@($null)` was empty on every tick and this function did
+    NOTHING in production. Consequences, all silent:
+
+      * an operation queued by the auto-download / auto-install chain (Pending=$true, PendingOp set)
+        was never started - the automatic behaviours could not work even once the settings gates
+        were corrected, because nothing consumed what they queued;
+      * Phase-E retries (RetryAt) were never promoted, so a timed-out computer never retried;
+      * phase gating never applied to queued items.
+
+    That is why Test-PendingDrain could pass for two releases while the queue was dead: it built the
+    very object the production code was missing. The test now populates the store instead.
+
+    Get-WuuComputerRow is an exported Wuu.State function; all modules are imported -Global, so it
+    resolves here at call time (the same cross-module visibility Test-PendingDrain asserts).
+    #>
     $ctx = $script:WuuCtx
-    $backgroundProcessing = $ctx.BackgroundProcessing; $uiHash = $ctx.UiHash
+    $backgroundProcessing = $ctx.BackgroundProcessing
     $jobs = $ctx.Jobs; $MaxConcurrentJobs = $ctx.MaxConcurrentJobs
+    $store = $ctx.StateStore
     if ($backgroundProcessing.Suspended) { return }
+    if (-not $store) { return }   # no store = nothing to schedule; never fatal on a timer tick
+
     # Promote due Phase-E timeout retries (RetryAt set by $GetUpdates) back into the pending queue
     $now = [DateTime]::Now
-    foreach ($item in @($uiHash.Listview.Items)) {
+    $rows = @(Get-WuuComputerRow -Store $store)
+    foreach ($item in $rows) {
         if ($item.PSObject.Properties['RetryAt'] -and $item.RetryAt -and $item.RetryAt -le $now) {
             $item.RetryAt = $null
             $item.Pending = $true
         }
     }
-    $pendingItems = @($uiHash.Listview.Items | Where-Object { $_.Pending })
+    $pendingItems = @($rows | Where-Object { $_.Pending })
     foreach ($item in $pendingItems) {
         if ($jobs.Count -ge $MaxConcurrentJobs) { break }
+        # ONE OPERATION PER COMPUTER: if this row already has an operation in flight, leave it
+        # Pending and try again on the next tick. -IgnorePending because this function IS the
+        # consumer of the Pending flag: treating it as "busy" here would make the scheduler skip
+        # every row it was handed, for ever.
+        # The check must come BEFORE $item.Pending is cleared, or a refusal would lose the request.
+        if (Test-WuuComputerBusy -Row $item -IgnorePending) { continue }
         if (-not (Test-PhaseReady -Phase $item.Phase)) {
             if ($item.Status -notlike 'Waiting for previous phase*') {
                 $item.Status = "Waiting for previous phase to complete. Current phase: $($item.Phase)"
                 if ($item.PSObject.Properties['State']) { $item.State = 'Queued' }
-                $uiHash.Listview.Items.Refresh()
+                # Was $uiHash.Listview.Items.Refresh() - the store's redraw signal replaces it.
+                $store.Touch()
             }
             continue
         }
@@ -507,9 +590,18 @@ function Start-PendingUpdateCheck {
 }
 
 function Test-PhaseCompletion {
+    <#
+    .SYNOPSIS Whether every computer in a phase has settled successfully.
+    .DESCRIPTION
+    Reads the store, not `$uiHash.Listview.Items`. The old source made `@($null)` empty, so
+    `$phaseComputers.Count -eq 0` was true and this returned `$true` for EVERY phase - i.e. phase
+    gating never blocked anything. That is the opposite of the intended behaviour, and it is why a
+    Phase 2 job could start while Phase 1 was still running.
+    #>
     param([string]$Phase)
-    $uiHash = $script:WuuCtx.UiHash
-    $phaseComputers = @($uiHash.Listview.Items | Where-Object { $_.Phase -eq $Phase })
+    $store = $script:WuuCtx.StateStore
+    if (-not $store) { return $true }
+    $phaseComputers = @(Get-WuuComputerRow -Store $store | Where-Object { $_.Phase -eq $Phase })
     
     if ($phaseComputers.Count -eq 0) {
         return $true  # No computers in this phase, consider it complete

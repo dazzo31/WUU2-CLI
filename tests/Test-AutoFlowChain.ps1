@@ -27,15 +27,16 @@ Import-WuuModules -WuuRoot $root
 $markerFile = Join-Path $env:TEMP ("WUU_autoflow_markers_{0}.log" -f ([guid]::NewGuid().ToString('N')))
 New-Item -ItemType File -Path $markerFile -Force | Out-Null
 
-# --- Stub UI state (no-op dispatcher so dispatcher actions run inline) ------------------
-$global:uiHash = [hashtable]::Synchronized(@{})
-$fakeItems = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-$noOpDispatcher = New-Object PSObject
-$null = Add-Member -InputObject $noOpDispatcher -MemberType ScriptMethod -Name Invoke -Value { param($priority, $action) & $action } -Force
-$global:uiHash.ListView = [pscustomobject]@{ Items = $fakeItems; Dispatcher = $noOpDispatcher }
-$global:uiHash.AutoInstallCheckBox = [pscustomobject]@{ IsChecked = $true }
-$global:uiHash.AutoRebootCheckBox  = [pscustomobject]@{ IsChecked = $false }
-
+# --- Console state: the queue lives in the store, settings live in Settings ---------------
+# This suite used to hand-build `uiHash.ListView` (an ObservableCollection + no-op dispatcher) and
+# fake `AutoInstallCheckBox`/`AutoRebootCheckBox` objects. Those are GUI constructs that do not
+# exist in this edition - nothing in src/ ever assigns them - so the test was asserting against
+# objects it supplied itself, and could not fail the way the application does. It now drives the
+# same store and Settings the console uses.
+$stateStore = New-WuuStateStore
+$stateStore.Settings.AutoDownload = $true
+$stateStore.Settings.AutoInstall = $true
+$stateStore.Settings.AutoReboot = $false
 $global:jobs = [system.collections.arraylist]::Synchronized((New-Object System.Collections.ArrayList))
 $global:backgroundProcessing = [hashtable]::Synchronized(@{ Suspended = $false })
 $global:MaxConcurrentJobs = 10
@@ -66,7 +67,7 @@ $payloadInstall  = $mkN.Invoke('INSTALL')  | Select-Object -First 1
 $payloadRestart  = $mkA.Invoke('RESTART')  | Select-Object -First 1
 
 Initialize-WuuWindowsUpdateContext -Context @{
-    UiHash                      = $global:uiHash
+    StateStore                  = $stateStore
     Jobs                        = $global:jobs
     UpdatesHash                 = $global:updatesHash
     PerformanceHash             = $global:performanceHash
@@ -99,11 +100,14 @@ function Invoke-OpChain {
     # Fresh marker file per op so ordering is unambiguous
     Set-Content -Path $markerFile -Value $null
 
-    $item = New-Object PSObject -Property @{
-        Computer = 'localhost'; Phase = 'Phase 1'; Pending = $true
-        PendingOp = $PendingOp; Runspace = $null; Status = 'test'
-    }
-    $fakeItems.Add($item)
+    $item = New-WuuComputerRow -Computer 'localhost' -Phase 'Phase 1'
+    $item.Pending = $true
+    $item.PendingOp = $PendingOp
+    $item.Runspace = $null
+    $item.Status = 'test'
+    # The row contract has every field the scheduler and payloads touch, so no PSObject literal is
+    # needed (and a literal was itself a hazard: it omitted fields the real factory guarantees).
+    Add-WuuComputerRow -Store $stateStore -Row $item | Out-Null
     Start-PendingUpdateCheck
 
     if ($global:jobs.Count -ne 1) {
@@ -118,7 +122,7 @@ function Invoke-OpChain {
     $global:jobs.Remove($job)
     try { $job.PowerShell.Dispose() } catch { $null = $_ }
     if ($item.Runspace) { try { $item.Runspace.Close(); $item.Runspace.Dispose() } catch { $null = $_ } }
-    $fakeItems.Remove($item)
+    Remove-WuuComputerRow -Store $stateStore -Computer $item.Computer | Out-Null
 
     $got = @((Get-Content $markerFile) | Where-Object { $_ })
     $match = ($got.Count -eq $Expected.Count)
