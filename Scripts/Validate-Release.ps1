@@ -1360,5 +1360,75 @@ if ($encodingOffenders.Count -gt 0) {
     Pass "every shipped file with non-ASCII bytes carries a UTF-8 BOM ($($encodingFiles.Count) file(s) checked)"
 }
 
+# (ag) REBOOT AND CANCELLATION COVERAGE (brief SS16). The brief lists these as the untested behaviours,
+#      and they are the ones where a bug is expensive: a reboot that never happens, a reboot wrongly
+#      reported as failed, or a cancellation that runs anyway.
+#
+#      The BEHAVIOUR is covered by tests\Test-RebootAndCancellation.ps1, which extracts the shipped
+#      $RestartComputer payload and drives it in a real runspace with stubbed remote calls (the only way
+#      to exercise it without a second machine). This gate asserts the pieces that make that coverage
+#      meaningful, so deleting the payload's structure cannot silently turn the tests into no-ops.
+$coreRawR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+$restartBody = [regex]::Match($coreRawR, '\$RestartComputer = \{[\s\S]*?\r?\n# Note: the old duplicate').Value
+if (-not $restartBody) {
+    Fail 'could not locate the $RestartComputer payload'
+} else {
+    # Comments stripped: the payload explains the ICMP removal by naming Test-Connection.
+    $restartCode = Get-WuuTextWithoutComments -Text $restartBody
+    if ($restartCode -match 'Test-Connection') {
+        Fail 'the reboot payload decides with ICMP again - it cannot terminate on a host that blocks echo (SS7/SS16)'
+    }
+    if ($restartCode -notmatch 'Restart-Computer \$Computer\.computer -Force') {
+        Fail 'the reboot payload does not issue Restart-Computer (the reboot would never be requested) (SS16)'
+    }
+    if ($restartCode -notmatch 'Test-WuuManagementEndpoint') {
+        Fail 'the reboot payload does not use the management-endpoint probe (SS7/SS16)'
+    }
+    # The offline wait must give up and CONTINUE rather than fail - a slow shutdown is not a stuck one.
+    if ($restartCode -notmatch 'assuming a very fast reboot') {
+        Fail 'the offline wait no longer tolerates "never observed down" - a healthy fast reboot would be reported as failed (SS16)'
+    }
+    if ($restartCode -notmatch 'may still be booting') {
+        Fail 'the online-wait timeout no longer says the host may still be booting - it would blame the restart (SS16)'
+    }
+    if (-not $failed) { Pass 'the reboot payload waits on the management endpoint and reports honestly (SS16)' }
+}
+# The cancellation surfaces, asserted structurally because they are reachability properties.
+$navRawR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Navigate.psm1') -Raw
+$consoleRawR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Console.psm1') -Raw
+$denialSites = ([regex]::Matches($navRawR + $consoleRawR, 'DenialHook')).Count
+if ($denialSites -lt 3) {
+    Fail "only $denialSites denial-hook site(s) - a cancellation would leave no trace (A.8.15) (SS16)"
+}
+if ($navRawR -notmatch "Proceed = \`$false; Reason = ''") {
+    Fail 'a blank change reason no longer cancels the operation (it would run unaudited) (SS16)'
+}
+$emptyGuards = ([regex]::Matches($coreRawR, "if \(\`$rows\.Count -eq 0\) \{ Write-Host '  Cancelled\.'")).Count
+if ($emptyGuards -lt 5) {
+    Fail "only $emptyGuards empty-selection guard(s) - a cancelled selection could widen to every computer (SS16)"
+}
+# An unreachable computer must cancel queued work but KEEP the row below the threshold (SS12/SS16).
+$stateRawR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+if ($stateRawR -notmatch "\`$Row\.Pending = \`$false") {
+    Fail 'an unreachable computer no longer has its queued work cancelled - the scheduler would spin against a host that is not there (SS16)'
+}
+# ...and the probe-shape handling must not have the unguarded Contains that made its own branch dead.
+#
+# The invariant is ORDER, not the absence of .Contains: the guarded branch legitimately calls
+# $ProbeResult.Contains('Resolves') on a hashtable. What broke was calling it BEFORE the shape test, on
+# an object that has no such method. So: the first shape test must precede the first .Contains call.
+$connBody = Get-WuuFunctionBody $stateRawR 'Update-WuuConnectivityState'
+$connCode = Get-WuuTextWithoutComments -Text $connBody
+$containsAt = $connCode.IndexOf('.Contains(')
+$shapeAt = $connCode.IndexOf('-is [hashtable]')
+if ($connCode -notmatch 'PSObject\.Properties\[''Resolves''\]') {
+    Fail 'the connectivity decision no longer handles a PSCustomObject probe result'
+} elseif ($containsAt -ge 0 -and ($shapeAt -lt 0 -or $containsAt -lt $shapeAt)) {
+    Fail "the connectivity decision calls .Contains on the probe result BEFORE testing its shape - a PSCustomObject throws and the PSCustomObject branch is unreachable (SS16)"
+} elseif (-not $failed) {
+    Pass 'the connectivity decision tests the probe shape before calling a shape-specific method (SS16)'
+}
+if (-not $failed) { Pass 'cancellation surfaces, and both probe-result shapes, are intact (SS16)' }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

@@ -666,7 +666,14 @@ function Update-WuuConnectivityState {
     $reachable = $false
     $reason = 'management endpoint unreachable'
     if ($ProbeResult) {
-        if ($ProbeResult.Contains('Resolves')) { } # ordered dictionary / hashtable
+        # NOTE: there used to be a bare `$ProbeResult.Contains('Resolves')` here, and it made the
+        # PSCustomObject branch below UNREACHABLE: .Contains is a STRING/collection method that a
+        # PSCustomObject does not have, so it threw
+        #   "Method invocation failed because [PSCustomObject] does not contain a method named 'Contains'"
+        # before the shape test ever ran (verified). The function therefore claimed to accept two
+        # shapes and only worked with one. Test-WuuManagementEndpoint happens to return an ordered
+        # hashtable today, so production never hit it - but the dead branch was a trap for any caller
+        # that round-trips a probe result through JSON (which converts it to a PSCustomObject).
         $resolves = $false; $endpoint = $false
         if ($ProbeResult -is [hashtable] -or $ProbeResult -is [System.Collections.Specialized.OrderedDictionary]) {
             if ($ProbeResult.Contains('Resolves')) { $resolves = [bool]$ProbeResult['Resolves'] }

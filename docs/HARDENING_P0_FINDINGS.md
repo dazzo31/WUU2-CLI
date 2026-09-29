@@ -117,7 +117,7 @@ from evidence rather than the brief's assumptions.
 | §12 inventory vs connectivity | **DONE** | `$RemoveOfflineComputer` deleted the row on a single failed `Test-Connection`. Now classified by `Update-WuuConnectivityState` (testable) with a consecutive-failure threshold. See below. |
 | §13 audit integrity | **PARTIAL** | The limitation *is* already documented accurately. No external anchor exists. |
 | §14 remaining GUI debris | **DONE for live reads and submissions** | No live GUI control read remains; no per-computer `BeginInvoke` remains in `Wuu.Core` other than the payload's own bounded sub-pipelines and the cleanup runspace. |
-| §16 tests | **PARTIAL** | Concurrency is covered (`Test-ComputerBusy`, `Test-SchedulerSerialization`). Reboot/ICMP cases and cancellation are **not**. |
+| §16 tests | **DONE** | See "§16 — reboot and cancellation coverage" below. The reboot payload is now driven for real in a runspace with stubbed remote calls (4 scenarios, including the ICMP-equivalent case), cancellation is covered on both surfaces, and writing this found a **latent bug**: an unguarded `.Contains()` made the connectivity function's own `PSCustomObject` branch unreachable. |
 
 ---
 
@@ -781,6 +781,94 @@ All three were my own test bugs, and all three are the same two mistakes recurri
   array**, so `.Ok` found the property on the psobject element and the code stayed 0. That is worth
   knowing on its own: an array result can mask a missing `Ok`. The JSON is now returned as a property on
   the single result object, so nothing depends on that behaviour.
+
+---
+
+## §16 — reboot and cancellation coverage (done)
+
+### What the brief asked for
+
+Two untested behaviours: **reboot/ICMP cases** and **cancellation**. Both are expensive when wrong — a
+reboot that never happens, a reboot wrongly reported as failed, or a cancellation that runs anyway.
+
+### How the reboot is tested for real
+
+The shipped `$RestartComputer` payload is **extracted from the source and executed in a real runspace**
+with stubbed remote calls (`Test-WuuManagementEndpoint`, `Restart-Computer`, the pooled online probe).
+A stub is the only way to cover this without a second machine, and it beats a static check because it
+drives the actual control flow: the offline wait's exit condition, the online wait's exit condition, the
+deadline arithmetic, the throw, and the status writes.
+
+Two mechanical facts were **probed before** the harness was written, because both would have produced a
+test that passes while testing nothing:
+
+* functions defined in the **runspace body** are visible to an invoked scriptblock (so stubs work);
+* the payload's bare `exit` completes the pipeline and leaves the runspace `Opened` and the host alive
+  (so a timeout scenario does not kill the test process).
+
+It also confirmed the earlier SS7 finding: `exit` inside a worker runspace is contained.
+
+| Scenario | Expected | Why it matters |
+| --- | --- | --- |
+| normal reboot (down on first probe, back on first) | 1 restart, `State='Connected'`, no timeout | the happy path is really exercised |
+| host **never appears to go down** | success, with the fast-reboot assumption logged | this is the **ICMP-equivalent** case: the old `while(Test-Connection)` loop never terminated here |
+| host **never comes back** | timeout attributed to the *online* wait, wording says "may still be booting" | a slow boot is not a failed restart |
+| after-install, `AutoReboot=OFF` / ON / no reboot required | refused / performed / skipped | the SS2 defect meant auto-reboot **never** worked |
+| manual restart with `AutoReboot=OFF` and `RebootRequired=false` | still performed | the operator asked for it explicitly |
+
+### The latent bug this found
+
+`Update-WuuConnectivityState` contained a bare `$ProbeResult.Contains('Resolves')`. `.Contains` is a
+string/collection method that a **`PSCustomObject` does not have**, so a `PSCustomObject` probe result
+threw — *before* the shape test that exists specifically to handle it. The function therefore documented
+two shapes and worked with one, and its `else` branch was **unreachable dead code**.
+
+`Test-WuuManagementEndpoint` returns an ordered hashtable, so production never hit it. The trap was
+latent but real: any caller that round-trips a probe result through JSON gets a `PSCustomObject`, and
+would have hit an exception instead of a decision. Fixed, and the gate now asserts the **ordering**
+invariant (the shape test must precede a shape-specific call) rather than banning `.Contains` — the
+guarded branch legitimately uses it.
+
+### Cancellation
+
+Two surfaces, tested separately because they mean different things:
+
+| Surface | Contract |
+| --- | --- |
+| cancelled at a prompt (console + guided) | nothing runs, and a **denial is recorded** (A.8.15) rather than the cancel vanishing — 13 denial-hook sites asserted |
+| blank change reason | returns `Proceed=$false` — the operation is cancelled, never run unaudited |
+| empty selection | cancels at 11 sites and **never falls through to "all computers"** (a cancelled selection must not widen) |
+| unreachable computer | queued work is **cancelled** (`Pending` cleared) but the row is **kept** below the threshold, and a success **resets** the counter so blips cannot accumulate into an eviction |
+
+### Verification
+
+* `tests\Test-RebootAndCancellation.ps1` — 28 assertions across the five reboot scenarios and the
+  cancellation surfaces.
+* Gate **(ag)** — the payload's structural properties (no ICMP, still issues the restart, tolerates
+  "never observed down", honest timeout wording), the cancellation reachability counts, and the
+  probe-shape ordering.
+* I confirmed the reboot scenarios are not tautologies by removing `Restart-Computer` from the payload
+  and watching 4 assertions fail, then restoring (BOM verified afterwards).
+* Full suite: **26 pass, 1 skip (elevation-gated), 0 fail.**
+
+### Three more harness bugs, all of which produced false results
+
+* **The payload was extracted as an assignment, not a scriptblock.** `$RestartComputer = { ... }` is an
+  assignment statement, so `[scriptblock]::Create(<whole assignment>)` produced a block whose body
+  *assigns an inner block and returns it*. Invoking it did nothing — and the suite "passed" the
+  structural checks while every scenario observed **zero** restarts. The harness now asserts the
+  extracted text is braced before using it.
+* **The online probe is reached as `& $InvokePooledScript`** — a *variable* holding a scriptblock, not a
+  function. Injecting a *function* left the variable `$null`, so both success scenarios silently timed
+  out (3 false failures). Injected with `[scriptblock]::Create` now, which is also how production
+  creates it — the same binding rule found during §5.
+* **A `-1` sentinel whose logic was inverted.** "Never comes back" was implemented as
+  `if ($n -ge 0 -and ...)`, so `-1` fell through to *success* and the never-returns scenario failed for
+  the wrong reason.
+* Also worth noting: my first tautology attempt broke the offline wait's tolerance for "never observed
+  down" — and the suite **correctly still passed**, because tolerating that case *is* the SS7 fix. A
+  break that the code is designed to absorb is not evidence of a weak test; the second attempt (removing
+  the restart) failed loudly, which is the right signal.
 
 ### A test bug worth recording, because it recurred three times
 
