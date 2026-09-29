@@ -117,6 +117,11 @@ function New-WuuComputerRow {
         # operator sees an operation that was accepted, reported as submitted, and never ran.
         OpState         = 'Idle'
         OpStartedAt     = $null
+        # SS12: consecutive connectivity failures. Inventory membership is NOT a connectivity status -
+        # a single lost ICMP packet (or a host that simply blocks echo, the Windows Firewall default)
+        # used to delete the row, after which the computer silently stopped being patched.
+        ConnectivityFailures    = 0
+        LastConnectivityError   = ''
         TimeoutExpiresAt = $null
         TimeoutSource   = ''
         RetryCount      = 0
@@ -420,6 +425,91 @@ function Set-WuuPhaseFailurePolicy {
     return $Policy
 }
 
+function Update-WuuConnectivityState {
+    <#
+    .SYNOPSIS Applies a connectivity probe result to a row (hardening brief SS12).
+    .DESCRIPTION
+    Inventory membership is NOT a connectivity status. This function is the single place that decides
+    what a probe result means for a row, so the policy cannot differ between callers.
+
+    BEFORE: one `Test-Connection -Count 1` whose failure DELETED the row. A single lost ICMP packet -
+    or a host that simply blocks echo, which is the Windows Firewall default - evicted a healthy
+    server from the managed set, after which it silently stopped being patched.
+
+    AFTER, three outcomes:
+      reachable                     -> Status online, failure counter RESET
+      unreachable, below threshold  -> Status unreachable, ROW KEPT (pending work cancelled)
+      unreachable, at threshold     -> removed from the set, with the reason recorded
+
+    Extracted from the worker payload deliberately. As inline payload code it was only reachable from
+    inside Wuu.Core's module scope, so it could not be tested at all - which is how a one-packet
+    delete survived. As a pure function it takes a probe RESULT, so the whole decision table is
+    testable without a network, a runspace or a scheduler.
+
+    Returns a verdict object rather than only mutating, so a caller (and a test) can assert what was
+    decided without inferring it from side effects.
+    #>
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$Row,
+        [Parameter(Mandatory = $false)][AllowNull()]$ProbeResult,
+        [Parameter(Mandatory)][hashtable]$Store,
+        [Parameter(Mandatory = $false)]$UpdatesHash = $null,
+        [int]$FailuresBeforeRemoval = 2
+    )
+
+    if ($null -eq $Row) { return [pscustomobject]@{ Action = 'skip'; Reason = 'no row' } }
+
+    # A probe that could not run at all is NOT evidence the computer is down. Treating "I could not
+    # tell" as "offline" is the mistake that made an unprobed fleet look dead.
+    $reachable = $false
+    $reason = 'management endpoint unreachable'
+    if ($ProbeResult) {
+        if ($ProbeResult.Contains('Resolves')) { } # ordered dictionary / hashtable
+        $resolves = $false; $endpoint = $false
+        if ($ProbeResult -is [hashtable] -or $ProbeResult -is [System.Collections.Specialized.OrderedDictionary]) {
+            if ($ProbeResult.Contains('Resolves')) { $resolves = [bool]$ProbeResult['Resolves'] }
+            if ($ProbeResult.Contains('Endpoint')) { $endpoint = [bool]$ProbeResult['Endpoint'] }
+            if ($ProbeResult.Contains('Reason') -and $ProbeResult['Reason']) { $reason = [string]$ProbeResult['Reason'] }
+        } else {
+            if ($ProbeResult.PSObject.Properties['Resolves']) { $resolves = [bool]$ProbeResult.Resolves }
+            if ($ProbeResult.PSObject.Properties['Endpoint']) { $endpoint = [bool]$ProbeResult.Endpoint }
+            if ($ProbeResult.PSObject.Properties['Reason'] -and $ProbeResult.Reason) { $reason = [string]$ProbeResult.Reason }
+        }
+        $reachable = ($resolves -and $endpoint)
+    }
+
+    if ($reachable) {
+        if ($Row.PSObject.Properties['ConnectivityFailures']) { $Row.ConnectivityFailures = 0 }
+        if ($Row.PSObject.Properties['LastConnectivityError']) { $Row.LastConnectivityError = '' }
+        $Row.Status = 'Online.'
+        $Row.State = 'Connected'
+        $Store.Revision = [int]$Store.Revision + 1
+        return [pscustomobject]@{ Action = 'online'; Failures = 0; Reason = '' }
+    }
+
+    $prior = 0
+    if ($Row.PSObject.Properties['ConnectivityFailures']) { $prior = [int]$Row.ConnectivityFailures }
+    $count = $prior + 1
+    if ($Row.PSObject.Properties['ConnectivityFailures']) { $Row.ConnectivityFailures = $count }
+    if ($Row.PSObject.Properties['LastConnectivityError']) { $Row.LastConnectivityError = $reason }
+    $Row.State = 'Offline'
+    $Row.Color = 'Error'
+    # A row that is unreachable is not a candidate for scheduled work - clear the request so the
+    # scheduler does not spin against a host that is not there.
+    if ($Row.PSObject.Properties['Pending']) { $Row.Pending = $false }
+
+    if ($count -ge $FailuresBeforeRemoval) {
+        if ($UpdatesHash) { try { $UpdatesHash.Remove($Row.Computer) } catch { } }
+        $Row.Status = "Unreachable $count time(s) ($reason) - removed from the set. Re-add it when the host is back."
+        Remove-WuuComputerRow -Store $Store -Computer $Row.Computer | Out-Null
+        return [pscustomobject]@{ Action = 'removed'; Failures = $count; Reason = $reason }
+    }
+
+    $Row.Status = "Unreachable ($reason) - kept in the set; removal needs $FailuresBeforeRemoval consecutive failures."
+    $Store.Revision = [int]$Store.Revision + 1
+    return [pscustomobject]@{ Action = 'kept'; Failures = $count; Reason = $reason }
+}
+
 function New-WuuOperatorContext {
     <#
     .SYNOPSIS
@@ -455,5 +545,6 @@ Export-ModuleMember -Function @(
     'Test-WuuComputerBusy'
     'Test-WuuPhaseFailureBlocks'
     'Set-WuuPhaseFailurePolicy'
+    'Update-WuuConnectivityState'
     'New-WuuOperatorContext'
 )

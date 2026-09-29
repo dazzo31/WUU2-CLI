@@ -839,5 +839,56 @@ else {
     } else { Pass 'the phase gate evaluates the failure policy before outstanding work (policy is not dead configuration)' }
 }
 
+# (z) ICMP MUST NOT DECIDE STATE (brief SS7 / SS12), and inventory must not be evicted on one probe.
+#
+#     Two separate hazards, both real:
+#       * SS7: the reboot wait was `While(Test-Connection ...)`, which NEVER terminates against a host
+#         that blocks echo (the Windows Firewall default) - the loop burns its full window and then
+#         reports a healthy reboot as FAILED.
+#       * SS12: `$RemoveOfflineComputer` deleted the row on a single failed ping, so one lost packet
+#         silently removed a server from the managed set and it stopped being patched.
+#
+#     Evaluated against COMMENT-STRIPPED text. This is load-bearing in BOTH directions here: my own
+#     migration comments quote "Test-Connection" while explaining its removal, so raw text gives a
+#     false failure (observed), while a pattern inside a string would be missed by a naive regex
+#     (which is why the tokenizer is used rather than a '#.*$' strip).
+$coreCodeOnly = Get-WuuCodeWithoutComments -Path (Join-Path $root 'src\Wuu.Core.psm1')
+$offIdx = $coreCodeOnly.IndexOf('RemoveOfflineComputer =')
+if ($offIdx -lt 0) { Fail 'could not locate the RemoveOfflineComputer payload' }
+else {
+    $offBody = $coreCodeOnly.Substring($offIdx, [Math]::Min(2500, $coreCodeOnly.Length - $offIdx))
+    if ($offBody -match 'Test-Connection') {
+        Fail 'the connectivity payload still decides with Test-Connection - one lost ICMP packet can evict a healthy computer (SS12)'
+    } elseif ($offBody -notmatch 'Test-WuuManagementEndpoint') {
+        Fail 'the connectivity payload does not use the management-endpoint probe'
+    }
+}
+$rIdx = $coreCodeOnly.IndexOf('RestartComputer =')
+if ($rIdx -lt 0) { Fail 'could not locate the RestartComputer payload' }
+else {
+    $rBody = $coreCodeOnly.Substring($rIdx, [Math]::Min(7000, $coreCodeOnly.Length - $rIdx))
+    if ($rBody -match 'Test-Connection') {
+        Fail 'the reboot wait still uses ICMP - it cannot terminate on a host that blocks echo (SS7)'
+    }
+    if ($rBody -notmatch 'Restart-Computer') {
+        Fail 'the reboot payload never issues Restart-Computer (dropped once during editing; the host would never reboot)'
+    }
+    if ($rBody -notmatch 'Test-WuuManagementEndpoint') {
+        Fail 'the reboot wait does not use the management-endpoint probe'
+    }
+}
+if (-not $failed) { Pass 'no ICMP-decided state transition remains, and the restart is still issued (SS7/SS12)' }
+
+# ...and the eviction decision must go through the tested function, not inline payload logic that is
+# unreachable from a test scope (which is how a one-packet delete survived).
+$stateRaw3 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+if ($stateRaw3 -notmatch 'function Update-WuuConnectivityState') {
+    Fail 'Update-WuuConnectivityState is not defined - the SS12 decision is not testable'
+} elseif ($stateRaw3 -notmatch "'Update-WuuConnectivityState'") {
+    Fail 'Update-WuuConnectivityState is not exported'
+} elseif ($coreCodeOnly -notmatch 'Update-WuuConnectivityState') {
+    Fail 'the connectivity payload does not delegate to Update-WuuConnectivityState'
+} else { Pass 'the connectivity decision is a tested function, and the payload delegates to it (SS12)' }
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

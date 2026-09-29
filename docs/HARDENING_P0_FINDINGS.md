@@ -109,12 +109,12 @@ from evidence rather than the brief's assumptions.
 | §4 unify the scheduling model | **DONE** | Every per-computer operation now goes through `Start-UpdateCheckJob`. The five console handlers that composed their own `[powershell]::Create()` + `BeginInvoke` (check / download / install / restart / remove-offline / service-action) now delegate, so they share the per-computer gate **and** the global `MaxConcurrentJobs` cap. Validator gate (x) enforces it. |
 | §5 operation-specific timeouts | **PARTIAL** | `TimeoutExpiresAt`/`TimeoutSource` are **written and never read** — dead fields, verified by counting uses vs assignments. A blanket 10-minute hard stop applies (in the cleanup loop) and does not distinguish slow from stuck. |
 | §6 credential propagation | **NOT VERIFIED** | Needs a per-operation audit. |
-| §7 reboot detection | **OPEN** | Reboot state correctly uses `Microsoft.Update.SystemInfo.RebootRequired`/`Win32_ComputerSystem`, but the online/offline transition in `$RestartComputer` **is** ping-authoritative (`While (Test-Connection ...)`) — up to 600 s offline wait, then an online wait. |
+| §7 reboot detection | **DONE** | The reboot wait was `While(Test-Connection ...)` - see below. Reboot STATE was already read correctly (`Microsoft.Update.SystemInfo.RebootRequired`); it was the online/offline TRANSITION that was ICMP-driven. |
 | §8 workflow state vs display state | **PARTIAL** | `State` has a `ValidateSet`, and `OpState` now separates operation state from display state. But `Test-PhaseCompletion` still uses `UpdatesStatus` (a display string) as its predicate. |
 | §9 phase failure policy | **DONE** | Explicit policy on the store: `PhaseFailurePolicy` = `BlockOnFailure` (DEFAULT) / `ContinueOnTimeout` / `ContinueOnFailure`, decided by the pure `Test-WuuPhaseFailureBlocks`. The old behaviour `continue`d past failed/timed-out rows, i.e. ContinueOnFailure was hard-coded and unreported. See "Phase failure policy" below. |
 | §10 exit codes | **OPEN** | Only `0` and `1` exist. Also `Invoke-WuuCommand` returns once work is *queued*, so a scripted `wuu install` can exit 0 without the install completing. |
 | §11 WhatIf | **PARTIAL** | Non-destructive and audited already; reports the planned operation but not the per-computer update breakdown. |
-| §12 inventory vs connectivity | **OPEN** | `$RemoveOfflineComputer` deletes rows on a **single** failed `Test-Connection`, and guided pre-flight's "Remove offline computers" calls it. |
+| §12 inventory vs connectivity | **DONE** | `$RemoveOfflineComputer` deleted the row on a single failed `Test-Connection`. Now classified by `Update-WuuConnectivityState` (testable) with a consecutive-failure threshold. See below. |
 | §13 audit integrity | **PARTIAL** | The limitation *is* already documented accurately. No external anchor exists. |
 | §14 remaining GUI debris | **DONE for live reads and submissions** | No live GUI control read remains; no per-computer `BeginInvoke` remains in `Wuu.Core` other than the payload's own bounded sub-pipelines and the cleanup runspace. |
 | §16 tests | **PARTIAL** | Concurrency is covered (`Test-ComputerBusy`, `Test-SchedulerSerialization`). Reboot/ICMP cases and cancellation are **not**. |
@@ -179,10 +179,75 @@ are gated rather than commented.
 
 ### Recommended next order
 
-1. **§7** (reboot detection is ping-authoritative), then **§12** (a single failed ping deletes
-   inventory), then **§10** (exit codes do not distinguish queued from completed).
-2. **§5/§6/§8/§16** as a group; §5 needs a design decision (heartbeats) rather than a patch.
+1. **§10** (exit codes do not distinguish queued from completed), then **§5** (operation-specific
+   timeouts with heartbeats - needs a design decision, not a patch).
+2. **§6** (credential propagation audit), **§8** (workflow vs display state in the remaining
+   predicates), **§16** (reboot/ICMP and cancellation test cases).
 3. **§11** opportunistic.
+
+---
+
+## §7 / §12 — ICMP was load-bearing for state (done)
+
+### The two defects
+
+**§7 - the reboot wait could not terminate on a well-configured host.**
+
+```powershell
+While(Test-Connection -Count 1 -ComputerName $computer.Computer -Quiet){   # wait for offline
+    Start-Sleep -Seconds 5; $offlineWait += 5
+    if($offlineWait -ge 600){ throw "... did not go offline within 10 minutes ..." }
+}
+```
+
+Windows Firewall blocks inbound echo by default. Against such a host the ping keeps succeeding, the
+loop burns its full 600 s, and the restart is then reported as **FAILED** - on a machine that rebooted
+perfectly. It is not "ICMP is slightly unreliable"; it is a false failure on the commonest
+configuration.
+
+**§12 - one lost packet evicted a server.**
+
+```powershell
+if(Test-Connection -Count 1 -ComputerName $computer.Computer -Quiet){ ...online... }
+else{ Remove-WuuComputerRow ... }   # a single failure deleted the row
+```
+
+The computer then silently stopped being patched, with no record that it had ever been in the set.
+
+### What replaced it
+
+* **`Test-WuuManagementEndpoint`** (`Wuu.Remote.psm1`, exported) - two cheap, non-hanging signals:
+  name resolution, then a bounded TCP connect to the RPC endpoint mapper (the thing the DCOM/CIM calls
+  depend on). It returns a hashtable, not a boolean, so "not resolvable" and "resolves but no
+  endpoint" stay distinguishable - they are different operator actions.
+  **It deliberately does not open a WUA session.** An earlier attempt did, and that is what made the
+  wait loop unreliable: a WUA session against a host that is still shutting down blocks far longer
+  than the surrounding timeout plumbing controls. A `TcpClient.BeginConnect` cannot be blocked by the
+  remote host.
+* **`Update-WuuConnectivityState`** (`Wuu.State.psm1`, exported) - the single place a probe result is
+  turned into a row change: reachable → reset counter; unreachable → keep the row, cancel queued work,
+  record the reason; unreachable at the threshold → remove. "Cannot tell" is never treated as offline.
+* Config: `ConnectivityFailuresBeforeRemoval` (2 - a single blip cannot evict), `EndpointProbePort`,
+  `EndpointProbeTimeoutMs`.
+
+### Why the decision was EXTRACTED rather than left inline
+
+As inline payload code the SS12 policy lived inside `Wuu.Core`'s module scope, so **no test could
+reach it** - which is exactly how a one-packet delete survived. It is now a pure function taking a
+probe RESULT, so the whole decision table is testable without a network, a runspace or a scheduler.
+
+### One thing I broke and caught
+
+While rewriting the wait loop I **deleted `Restart-Computer`**. The payload would then have waited
+~30 minutes for a reboot it never requested - a failure that presents exactly like "the reboot is
+slow". Restored, and validator gate (z) now asserts the restart is still issued. It is the second
+time in this pass that a rewrite dropped a load-bearing line (`Restart-Computer` here, the
+`$targetRows` assignment earlier); both were caught by a check rather than by reading.
+
+**Tests.** `tests\Test-ConnectivityClassification.ps1` - 29 assertions across the probe (fast, honest
+reason, resolvable/unresolvable distinguished), the decision table (one failure keeps, repeats remove,
+recovery resets, missing probe does not evict, `$null` tolerated), and structurally that no live code
+decides with ICMP while the restart is still issued.
 
 ---
 

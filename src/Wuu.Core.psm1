@@ -121,6 +121,14 @@ $global:CredProbeTimeoutSeconds   = 10   # was hardcoded 5 in WindowsUpdate runs
 $global:RebootProbeTimeoutSeconds = 10   # online probe inside reboot wait
 $global:OfflineWaitSeconds        = 600  # was hardcoded inline in $RestartComputer
 $global:OnlineWaitSeconds         = 1800 # was hardcoded inline in $RestartComputer
+# SS7: the management-endpoint probe used instead of ICMP for state transitions.
+# 135 is the RPC endpoint mapper, which the DCOM/CIM calls actually depend on. 3s is long enough for
+# a LAN host and short enough that a reboot wait loop stays responsive.
+$global:EndpointProbePort         = 135
+$global:EndpointProbeTimeoutMs    = 3000
+# SS12: how many CONSECUTIVE connectivity failures justify removing a computer from the set.
+# More than one, because a single blip used to be enough to evict a healthy server.
+$global:ConnectivityFailuresBeforeRemoval = 2
 
 # Enhanced error handling toggle. Set to $true to enable advanced error handling.
 $global:EnableEnhancedErrorHandling = $true
@@ -1973,23 +1981,21 @@ $RemoveOfflineComputer = {
     Param ($computer)
     try{
         #Update status
-            $computer.Status = 'Testing Connectivity.'
+            $computer.Status = 'Testing connectivity.'
             $computer.State = 'Connecting'
         if ($stateStore) { $stateStore.Touch() }
-        #Verify connectivity
-        if(Test-Connection -Count 1 -ComputerName $computer.Computer -Quiet){
-                $computer.Status = 'Online.'
-                $computer.State = 'Connected'
-            if ($stateStore) { $stateStore.Touch() }
-        }
-        else{
-            #Remove unreachable computers
-            $updatesHash.Remove($computer.computer)
-            # Remove the row from the store (was: $uiHash.clientObservable.Remove).
-            # NOTE: the mechanical transformer left this pointing at clientObservable, which no
-            # longer exists - it would silently no-op and leave unreachable rows in the list.
-            Remove-WuuComputerRow -Store $stateStore -Computer $computer.Computer | Out-Null
-        }
+
+        # SS12: INVENTORY MEMBERSHIP IS NOT A CONNECTIVITY STATUS.
+        #
+        # This used to be a single `Test-Connection -Count 1` whose failure DELETED the row - one lost
+        # ICMP packet, or a host that blocks echo (the Windows Firewall default), evicted a healthy
+        # server from the managed set and it silently stopped being patched.
+        #
+        # The DECISION lives in Update-WuuConnectivityState (Wuu.State) so it is testable, and so the
+        # policy cannot differ between callers. This payload only probes and delegates.
+        $probe = Test-WuuManagementEndpoint -ComputerName $computer.Computer
+        $null = Update-WuuConnectivityState -Row $computer -ProbeResult $probe -Store $stateStore `
+            -UpdatesHash $updatesHash -FailuresBeforeRemoval $global:ConnectivityFailuresBeforeRemoval
     }
     Catch{
             $computer.Status = "Error occured: $($_.Exception.Message)"
@@ -2022,15 +2028,40 @@ $RestartComputer = {
             $computer.State = 'Rebooting'
         if ($stateStore) { $stateStore.Touch() }
 
-        #Restart and wait until remote COM can be connected
+        # Issue the restart. THIS LINE IS LOAD-BEARING and was accidentally dropped once while
+        # rewriting the wait below - the payload then waited ~30 minutes for a reboot it had never
+        # requested, which is exactly the kind of failure that looks like "the reboot is slow".
         Restart-Computer $Computer.computer -Force
+
+        #Restart and wait until the computer has gone down.
+        #
+        # SS7: ICMP IS NOT THE AUTHORITATIVE SIGNAL. This used to be
+        #     While(Test-Connection -Count 1 -ComputerName ... -Quiet){ ... }
+        # which never terminated against a host that blocks ICMP (Windows Firewall blocks inbound
+        # echo by default): the ping keeps succeeding, the loop burns the full 600s, and then the
+        # restart is reported as FAILED - on a host that rebooted perfectly. It is the same ICMP
+        # dependency that caused the false "offline" removals, so it is now gone entirely.
+        #
+        # The transition is "management endpoint disappears" instead: WUA is the endpoint this tool
+        # actually depends on and cannot be faked by a firewall rule.
         $offlineWait = 0
-        While(Test-Connection -Count 1 -ComputerName $computer.Computer -Quiet){ #Wait for computer to go offline
+        $rebootObservedDown = $false
+        while ($offlineWait -lt $global:OfflineWaitSeconds) {
+            if (-not (Test-WuuManagementEndpoint -ComputerName $Computer.computer)) {
+                $rebootObservedDown = $true
+                break
+            }
             Start-Sleep -Seconds 5
             $offlineWait += 5
-            if($offlineWait -ge 600){
-                throw "Computer $($Computer.computer) did not go offline within 10 minutes of the restart command."
-            }
+        }
+        if (-not $rebootObservedDown) {
+            # SS7: a slow shutdown is NOT the same thing as a stuck one, and the operator needs to
+            # know which they have. Continue to the online wait rather than throwing - if the host
+            # is back, the next phase proves it; if it is not, THAT wait reports the failure with
+            # accurate wording. Reporting "did not go offline" when the truth may be "went down and
+            # came back" is how a healthy reboot got blamed.
+            $computer.Status = "Did not observe the management endpoint go down within $($global:OfflineWaitSeconds)s - assuming a very fast reboot and continuing."
+            if ($stateStore) { $stateStore.Touch() }
         }
 
         #Update status
@@ -2039,7 +2070,7 @@ $RestartComputer = {
         if ($stateStore) { $stateStore.Touch() }
 
         $onlineWait = 0
-        While($true){ #Wait for computer to come online (each COM probe is bounded by a 10s pool call)
+        While($true){ #Wait for the computer to come back (each management probe is bounded at 10s)
             $probeResult = $null
             $probeOk = $false
             try {
@@ -2065,8 +2096,8 @@ $RestartComputer = {
             
             Start-Sleep 5
             $onlineWait += 5
-            if($onlineWait -ge 1800){
-                throw "Computer $($Computer.computer) did not come back online within 30 minutes of restarting."
+            if($onlineWait -ge $global:OnlineWaitSeconds){
+                throw "Computer $($Computer.computer) did not come back online within $($global:OnlineWaitSeconds)s of restarting. It may still be booting; re-check it before assuming the restart failed."
             }
         }
 

@@ -4,6 +4,74 @@
 Bounded remote WMI/CIM and service operations with hard timeouts.
 #>
 
+function Test-WuuManagementEndpoint {
+    <#
+    .SYNOPSIS Whether the management endpoint WUU actually depends on answers (hardening brief SS7).
+    .DESCRIPTION
+    "Online" for this tool means "the endpoint I need is reachable", not "ICMP answers". Windows
+    Firewall blocks inbound echo by default, so a perfectly healthy domain server can fail a ping -
+    which is why ping is no longer used for any state transition in this codebase.
+
+    WHAT IT DELIBERATELY DOES NOT DO
+    --------------------------------
+    It does not open a WUA session. An earlier attempt at this
+    ([activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session', $Name))) is the
+    thing that made the reboot-wait loop unreliable: creating a WUA session against a host that is
+    still shutting down can block far longer than the surrounding timeout plumbing controls, because
+    the DCOM call itself stalls rather than the wrapper.
+
+    So it asks the same question with two signals that are cheap and CANNOT hang:
+      1. name resolution - a stale DNS entry is the most common reason a probe fails for ever, and it
+         is worth reporting separately from "the host is down";
+      2. a bounded TCP connect to the RPC endpoint mapper, which is what the DCOM/CIM calls depend
+         on. A connect has a hard timeout, so the caller cannot be blocked by it.
+
+    Returns a hashtable, not a boolean, so a caller can distinguish "not resolvable" from "resolves
+    but no endpoint" - different operator actions. It is an ONLINE indicator; its negation is a
+    strong offline signal. The reboot path re-verifies with the real management probe before
+    declaring success.
+    #>
+    param([Parameter(Mandatory)][string]$ComputerName)
+
+    $result = [ordered]@{
+        Computer    = $ComputerName
+        Resolves    = $false
+        Endpoint    = $false
+        ResolvedIps = @()
+        Reason      = ''
+    }
+
+    # 1. Name resolution.
+    try {
+        $ips = @([System.Net.Dns]::GetHostAddresses($ComputerName) | ForEach-Object { $_.IPAddressToString })
+        $result.ResolvedIps = $ips
+        $result.Resolves = $true
+    } catch {
+        $result.Reason = "name not resolvable: $($_.Exception.Message)"
+        return $result
+    }
+
+    # 2. RPC endpoint mapper - a bounded connect cannot hang the caller.
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($ComputerName, $global:EndpointProbePort)
+        $answered = $iar.AsyncWaitHandle.WaitOne($global:EndpointProbeTimeoutMs, $false)
+        if ($answered) {
+            try { $client.EndConnect($iar); $result.Endpoint = $true }
+            catch { $result.Reason = "connect refused/failed: $($_.Exception.Message)" }
+        } else {
+            $result.Reason = "no response within $($global:EndpointProbeTimeoutMs)ms"
+        }
+    } catch {
+        $result.Reason = "endpoint probe failed: $($_.Exception.Message)"
+    } finally {
+        if ($client) { try { $client.Close(); $client.Dispose() } catch { } }
+    }
+
+    return $result
+}
+
 function Invoke-CimWithTimeout {
     param(
         [Parameter(Mandatory=$true)]
@@ -413,5 +481,5 @@ function Invoke-WuuRemoteTask {
     }
 }
 
-Export-ModuleMember -Function @('Invoke-CimWithTimeout', 'Invoke-ServiceWithTimeout', 'Test-SystemDependencies', 'Invoke-WithTimeout', 'Invoke-WuuRemoteTask')
+Export-ModuleMember -Function @('Invoke-CimWithTimeout', 'Invoke-ServiceWithTimeout', 'Test-SystemDependencies', 'Invoke-WithTimeout', 'Invoke-WuuRemoteTask', 'Test-WuuManagementEndpoint')
 
