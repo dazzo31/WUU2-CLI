@@ -254,6 +254,86 @@ function Show-CredentialConfigDialog {
     return $true
 }
 
+function Get-WuuCredentialStateSignature {
+    <#
+    .SYNOPSIS A compact, non-secret description of the active credential mode (SS6).
+    .DESCRIPTION
+    Returns the identity part of the credential mode in use, so a saved configuration can record WHAT
+    it was saved with and a load can tell whether the running session matches.
+
+    Deliberately identity only: never a password, and never any part of one. What a human or an
+    auditor needs to answer is "was this list loaded with the custom account or the service account?",
+    and a username answers that.
+
+    Returns a hashtable so callers can persist it as-is. Empty strings (not $null) when custom
+    credentials are off, so the shape is stable whether or not they are configured.
+    #>
+    [CmdletBinding()]
+    param()
+    $enabled = [bool]$global:UseCustomCredentials
+    $userName = ''
+    if ($enabled -and $global:CustomCredentials) {
+        # PSCredential.UserName is the authoritative source. It was $global:CredentialConfig.Username
+        # that got persisted - and that variable is assigned exactly ONCE in the whole codebase (its
+        # initialiser in Wuu.Core), so every saved configuration recorded Username='' and Domain=''
+        # while the real name sat in CustomCredentials.UserName. Verified by probe: a config saved with
+        # a configured credential loaded back with empty strings.
+        $userName = [string]$global:CustomCredentials.UserName
+    }
+    return @{
+        Enabled  = $enabled
+        UserName = $userName
+        # The mode, in words, so the saved file explains itself to someone reading the JSON.
+        Mode     = if ($enabled) { 'custom' } else { 'current-process' }
+    }
+}
+
+function Test-WuuCredentialStateMatches {
+    <#
+    .SYNOPSIS Does the running credential session match what a configuration was saved with? (SS6)
+    .DESCRIPTION
+    The load path used to ignore the saved credential block entirely: loading a list saved with custom
+    credentials into a session that had none (or the reverse) silently changed which account every
+    remote operation would use. Nothing failed - the operations simply ran as a different principal,
+    which is a security-relevant difference that is invisible until an access-denied appears on some
+    host, or does not appear when it should.
+
+    Returns Match plus a human-readable Reason so the caller can WARN with the specific difference
+    rather than a vague "credential mismatch".
+    #>
+    [CmdletBinding()]
+    param([AllowNull()]$Saved)
+    $now = Get-WuuCredentialStateSignature
+    if (-not $Saved) {
+        return [pscustomobject]@{ Match = $true; Reason = 'the configuration records no credential mode (saved by an older build)'; SavedMode = ''; CurrentMode = $now.Mode }
+    }
+    # ConvertFrom-Json hands back a PSCustomObject, a hand-built one is a hashtable - both are read here.
+    $savedEnabled = $null
+    if ($Saved.PSObject.Properties['Enabled']) { $savedEnabled = [bool]$Saved.Enabled }
+    elseif ($Saved -is [hashtable] -and $Saved.ContainsKey('Enabled')) { $savedEnabled = [bool]$Saved['Enabled'] }
+    if ($null -eq $savedEnabled) {
+        return [pscustomobject]@{ Match = $true; Reason = 'the configuration does not state whether custom credentials were used'; SavedMode = ''; CurrentMode = $now.Mode }
+    }
+    $savedUser = ''
+    if ($Saved.PSObject.Properties['UserName']) { $savedUser = [string]$Saved.UserName }
+    elseif ($Saved -is [hashtable] -and $Saved.ContainsKey('UserName')) { $savedUser = [string]$Saved['UserName'] }
+
+    if ($savedEnabled -ne $now.Enabled) {
+        $savedMode = if ($savedEnabled) { 'custom' } else { 'current-process' }
+        return [pscustomobject]@{
+            Match = $false; SavedMode = $savedMode; CurrentMode = $now.Mode
+            Reason = "saved with '$savedMode' credentials but this session is using '$($now.Mode)'"
+        }
+    }
+    if ($savedEnabled -and $savedUser -and $now.UserName -and $savedUser -ne $now.UserName) {
+        return [pscustomobject]@{
+            Match = $false; SavedMode = 'custom'; CurrentMode = $now.Mode
+            Reason = "saved with custom credentials for '$savedUser' but this session is using '$($now.UserName)'"
+        }
+    }
+    return [pscustomobject]@{ Match = $true; Reason = ''; SavedMode = $now.Mode; CurrentMode = $now.Mode }
+}
+
 function Protect-ComputerListData {
     param(
         [string]$Data,
@@ -339,15 +419,16 @@ function Save-ComputerListConfig {
                     # Only save computer name and phase - all other status data is temporary
                 }
             }
-            # Save credential configuration if custom credentials are used
-            CredentialConfig = if ($global:UseCustomCredentials) {
-                @{
-                    Username = $global:CredentialConfig.Username
-                    Domain = $global:CredentialConfig.Domain
-                }
-            } else {
-                $null
-            }
+            # Record the credential MODE this list was saved under (SS6). This block used to be written
+            # from $global:CredentialConfig.Username/.Domain - a variable assigned exactly ONCE in the
+            # codebase (its initialiser), so every config ever saved carried Username='' and Domain=''
+            # while the real name sat in $global:CustomCredentials.UserName. Verified by probe.
+            #
+            # What is recorded is IDENTITY ONLY - a username and a mode word. No password, no token, and
+            # nothing derived from one: the list itself is already encrypted with the operator's
+            # passphrase, and adding reversible credential material to it would widen the blast radius of
+            # a weak passphrase.
+            CredentialConfig = Get-WuuCredentialStateSignature
         }
         
         # Convert to JSON
@@ -399,5 +480,5 @@ function Import-ComputerListConfig {
     }
 }
 
-Export-ModuleMember -Function @('Protect-Credential', 'Unprotect-Credential', 'Get-RemoteCredentials', 'Show-PasswordPrompt', 'Show-CustomCredentialDialog', 'Show-CredentialConfigDialog', 'Protect-ComputerListData', 'Unprotect-ComputerListData', 'Save-ComputerListConfig', 'Import-ComputerListConfig')
+Export-ModuleMember -Function @('Protect-Credential', 'Unprotect-Credential', 'Get-RemoteCredentials', 'Show-PasswordPrompt', 'Show-CustomCredentialDialog', 'Show-CredentialConfigDialog', 'Protect-ComputerListData', 'Unprotect-ComputerListData', 'Save-ComputerListConfig', 'Import-ComputerListConfig', 'Get-WuuCredentialStateSignature', 'Test-WuuCredentialStateMatches')
 

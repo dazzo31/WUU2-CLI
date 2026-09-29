@@ -2768,7 +2768,29 @@ $eventLoadConfig = {
 
         if ($loadResult.Success) {
             $loadedComputers = $loadResult.Config.Computers
-            
+
+            # SS6: compare the credential mode this list was SAVED with against the running session.
+            # The saved block used to be ignored entirely, so loading a list into a session with a
+            # different credential mode silently changed which account every remote operation would
+            # use - a security-relevant difference that stays invisible until an access-denied appears
+            # (or, worse, does not). Reported, not auto-corrected: silently switching the operator's
+            # credentials on load would be a bigger surprise than the warning.
+            try {
+                $credCheck = Test-WuuCredentialStateMatches -Saved $loadResult.Config.CredentialConfig
+                if (-not $credCheck.Match) {
+                    Write-Host ''
+                    Write-Host '  CREDENTIAL MODE DIFFERS from the one this list was saved with.' -ForegroundColor Yellow
+                    Write-Host "    $($credCheck.Reason)" -ForegroundColor Yellow
+                    Write-Host '    Remote operations will run as the CURRENT session mode. Use' -ForegroundColor Yellow
+                    Write-Host '    "Set domain credentials" to change it before running anything.' -ForegroundColor Yellow
+                    Write-Host ''
+                } elseif ($credCheck.SavedMode -eq 'custom') {
+                    Write-InfoLog ("Loaded configuration matches this session's custom credentials ($($credCheck.SavedMode))")
+                }
+            } catch {
+                Write-WarningLog "Could not compare the saved credential mode: $($_.Exception.Message)"
+            }
+
             # Console edition: clear the store and add the loaded rows directly.
             # (GUI edition cleared clientObservable then added rows inside a dispatcher
             # invoke; the store needs neither.)

@@ -49,6 +49,34 @@ function Get-WuuCodeWithoutComments {
     return $sb.ToString()
 }
 
+function Get-WuuTextWithoutComments {
+    <#
+    .SYNOPSIS Strips comment lines AND block comments from source text, preserving newlines and '$'.
+    .DESCRIPTION
+    Get-WuuCodeWithoutComments (above) cannot be used for gates that need to SLICE a function body or
+    match '$'-anchored patterns: it joins every token with a space, which DISCARDS newlines (so
+    Get-WuuFunctionBody, which slices to the next "\nfunction ", returned the whole file) and drops '$'
+    (so a '\$state -in' pattern could never match). It is correct for its own callers - a whole-file
+    pattern scan - and is left alone.
+
+    This helper exists because three gates in this pass each hit the SAME failure: a check matched the
+    comment that explains the code being checked. Examples, all observed:
+      * the SS8 gate matched a comment quoting the removed 'UpdatesStatus -ne ...' predicate;
+      * the SS6 gate matched a comment quoting the removed '$global:CredentialConfig.Username' read;
+      * the SS6 gate matched "never a password" inside a block comment, which a line-prefix strip does
+        NOT remove. (Block comments are why this helper exists: '# '-prefix stripping alone is not
+        enough, and the first version of this very comment was itself broken by writing the block-comment
+        delimiters literally inside it, which closed the comment early.)
+    Trade-off: block-comment delimiters appearing inside a string literal would also be stripped. No such
+    literal exists in this codebase, and a validator that occasionally needs its comment adjusted is
+    better than three gates that silently pass on stale code.
+    #>
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    $noBlocks = [regex]::Replace($Text, '(?s)<#.*?#>', '')
+    return (($noBlocks -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+}
+
 $wpfPattern = 'XamlReader|PresentationFramework|PresentationCore|WindowsBase|ItemContainerGenerator|clientObservable|Out-GridView'
 # The GUI-only namespace patterns. These were MISSING from the list above, which let a genuine,
 # reachable defect through this very gate: the AD connectivity test ended in a
@@ -1079,14 +1107,14 @@ if ($idleSitesT -gt 0 -and $clearSitesT -lt $idleSitesT) {
 #          and there is nothing to report) was permanently "outstanding", so that row's phase could
 #          never complete.
 #
-#      The check strips COMMENT LINES from the RAW text rather than using Get-WuuCodeWithoutComments.
-#      Two reasons, both learned the hard way here: that tokenizer-based helper joins every token with
-#      a space and DISCARDS newlines (so Get-WuuFunctionBody, which slices to the next "\nfunction ",
-#      returned the whole file) and drops '$' (so a '\$state -in' pattern could never match). Both
-#      produced false failures on correct code. Raw-minus-comment-lines keeps '$' and newlines.
+#      The check strips comments (including <# #> blocks) from the RAW text rather than using
+#      Get-WuuCodeWithoutComments. Two reasons, both learned the hard way here: that tokenizer-based
+#      helper joins every token with a space and DISCARDS newlines (so Get-WuuFunctionBody, which slices
+#      to the next "\nfunction ", returned the whole file) and drops '$' (so a '\$state -in' pattern
+#      could never match). Both produced false failures on correct code. Raw-minus-comments keeps both.
 $wupdRawC = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
 $wupdBodyC = Get-WuuFunctionBody $wupdRawC 'Test-PhaseCompletion'
-$wupdNoComments = (($wupdBodyC -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+$wupdNoComments = Get-WuuTextWithoutComments -Text $wupdBodyC
 if (-not $wupdNoComments) {
     Fail 'could not locate Test-PhaseCompletion'
 } else {
@@ -1116,6 +1144,100 @@ $ccSets = ([regex]::Matches($coreRawW, "CheckConcluded'\]\)\s*\{\s*\`$\w+\.Check
 if ($ccSets -lt 3) {
     Fail "only $ccSets CheckConcluded assignment(s) in the check payload - an outcome (updates available / reboot required / clean) would never be recorded (SS8)"
 } elseif (-not $failed) { Pass "the check payload records CheckConcluded for all three outcomes ($ccSets sites) (SS8)" }
+
+# (ad) CREDENTIAL PROPAGATION AND PERSISTENCE (brief SS6, which was marked NOT VERIFIED). Auditing it
+#      found two real defects rather than a clean bill of health:
+#
+#        A. the saved credential block came from $global:CredentialConfig.Username/.Domain - a variable
+#           assigned exactly ONCE in the codebase (its initialiser) - so every configuration recorded
+#           Username='' while the real name sat in $global:CustomCredentials.UserName. Verified by
+#           probe, not by reading.
+#        B. nothing READ that block on load, so loading a list into a session with a different credential
+#           mode silently changed which account remote operations would use.
+#
+#      The identity is now taken from the PSCredential and compared on load. What is persisted is
+#      IDENTITY ONLY - never a password, or anything derived from one.
+$credRawC = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Credentials.psm1') -Raw
+# Comments are stripped - lines AND <# #> blocks - before the identity checks below, because the
+# implementation explains the removal by quoting the old `$global:CredentialConfig.Username` read and
+# its header says it "never handles a password". Matching raw text reported BOTH as defects (observed).
+# This is the third time in this pass that a check matched its own explanatory comment, so the shared
+# block-comment-aware helper is used rather than another ad-hoc line filter.
+$credNoComments = Get-WuuTextWithoutComments -Text $credRawC
+
+# 1. The signature must come from the PSCredential, not from the never-assigned CredentialConfig.
+if ($credNoComments -notmatch 'function Get-WuuCredentialStateSignature') {
+    Fail 'Get-WuuCredentialStateSignature is missing - SS6 has no single source for the credential identity'
+} elseif ($credNoComments -notmatch 'CustomCredentials\.UserName') {
+    Fail 'the credential signature does not read CustomCredentials.UserName - it would record an empty identity again (SS6)'
+}
+if ($credNoComments -match '\$global:CredentialConfig\.Username') {
+    Fail 'the credential identity is still read from $global:CredentialConfig.Username, which is never assigned (SS6)'
+}
+
+# 2. Identity only. A password-shaped value must not be placed in the signature hashtable.
+$sigBody = Get-WuuTextWithoutComments -Text (Get-WuuFunctionBody $credRawC 'Get-WuuCredentialStateSignature')
+if ($sigBody) {
+    if ($sigBody -match 'Password|SecureString|GetNetworkCredential|PtrToStringAuto') {
+        Fail 'the credential signature handles password material - it must be identity only (SS6)'
+    }
+    if ($sigBody -notmatch 'Mode') {
+        Fail 'the credential signature does not state the mode in words'
+    }
+}
+
+# 3. The comparison must exist and be consulted by the load path, or the block stays write-only.
+if ($credRawC -notmatch 'function Test-WuuCredentialStateMatches') {
+    Fail 'Test-WuuCredentialStateMatches is missing - a saved credential mode could not be compared (SS6)'
+}
+if ($credRawC -notmatch "'Test-WuuCredentialStateMatches'") {
+    Fail 'Test-WuuCredentialStateMatches is not exported'
+}
+if ($credRawC -notmatch "'Get-WuuCredentialStateSignature'") {
+    Fail 'Get-WuuCredentialStateSignature is not exported (the save path could not reach it)'
+}
+if ($coreRawE -notmatch 'Test-WuuCredentialStateMatches') {
+    Fail 'the config load path does not compare the saved credential mode - the saved block stays write-only (SS6)'
+} elseif ($coreRawE -notmatch 'CREDENTIAL MODE DIFFERS') {
+    Fail 'a credential-mode difference is not surfaced to the operator'
+} else {
+    if (-not $failed) { Pass 'credential identity is recorded from the PSCredential and compared on load (SS6)' }
+}
+
+# 4. The propagation matrix: the two remote task paths that CHANGE a machine must resolve and pass a
+#    credential, and must skip resolution on the local machine (where the process token is already right
+#    and passing credentials to local DCOM is rejected).
+$passCount = ([regex]::Matches($coreRawE, "InvokeRemoteTaskScript[\s\S]{0,400}?Credential \`$remoteCred")).Count
+if ($passCount -lt 2) {
+    Fail "only $passCount remote-task call(s) pass the resolved credential - the download/install paths must both pass it (SS6)"
+}
+$guardCount = ([regex]::Matches($coreRawE, "UseCustomCredentials -and \`$Computer\.computer -ne 'localhost' -and \`$Computer\.computer -ne \`$env:COMPUTERNAME")).Count
+if ($guardCount -lt 2) {
+    Fail "only $guardCount local-machine guard(s) - custom credentials could be applied to the local host (SS6)"
+}
+$wupdRawC = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+if ($wupdRawC -notmatch '\[pscredential\]\$Cred') {
+    Fail 'the credential probe is not typed [pscredential] - a plain-string password could be used as one (SS6)'
+}
+if ($wupdRawC -notmatch "CredentialCache\[\`$ComputerName\] = \`$null") {
+    Fail 'the runspace resolver does not cache the default-credentials outcome as an explicit null entry (SS6)'
+}
+
+# 5. No password in the logs or the audit trail. Matches password-shaped EXPRESSIONS, not the word
+#    "password": four correct lines log that the secure PROMPT was unavailable and interpolate only the
+#    exception text, and a word-match reported those as leaks (observed while writing the test).
+$pwExpression = '\$(password|pass|pwd|plainPassword|plaintext|secret|sec)\b|\.Password\b|GetNetworkCredential|PtrToStringAuto|SecureStringToBSTR'
+$leakFiles = @()
+foreach ($candidate in @('Wuu.Core.psm1', 'Wuu.WindowsUpdate.psm1', 'Wuu.Credentials.psm1', 'Wuu.Remote.psm1')) {
+    $text = Get-Content -LiteralPath (Join-Path $root "src\$candidate") -Raw
+    $logLines = ($text -split "`r?`n") | Where-Object { $_ -match '(WriteWuuLog|Write-InfoLog|Write-DebugLog|Write-WarningLog|Write-ErrorLog)' }
+    if (@($logLines | Where-Object { $_ -match $pwExpression }).Count -gt 0) { $leakFiles += $candidate }
+}
+if ($leakFiles.Count -gt 0) {
+    Fail "password-shaped expression(s) interpolated into a log call in: $($leakFiles -join ', ') (SS6)"
+} elseif (-not $failed) {
+    Pass 'no log or audit call interpolates a password-shaped expression (SS6)'
+}
 
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

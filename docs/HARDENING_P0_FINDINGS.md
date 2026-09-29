@@ -108,7 +108,7 @@ from evidence rather than the brief's assumptions.
 | §3 one operation per computer | **DONE** | See "Per-computer serialization" below. |
 | §4 unify the scheduling model | **DONE** | Every per-computer operation now goes through `Start-UpdateCheckJob`. The five console handlers that composed their own `[powershell]::Create()` + `BeginInvoke` (check / download / install / restart / remove-offline / service-action) now delegate, so they share the per-computer gate **and** the global `MaxConcurrentJobs` cap. Validator gate (x) enforces it. |
 | §5 operation-specific timeouts | **DONE** | See "§5 — operation-specific timeouts" below. A per-op budget table replaces the flat 10-minute stop; the deadline is recorded at submission and read by the cleanup loop, with a heartbeat separating *slow* from *stuck*. `TimeoutExpiresAt`/`TimeoutSource` were dead fields (written, never read) and are now the read side of the decision. |
-| §6 credential propagation | **NOT VERIFIED** | Needs a per-operation audit. |
+| §6 credential propagation | **DONE** | See "§6 — credential propagation" below. Auditing it found two real defects, not a clean bill: the saved credential block came from `$global:CredentialConfig.Username` (a variable assigned exactly **once** — its initialiser — so every config recorded `''`), and **nothing read that block on load**, so loading a list under a different credential mode silently changed which account remote operations used. Identity now comes from the `PSCredential` and is compared on load; only identity is persisted, never password material. |
 | §7 reboot detection | **DONE** | The reboot wait was `While(Test-Connection ...)` - see below. Reboot STATE was already read correctly (`Microsoft.Update.SystemInfo.RebootRequired`); it was the online/offline TRANSITION that was ICMP-driven. |
 | §8 workflow state vs display state | **DONE** | See "§8 — workflow state vs display state" below. The phase gate no longer decides from `UpdatesStatus` (a display string); it reads a three-state `CheckConcluded` plus the workflow `State`. The display-string read in the settled-failure test was also removed — every site that sets `UpdatesStatus='Error'/'Timeout'` sets the matching `State` on the adjacent line, so it could only add disagreement. |
 | §9 phase failure policy | **DONE** | Explicit policy on the store: `PhaseFailurePolicy` = `BlockOnFailure` (DEFAULT) / `ContinueOnTimeout` / `ContinueOnFailure`, decided by the pure `Test-WuuPhaseFailureBlocks`. The old behaviour `continue`d past failed/timed-out rows, i.e. ContinueOnFailure was hard-coded and unreported. See "Phase failure policy" below. |
@@ -614,3 +614,76 @@ with: verify from the code, not from the comment — including my own.
   setting `UpdatesStatus` alone — it encoded the very defect SS8 removes. It now sets the workflow
   fields, and a comment says why.
 * Full suite: **23 pass, 1 skip (elevation-gated), 0 fail.**
+
+---
+
+## §6 — credential propagation (done)
+
+### Method
+
+The brief marked this **NOT VERIFIED**, so the first step was to *probe* rather than read. Two defects
+came out of it, neither of which was visible from the comments:
+
+**A. The saved credential identity was always empty.** `Save-ComputerListConfig` wrote
+`CredentialConfig.Username` from `$global:CredentialConfig`, a variable assigned exactly **once** in the
+whole codebase — its initialiser (`@{ Username = ''; Domain = ''; ... }`). The real name lives in
+`$global:CustomCredentials.UserName`. Measured: with a credential configured as `CONTOSO\svc-wuu`, the
+saved config loaded back with `Username=''` and `Domain=''`. Every configuration ever saved recorded
+nothing.
+
+**B. Nothing read that block on load.** `$eventLoadConfig` never looked at
+`$loadResult.Config.CredentialConfig`, so loading a list saved under one credential mode into a session
+using another **silently changed which account every remote operation would run as**. Nothing failed —
+the operations simply ran as a different principal, which is exactly the kind of difference that stays
+invisible until an access-denied appears on some host, or does not appear when it should.
+
+### What replaced it
+
+* `Get-WuuCredentialStateSignature` — the credential mode as `{ Enabled; UserName; Mode }`, read from
+  `CustomCredentials.UserName`. **Identity only**: no password, no SecureString, nothing derived from
+  one. The list itself is already encrypted with the operator's passphrase, and putting reversible
+  credential material inside it would widen the blast radius of a weak passphrase for no benefit.
+* `Test-WuuCredentialStateMatches` — compares a saved mode against the running session and returns a
+  specific reason (`saved with 'custom' credentials but this session is using 'current-process'`, or the
+  two account names) rather than a vague "mismatch".
+* The load path now compares and **warns without auto-correcting**. Silently switching the operator's
+  credentials on load would be a bigger surprise than the warning; the operator is told which
+  credentials will actually be used and how to change them.
+
+The propagation matrix was then verified rather than assumed — the gate and the test together assert:
+
+| Property | Assertion |
+| --- | --- |
+| the two remote task paths that **change** a machine both resolve a credential | `Windows Update download` and `Windows Update install` |
+| the resolved credential is actually **passed** to the remote task | ≥2 `InvokeRemoteTaskScript ... -Credential $remoteCred` sites |
+| custom credentials are **not** applied to the local machine | `-ne 'localhost' -and -ne $env:COMPUTERNAME` guard at both sites (the process token is already the right principal, and local DCOM rejects explicit credentials) |
+| the resolver order is custom → default, with the outcome **cached** | including `CredentialCache[$name] = $null` as an explicit "use default" entry, not an absent key |
+| the module-side and runspace-side resolvers agree | same order, same cache semantics |
+| the probe credential is typed `[pscredential]` | so a plain-string password cannot be passed as one |
+| no password reaches a log or the audit trail | matched as password-shaped **expressions**, not the word "password" |
+
+### Verification
+
+* `tests\Test-CredentialPropagation.ps1` — 26 assertions, including a real Save/Import round trip that
+  **fails against the pre-fix code** (it asserts the identity survives).
+* Gate **(ad)** — the same properties in the release gate, including "the credential identity is still
+  read from `$global:CredentialConfig.Username`" as an explicit failure.
+* Full suite: **24 pass, 1 skip (elevation-gated), 0 fail.**
+
+### A test bug worth recording, because it recurred three times
+
+The first version of the leak check flagged any log line containing the word "password" — and reported
+**four false failures** on correct lines: `Write-ErrorLog "Secure password prompt unavailable: ..."` logs
+that the secure *prompt* failed and interpolates only the exception text. It now matches password-shaped
+expressions (`$password`, `.Password`, `GetNetworkCredential`, `SecureStringToBSTR`, …).
+
+The same class of mistake appeared three times in this pass — a check matching the comment that
+explains the code it is checking (SS8 quoting the removed predicate, SS6 quoting the removed
+`CredentialConfig` read, and SS6 matching "never a password" in its own comment). Each was fixed
+ad-hoc before it was recognised as **one** problem, so the validator now has a shared
+`Get-WuuTextWithoutComments` helper that strips **both** comment lines and block comments. The
+existing `Get-WuuCodeWithoutComments` could not be reused: it joins tokens with spaces, which discards
+newlines (breaking `Get-WuuFunctionBody`, which slices to the next `"\nfunction "`) and drops `$`
+(so a `\$state -in` pattern could never match). The first draft of the new helper was itself broken the
+same way — its doc comment contained the literal block-comment delimiters, which closed the comment
+early. That is noted in the helper so the next person does not repeat it.
