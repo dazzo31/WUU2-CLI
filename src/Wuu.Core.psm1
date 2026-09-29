@@ -98,10 +98,17 @@ Enhanced Version - 2025-07-08
 # so a release could ship with the log claiming one version and the audit trail recording
 # another - a genuine compliance problem for a field an ISO 27001 review relies on.
 #
-# v1.5.0-beta.1-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
-# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.1-cli` knows the evidence
+# v1.5.0-beta.2-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
+# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.2-cli` knows the evidence
 # came from pre-release software. Do not reuse this string for a final release.
-$global:WuuVersion = 'v1.5.0-beta.1-cli'
+#
+# beta.2 is the HARDENING build: same commands and same engine, but a substantial correctness pass
+# over behaviour that used to fail SILENTLY (exit codes that meant "queued", phase gating driven by
+# a display string, a dead timeout field, credential identity written empty and never read). Those
+# are behaviour changes, which is why they are a release and not a patch. See
+# docs/HARDENING_P0_FINDINGS.md for the findings and docs/RELEASE_NOTES_v1.5.0-beta.2-cli.md for
+# what changed and what to re-test.
+$global:WuuVersion = 'v1.5.0-beta.2-cli'
 
 # Toggle debug logging. Set to $true to enable detailed logging (performance impact).
 # WARNING: Enabling this creates large log files and reduces performance.

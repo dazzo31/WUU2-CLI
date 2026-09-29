@@ -15,11 +15,15 @@ No GUI, no WPF, no XAML. Pure PowerShell 5.1. Same update engine as the
   COMPUTER             PHASE     STATE          UPDATES           STATUS
   ------------------------------------------------------------------------
   SRV01                Phase 1   Complete       A:3 D:3           Updates installed
-  SRV02                Phase 1   Checking       A:0 D:0           Searching...
+  SRV02                Phase 1   Downloading    A:3 D:1           [Download 12m left beat 18s ago]
   SRV03                Phase 2   Queued         A:0 D:0           Waiting for Phase 1
 
   Auto download: on    Auto install: on    Auto reboot: off
 ```
+
+The bracketed field appears only while an operation is running: it names the operation, its remaining
+budget and how long since the last heartbeat, so "still working" is distinguishable from "stuck"
+without reading a log.
 
 ---
 
@@ -39,9 +43,26 @@ Two consequences worth stating up front:
 - **It runs anywhere PowerShell 5.1 runs.** No WPF assembly dependency for the interface, so it
   works in a plain console, a remoting session, or an unattended job. (`-STA` is still required —
   the Windows Update COM APIs and the worker runspaces are apartment-affine.)
-- **It is scriptable.** Every operation the menu offers is also a verb, which is what makes the
-  audit trail meaningful: a change made by a scheduled task is recorded exactly like a change made
-  by a human.
+- **It is scriptable.** The operations that change remote state are also verbs, which is what makes
+  the audit trail meaningful: a change made by a scheduled task is recorded exactly like a change
+  made by a human. (A few menu-only conveniences — phase display, the settings toggle, the AD
+  acquisition screen — have no verb; see [Commands](#commands).)
+
+### Two interactive front ends
+
+Running `WUU.ps1` with no arguments gives the **guided workflow**: an acquisition-first shell that
+walks you through add → review → save → pre-flight → check → download → install → restart → verify,
+confirming each change and asking for its reason. It does not show update operations until a
+computer set exists.
+
+```powershell
+.\WUU.ps1                 # guided workflow (default)
+.\WUU.ps1 --flat-menu     # the older single-screen menu (26 keyed operations)
+```
+
+The flat menu is retained as a deliberate fallback: the guided workflow is newer orchestration, and
+the flat menu is the path that still works if a screen misbehaves. Its design is described in
+[`docs/INTERACTIVE_UI_SPEC.md`](docs/INTERACTIVE_UI_SPEC.md).
 
 ---
 
@@ -53,10 +74,10 @@ Clone or extract a release, then from an elevated PowerShell prompt:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WUU.ps1
 ```
 
-It requests elevation itself if you forget — accept the UAC prompt. You get the interactive menu:
-a live status table of your computers plus 25 keyed operations.
+It requests elevation itself if you forget — accept the UAC prompt. With no computers in the list
+you get the guided acquisition path; once a set exists you get the update workflow.
 
-Prefer commands? Every operation is a verb:
+Prefer commands? The operations that change remote state are verbs:
 
 ```powershell
 .\WUU.ps1 -Help                                              # full verb list
@@ -67,8 +88,31 @@ Prefer commands? Every operation is a verb:
 .\WUU.ps1 audit verify                                       # check the audit chain
 ```
 
-Exit codes in command mode: `0` success, `1` failure — including a broken audit chain, so a
-pipeline can gate on it.
+### Exit codes
+
+Eight documented codes, so a pipeline can gate on the specific outcome rather than on "non-zero":
+
+| Code | Meaning |
+| --- | --- |
+| `0` | success — the operation **completed** |
+| `1` | operation failed (one or more targets) |
+| `2` | usage error — check the verb and its arguments |
+| `3` | timeout — the wait elapsed with work still outstanding |
+| `4` | partial success *(reserved; see below)* |
+| `5` | audit failure — the chain failed to verify, or a fail-closed audit write failed |
+| `6` | queued — `-Async` was requested and the work was **accepted**, not completed |
+| `7` | refused — declined before running (most often a missing `-Reason`) |
+
+**`0` means completed, not queued.** `wuu install` submits work to a background runspace and waits a
+bounded period. If work is still outstanding when that window closes, the command exits **`3`**, not
+`0` — a script must never read "accepted" as "done". Pass `-Async` when fire-and-forget is what you
+actually want, and that becomes an explicit **`6`**. Gate on specific codes rather than `-ne 0`: a
+blanket "non-zero = retry" would retry a tampered audit log.
+
+`4` is **reserved but not produced**: with `-Computer A,B` the selection is resolved by one shared
+answer, so per-target outcomes are not observable from the command layer, and the honest answer today
+is `1`. See [`docs/EXIT_CODES.md`](docs/EXIT_CODES.md) for the full contract, including what JSON
+`-WhatIf` returns and how `-Async` interacts with the exit code.
 
 **Tip** — create a `wuu.cmd` on your PATH to avoid typing the host:
 
@@ -115,8 +159,16 @@ wuu <verb> [options]         run one operation and exit
 | `logs` | View a target's Windows Update log |
 | `audit` | `wsus` (audit a target) \| `verify` \| `show` \| `export` (the local audit trail) |
 
-Common options: `-Computer`, `-All`, `-Reason`, `-Path`, `-LogPath`, `-Json`, `-WhatIf`, `-Help`.
-`-Reason` is **required** for verbs that change remote state — see the audit trail below.
+Common options: `-Computer`, `-All`, `-Reason`, `-Path`, `-LogPath`, `-Json`, `-WhatIf`, `-Async`,
+`-Help`. `-Reason` is **required** for verbs that change remote state — see the audit trail below.
+
+`-WhatIf` on a mutating verb prints a **per-computer plan**, not one sentence: what each computer
+would do (`run` / `queue` / `skip` / `noop`), why, and any name that resolved to nothing. It changes
+**nothing**, including the audit trail — a dry run may be repeated freely while preparing a change.
+
+The distinction that matters: a computer that is already busy is **deferred** for check/download/
+install (the request is honoured when the current operation finishes) but **refused** for `restart`
+and `service` — a confirmed reboot is never silently postponed. The plan says which.
 
 ---
 
@@ -125,9 +177,17 @@ Common options: `-Computer`, `-All`, `-Reason`, `-Path`, `-LogPath`, `-Json`, `-
 ### Phased deployment (5 phases)
 
 Assign computers to up to 5 phases. A phase's checks do not start until every computer in the
-previous phase is fully patched and reboot-clean, so you roll updates across an estate in waves
-instead of hitting everything at once. Errored or timed-out hosts never block later phases, and
-phase assignments persist in saved computer lists.
+previous phase is settled, so you roll updates across an estate in waves instead of hitting
+everything at once. Phase assignments persist in saved computer lists.
+
+An errored or timed-out computer is **not** skipped by default. `PhaseFailurePolicy` defaults to
+`BlockOnFailure` — for patch deployment, stopping is recoverable and continuing past a failed canary
+is not. The other two values are `ContinueOnTimeout` (timeouts tolerated, failures block) and
+`ContinueOnFailure`; the policy is a store setting, decided by a tested function, and reported.
+
+> **This changed.** Earlier builds advanced past a failed computer and had **no** policy at all —
+> errors and timeouts silently permitted the next phase, which is the unsafe behaviour. If you relied
+> on a failed canary not stopping the roll-out, set `ContinueOnFailure` explicitly.
 
 ### Full automation
 
@@ -146,17 +206,48 @@ end-to-end and cached per computer to avoid repeat prompts. Note that PowerShell
 `Get-CimInstance` has no `-Credential` parameter, so alternate credentials flow through
 `New-CimSession -Protocol DCOM`.
 
+A saved computer list records the credential **mode** (custom account vs the process account) and
+its username — identity only, never a password. On load, a session whose credential mode differs is
+**warned about**, not silently switched: every remote operation would otherwise run as a different
+principal, which is the sort of difference that stays invisible until an access-denied appears (or,
+worse, does not).
+
+> **This changed.** Earlier builds wrote an always-blank identity into the saved config *and* read
+> nothing back on load, so the warning did not exist.
+
 ### Encrypted computer lists
 
 Save and load computer lists — including phase assignments — protected by a password-derived AES
 key, replacing the original tool's plain-text export.
 
-### Hang protection
+### Hang protection, and timeouts that distinguish slow from stuck
 
 Every remote call is wrapped in a hard timeout (`Invoke-CimWithTimeout`, `Invoke-ServiceWithTimeout`,
-`Invoke-RemoteComWithTimeout`). Stuck jobs are stopped after 10 minutes rather than starving the
-concurrency throttle. A genuinely unreachable host therefore takes longer to report than a naive
-fast-fail — that is the trade for never hanging.
+`Invoke-RemoteComWithTimeout`). A genuinely unreachable host therefore takes longer to report than a
+naive fast-fail — that is the trade for never hanging.
+
+Each operation also has its **own deadline**, because one number cannot be right for all of them:
+
+| Operation | Deadline |
+| --- | --- |
+| check / download | 45 min |
+| install + re-check | 2 h |
+| full self-driving chain | 4 h |
+| restart | 45 min (its own offline + online waits already total 40 min) |
+| remove-offline / service action | 5 min |
+
+The deadline is recorded when the work is **submitted**, so the budget you can inspect is the budget
+enforced, and it is cleared when the operation ends. A **heartbeat** is refreshed while the job runs,
+which is what separates "slow" from "stuck": a deadline alone only says "not finished", whereas the
+status line shows the operation, its remaining budget and how long since the last beat:
+
+```
+  SRV01  Phase 1  Downloading  A:3 D:1  [Download 12m left beat 18s ago] Downloading 2/3...
+```
+
+> **This changed.** Earlier builds force-stopped **every** job at a flat 10 minutes. That killed
+> healthy work — a restart's own waits exceed it, so *every* reboot was reported as a timeout — while
+> a hung 5-minute service action held a runspace for ten minutes.
 
 ---
 
@@ -165,6 +256,11 @@ fast-fail — that is the trade for never hanging.
 This is the main reason the console edition exists. Every operation — from the menu or the command
 line — is recorded to `%PROGRAMDATA%\WUU2\audit\audit-YYYYMMDD.jsonl`: one JSON object per line, one
 file per UTC day.
+
+**One deliberate exception: `-WhatIf`.** A dry run writes **nothing** to the trail and changes
+nothing anywhere else — so it can be repeated freely while preparing a change, with no artefacts to
+explain. A simulation is not a denied attempt, and mixing plans into the trail would make "this
+system refused the change" indistinguishable from "an operator asked what it would do".
 
 Each record answers the six questions A.8.15 cares about:
 
@@ -231,10 +327,15 @@ Same engine, different presentation layer. What actually changed:
 
 | Area | GUI edition | This edition |
 | --- | --- | --- |
-| Presentation | WPF + XAML (`ui/`), `$uiHash` control access, `Dispatcher.Invoke`, `DispatcherTimer` | Console shell: status table + keyed menu. `ui/` is deleted and no WPF assemblies are loaded |
+| Presentation | WPF + XAML (`ui/`), `$uiHash` control access, `Dispatcher.Invoke`, `DispatcherTimer` | Console shell: status table + keyed menu, and a guided workflow. `ui/` is deleted and no WPF assemblies are loaded |
 | State | WPF controls were the source of truth | Thread-safe state store (`src/Wuu.State.psm1`), rendered by the shell |
+| Workflow gating | A failed or timed-out host was skipped, permitting the next phase | An explicit, reported `PhaseFailurePolicy`, defaulting to blocking |
 | Scheduler | A `DispatcherTimer` on the UI thread — worked only because `ShowDialog()` pumped a message loop | The input loop polls and drains the scheduler each tick. A console blocked in `Read-Host` has no message loop, so a timer would silently never fire |
-| Interface | Mouse-driven context menus | 25 keyed menu operations **and** 17 scriptable verbs |
+| Concurrency | No per-computer guard: a second operation was silently discarded | One operation per computer, decided at a single submission point, plus a global cap |
+| Timeouts | One flat 10-minute stop | A per-operation budget, recorded at submission, with a heartbeat |
+| Liveness | ICMP (`Test-Connection`) decided online/offline | The management endpoint decides — ICMP is blocked by default on Windows |
+| Interface | Mouse-driven context menus | A guided workflow (default) **and** 26 keyed operations **and** 17 scriptable verbs |
+| Exit codes | n/a | Eight documented codes; `0` means completed |
 | Audit | none | Hash-chained ISO 27001 A.8.15 audit trail with a required change reason |
 
 **Not carried over:** column drag-resize/auto-fit, clipboard and context-menu affordances, the AD
@@ -261,8 +362,10 @@ src/
   Wuu.WindowsUpdate.psm1 update search/download/install, per-computer runspaces, phases
   Wuu.Remote.psm1        DCOM CIM sessions, remote task execution, timeouts
   Wuu.Network.psm1       connectivity and system performance probes
-  Wuu.Credentials.psm1   credential cache, encrypted computer-list config
+  Wuu.Credentials.psm1   credential cache, encrypted computer-list config, credential-mode check
   Wuu.Workers.psm1       bounded runspace pool for remote work
+  Wuu.Session.psm1       the computer set as a first-class object (add/import/export/prune)
+  Wuu.Navigate.psm1      the guided interactive workflow: screens, pre-flight, confirmation, results
   Wuu.Models.psm1        state factories and error suggestions
   Wuu.Logging.psm1       fault-tolerant debug logging
 Scripts/
@@ -286,28 +389,49 @@ Validate before packaging or releasing:
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Validate-Release.ps1
 ```
 
-This is a real gate, not a smoke test. It parses every shipped file under the PS 5.1 engine,
-asserts no WPF/XAML references remain in code, checks that every menu handler and verb handler
-resolves, requires a UTF-8 BOM on every non-ASCII file, and enforces structural invariants over the
-audit trail (array-vs-string canonicalisation, append-only writes, the exclusive lock, the complete
-A.8.15 field set, first-class denials, no delete path) plus a case-insensitive
-parameter-collision check.
+This is a real gate, not a smoke test, and it is what CI should run. It:
+
+- parses every shipped file under the PS 5.1 engine;
+- asserts no WPF/XAML reference remains in code (comments excluded, so explanatory notes do not
+  trip it);
+- checks that every menu entry and verb resolves to a wired handler;
+- requires a **UTF-8 BOM on every shipped file containing non-ASCII bytes** — a BOM-less non-ASCII
+  file is encoding-dependent, and rewriting it with `Set-Content` corrupts it silently;
+- enforces that behaviour is decided from **workflow state**, not from a display string;
+- enforces the **exit-code** contract, including that `0` cannot mean "queued";
+- enforces the **per-operation timeout** design: a budget per operation, a deadline recorded at
+  submission, cleared on every exit path, and a heartbeat;
+- enforces that **one operation per computer** is decided at a single submission point;
+- enforces that no state transition is decided by **ICMP**, and that a single lost probe cannot
+  evict a computer from the set;
+- enforces the **credential** rules: identity recorded from the `pscredential`, compared on load,
+  and no password-shaped expression interpolated into a log;
+- enforces the structural audit invariants (array-vs-string canonicalisation, append-only writes, the
+  exclusive lock, the complete A.8.15 field set, first-class denials, no delete path);
+- rejects case-insensitive parameter collisions (a local `$all` silently *is* a `[switch]$All`).
+
+Every invariant above has a matching regression suite in `tests\`, and the two are meant to be read
+together: a gate catches a structural regression, a suite catches a behavioural one. The reasoning
+behind each — including the ones that were wrong first — is in
+[`docs/HARDENING_P0_FINDINGS.md`](docs/HARDENING_P0_FINDINGS.md).
 
 Run the regression suites (all headless, no admin required):
 
 ```powershell
-Get-ChildItem .\tests\Test-*.ps1 | ForEach-Object {
+Get-ChildItem .\tests\Test-*.ps1 | Where-Object { $_.Name -notin @('Test-ColumnResize.ps1','Test-DragResize.ps1') } | ForEach-Object {
     powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File $_.FullName
 }
 ```
 
-> `tests\Test-ColumnResize.ps1` and `tests\Test-DragResize.ps1` are GUI-edition leftovers — they
-> exercise WPF column drag-resize, which does not exist in this edition. ColumnResize fails on
-> its missing WPF assemblies; **DragResize hangs** (blocking dispatcher pump). Both should be
-> deleted. They are excluded from the task above.
->
-> The other suites all run here: `Test-PendingDrain` passes, `Test-RemoteTask` skips politely
-> when not elevated, and `Test-CredentialTyping` fails against the GUI-era credential dialog.
+All suites are headless and need no admin. **`Test-RemoteTask` skips** (exit 0 with a `SKIP:` marker)
+when it is not elevated, because it registers a SYSTEM scheduled task; run it from an elevated prompt
+to exercise it. A per-suite timeout with straggler cleanup is worth wrapping around the loop — one
+hung suite should not stall a full run.
+
+> **Two stale suites:** `tests\Test-ColumnResize.ps1` and `tests\Test-DragResize.ps1` are GUI-edition
+> leftovers that exercise WPF column drag-resize, which does not exist here. ColumnResize fails on
+> its missing WPF assemblies; **DragResize hangs** (blocking dispatcher pump). Both should be deleted,
+> and both are excluded from the loop above.
 
 Build a release zip:
 
