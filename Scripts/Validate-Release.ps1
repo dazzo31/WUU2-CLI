@@ -765,8 +765,16 @@ else {
     if ($supBody -notmatch 'Test-WuuComputerBusy') {
         Fail 'Start-UpdateCheckJob does not consult Test-WuuComputerBusy - a second operation on a busy computer would be silently discarded'
     }
-    elseif ($supBody -notmatch "OpState\s*=\s*'Running'") {
+    elseif ($supBody -notmatch "OpState\s*=\s*'Running'" -and $supBody -notmatch "-OpState\s*'Running'") {
+        # SS16: the claim may be made either by a direct assignment or by the mutation funnel, which
+        # takes OpState as a parameter. Both are accepted; NOTHING that leaves the row unmarked is.
         Fail 'Start-UpdateCheckJob does not mark the computer Running - the gate could never say busy'
+    }
+    elseif ($supBody -match 'Update-WuuOperationState' -and $supBody -notmatch 'OperationIdNew') {
+        # If the claim goes through the funnel, it must use the sanctioned ADOPTION path - otherwise
+        # the funnel's identity check would compare the new id against the row's old one and refuse a
+        # legitimate submission.
+        Fail 'the submission claims through the funnel without -OperationIdNew, so the identity check would refuse its own resubmission'
     }
 }
 $stateRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
@@ -1588,17 +1596,23 @@ if ($coreRawA -notmatch "Properties\['Runspace'\]\) \{ \`$toRow\.Runspace = \`$n
     Pass 'the timeout path detaches the runspace before releasing the lock (SS3)'
 }
 
-# The out-of-band removal path must release the lock AND retire the identity.
+# The out-of-band removal path must release the lock AND retire the identity. SS16 moved that release
+# into the mutation funnel, so this asserts DELEGATION plus the funnel's coverage rather than the old
+# inline text - the inline form is exactly the copy-paste this work removed.
 $removeIdxA = $coreRawA.IndexOf('Failed to remove job from list')
 if ($removeIdxA -gt 0) {
     $removeWindow = $coreRawA.Substring($removeIdxA, [Math]::Min(2500, $coreRawA.Length - $removeIdxA))
-    # Anchored on the CODE token (the catch-block message), then searched for the retirement line.
-    # The window is generous because the explanatory comment between them is long, and the
-    # explanatory text is exactly what made an earlier revision of this check fail on correct code.
-    if ($removeWindow -notmatch "OperationId'\]\) \{ \`$Computer\.OperationId = ''") {
-        Fail 'the out-of-band job removal does not retire the operation identity - a late writer could present a valid token for a job that no longer exists (SS3)'
+    if ($removeWindow -notmatch 'Update-WuuOperationState') {
+        Fail 'the out-of-band job removal does not delegate to the mutation funnel (SS3/SS16)'
+    } elseif ($removeWindow -notmatch 'ClearOperation') {
+        Fail 'the out-of-band job removal does not end the operation via the funnel (SS3)'
+    } elseif ($removeWindow -notmatch 'OperationId') {
+        Fail 'the out-of-band job removal does not read an identity, so its release is unattributed (SS3)'
+    } elseif ($stateRawA -notmatch "'OperationId' ''") {
+        # The funnel must be what retires the identity, or delegating has lost the write.
+        Fail 'the mutation funnel does not retire the operation identity - a late writer could present a valid token for a job that no longer exists (SS3)'
     } else {
-        Pass 'the out-of-band job removal releases the lock and retires the identity (SS3)'
+        Pass 'the out-of-band job removal releases the lock and retires the identity via the funnel (SS3)'
     }
 } else {
     Fail 'could not locate the out-of-band job removal path'
@@ -1952,6 +1966,138 @@ if (-not $embeddedVersionM) {
         }
     } catch {
         Fail "could not resolve the version for the mismatch check: $($_.Exception.Message)"
+    }
+}
+
+# (an) THE STATE-MUTATION FUNNEL (reviewer P1). The invariant "a superseded operation cannot write"
+#      held for 2 of 6 producers of operation state, and 46 direct assignments bypassed all of them.
+#      This gates the funnel that now owns mutation, and it DRIVES the invariant checker rather than
+#      grepping for it - a checker that always returns "no violations" would make this a tautology.
+$coreRawN  = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+$stateRawN = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+$wupdRawN  = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+
+# The funnel lives in Wuu.STATE, not Wuu.Core - it mutated rows, so it belongs with the row contract.
+# (An earlier revision of this check searched Wuu.Core and reported the funnel missing while it was
+# present, which is the same file-confusion that the Stop-WuuFatal check above already hit.)
+if ($stateRawN -notmatch 'function Update-WuuOperationState') {
+    Fail 'the state-mutation funnel Update-WuuOperationState does not exist - state is mutated from many places again (P1)'
+} elseif ($stateRawN -notmatch "'Update-WuuOperationState'") {
+    Fail 'Update-WuuOperationState is not exported - callers outside Wuu.State cannot route mutation through it'
+} else {
+    Pass 'the state-mutation funnel exists and is exported (P1)'
+}
+
+# IDENTITY MUST BE CHECKED BEFORE ANY WRITE. Ordering is the whole point: a guard that runs after the
+# first assignment has already mutated the row, which is the defect, not the fix.
+#
+# COMMENTS ARE STRIPPED FIRST. The function documents its own guard at length, so the prose alone
+# contains three mentions of Test-WuuStaleWrite. Searching the raw body found the NAME in a docstring
+# and the ordering check passed on a tree where the actual call had been replaced with `$false` - the
+# exact comment-matching trap that has produced five false results in this repository already. The
+# mutation test caught it; this strip is the fix.
+$funnelText = Get-WuuFunctionBody $stateRawN 'Update-WuuOperationState'
+$funnelCode = Get-WuuTextWithoutComments -Text $funnelText
+if (-not $funnelText) {
+    Fail 'could not extract the funnel body for the ordering check'
+} else {
+    $guardAt = $funnelCode.IndexOf('Test-WuuStaleWrite')
+    $adoptAt = $funnelCode.IndexOf('$OperationIdNew')
+    $firstSetAt = $funnelCode.IndexOf("`$set '")
+    # The guard must be an INVOCATION carrying the row and the writer's identity, not merely a name.
+    $guardCall = [regex]::Match($funnelCode, 'Test-WuuStaleWrite\s+-Row\s+\$Row\s+-OperationId\s+\$OperationId')
+    if ($guardAt -lt 0 -or -not $guardCall.Success) {
+        Fail 'the funnel never INVOKES Test-WuuStaleWrite with (Row, OperationId) - it is not identity-guarded (P1)'
+    } elseif ($firstSetAt -lt 0) {
+        Fail 'the funnel has no apply block to order against - the check cannot prove the guard precedes the write'
+    } elseif ($guardAt -gt $firstSetAt) {
+        Fail 'the funnel writes BEFORE it checks identity - the guard must precede the first mutation (P1)'
+    } elseif ($adoptAt -gt 0 -and $adoptAt -gt $firstSetAt) {
+        Fail 'the funnel resolves identity ADOPTION after its first write, so adoption cannot gate it (P1)'
+    } elseif ($funnelCode -match 'elseif\s*\(\s*\$false\s*\)') {
+        # A disabled guard: the call is present in text but can never refuse. This is the mutation the
+        # ordering check originally missed, so it is asserted directly.
+        Fail 'the funnel contains a disabled condition ($false) - the identity guard may be inert (P1)'
+    } else {
+        Pass 'the funnel INVOKES the identity rule before its first write, and admission is refused over a running operation (P1)'
+    }
+}
+
+# REFUSAL MUST NOT WRITE. The contract is "nothing is written when refused", not "written then
+# reverted" - so every refusal path must return before the apply block.
+$refusalReturns = ([regex]::Matches($funnelText, 'return \(& \$refused')).Count
+if ($refusalReturns -lt 3) {
+    Fail "the funnel has only $refusalReturns refusal paths - identity, transition and revision refusals must all return before any write (P1)"
+} else {
+    Pass "the funnel refuses on $refusalReturns separate grounds, each returning before any write (P1)"
+}
+
+# The four former unguarded producers must delegate (the two in Wuu.Core) or delegate to the inlined
+# twin (the two injected worker copies, which cannot resolve a module function).
+foreach ($fn in @('Set-ComputerState', 'Set-ComputerTimeout')) {
+    $body = Get-WuuFunctionBody $coreRawN $fn
+    if ($body -notmatch 'Update-WuuOperationState') {
+        Fail "$fn does not route through the funnel - it still mutates operation state unchecked (P1)"
+    }
+}
+if ($coreRawN -match '(?s)function Set-ComputerState.*?Update-WuuOperationState') {
+    Pass 'Set-ComputerState and Set-ComputerTimeout route through the funnel (P1)'
+}
+
+$wupdN = Get-WuuTextWithoutComments -Text $wupdRawN
+if ($wupdN -notmatch 'UpdateWuuOperationStateScript') {
+    Fail 'the injected worker runspaces have no inlined mutation funnel - the payloads would still write unchecked (P1)'
+} elseif ($wupdN -notmatch 'rowOpId' -or $wupdN -notmatch 'writerOpId' -or $wupdN -notmatch 'cne') {
+    Fail 'the inlined worker funnel does not compare row identity against writer identity - it is present but inert (P1)'
+} else {
+    Pass 'the injected worker runspaces route state through an inlined, identity-guarded funnel (P1)'
+}
+
+# ClearOperation must cover every field the four former copy-pasted blocks cleared, plus the identity.
+$clearAt = $funnelText.IndexOf('if ($ClearOperation)')
+if ($clearAt -lt 0) {
+    Fail 'the funnel has no ClearOperation - the copy-pasted cleanup block has no single home (P1)'
+} else {
+    $clearBody = $funnelText.Substring($clearAt)
+    $missing = @()
+    foreach ($pair in @(@("'OpState' 'Idle'", 'releases the lock'),
+                        @("'OpStartedAt' `$null", 'clears the operation start time'),
+                        @("'TimeoutExpiresAt' `$null", 'clears the deadline'),
+                        @("'TimeoutSource' ''", 'clears the timeout source'),
+                        @("'OpName' ''", 'clears the operation name'),
+                        @("'LastHeartbeatAt' `$null", 'clears the heartbeat'),
+                        @("'OperationId' ''", 'retires the identity'),
+                        @("'Runspace' `$null", 'detaches the runspace'))) {
+        if (-not $clearBody.Contains($pair[0])) { $missing += $pair[1] }
+    }
+    if ($missing.Count -gt 0) {
+        Fail ("ClearOperation does not " + ($missing -join ', ') + ' (P1)')
+    } else {
+        Pass 'ClearOperation covers all eight fields of the former copy-pasted cleanup block, including the identity (P1)'
+    }
+}
+
+# DRIVE THE INVARIANT CHECKER. A gate that only reads the checker's source cannot tell a working check
+# from one that returns nothing. This builds a deliberately inconsistent row and requires a violation.
+if (-not (Get-Command Test-WuuOperationStateInvariant -ErrorAction SilentlyContinue)) {
+    Fail 'Test-WuuOperationStateInvariant is not resolvable - the invariant is not assertable (P1)'
+} else {
+    try {
+        $badRow = New-WuuComputerRow -Computer 'GATE-VIOLATION-PROBE'
+        $badRow.OpState = 'Running'
+        $badRow.OperationId = ''
+        $badViolations = @(Test-WuuOperationStateInvariant -Row $badRow)
+        $goodRow = New-WuuComputerRow -Computer 'GATE-CLEAN-PROBE'
+        $goodViolations = @(Test-WuuOperationStateInvariant -Row $goodRow)
+        if ($badViolations.Count -eq 0) {
+            Fail 'the invariant checker reports NO violations for a row that is Running with no operation identity - it cannot detect the defect it exists for (P1)'
+        } elseif ($goodViolations.Count -ne 0) {
+            Fail ("the invariant checker reports violations for a fresh, valid row: " + ($goodViolations -join '; '))
+        } else {
+            Pass "the invariant checker detects a real violation and passes a clean row (P1)"
+        }
+    } catch {
+        Fail "the invariant checker threw instead of reporting: $($_.Exception.Message)"
     }
 }
 

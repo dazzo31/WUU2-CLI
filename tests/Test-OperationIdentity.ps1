@@ -55,6 +55,7 @@ function Get-CodeNoComments([string]$Text) {
 }
 $coreCode = Get-CodeNoComments $coreRaw
 $wupdCode = Get-CodeNoComments $wupdRaw
+$stateCode = Get-CodeNoComments $stateRaw
 
 # ---------------------------------------------------------------------------------------
 # 1. the row contract carries the identity
@@ -280,13 +281,31 @@ $removeIdx = $coreCode.IndexOf('Failed to remove job from list')
 Assert-True ($removeIdx -gt 0) '10. the out-of-band removal path exists'
 if ($removeIdx -gt 0) {
     $removeBlock = $coreCode.Substring($removeIdx, [Math]::Min(1600, $coreCode.Length - $removeIdx))
+    # SS16: this site used to inline the 7-line release block. It now delegates to the mutation
+    # funnel, which owns that block once - so the obligation is asserted as DELEGATION plus the
+    # funnel's coverage, not as the presence of the old inline text. Asserting the inline form here
+    # would demand that the copy-paste this work removed be put back.
+    #
     # Anchors are ORDINAL string tests, not regex: in a regex an unescaped `$` is an end-of-string
-    # anchor, so '\$Computer\.OperationId' silently matches nothing. That mistake made this block
-    # fail while the guard was correct - and it is the same class of error as matching a comment.
-    Assert-True ($removeBlock.Contains("`$Computer.OpState = 'Idle'")) '10. it releases the lock'
-    Assert-True ($removeBlock.Contains('TimeoutExpiresAt = $null')) '10. it clears the deadline (same trap as the cleanup loop)'
-    Assert-True ($removeBlock.Contains("`$Computer.OperationId = ''")) '10. it retires the identity so a late writer cannot present a valid token for a dead job'
-    Assert-True ($removeBlock.Contains('$Computer.Runspace = $null')) '10. it detaches the runspace'
+    # anchor, so '\$Computer\.OperationId' silently matches nothing - the class of error that made
+    # this block fail while the guard was correct.
+    Assert-True ($removeBlock.Contains('Update-WuuOperationState')) '10. the out-of-band removal delegates to the mutation funnel'
+    Assert-True ($removeBlock.Contains('-ClearOperation')) '10. it asks the funnel to end the operation'
+    Assert-True ($removeBlock.Contains('OperationId')) '10. the identity is read and passed, so the funnel can attribute the release'
+
+    # The funnel's ClearOperation is what releases the lock, clears the deadline, retires the identity
+    # and detaches the runspace. tests\Test-WuuOperationState.ps1 drives that behaviour directly; this
+    # asserts the four obligations are still covered by it, so delegating cannot hide a lost write.
+    $clearBlock = ''
+    $ci = $stateCode.IndexOf('if ($ClearOperation) {')
+    if ($ci -gt 0) { $clearBlock = $stateCode.Substring($ci, [Math]::Min(1500, $stateCode.Length - $ci)) }
+    # Double-quoted patterns on purpose: inside a single-quoted PowerShell string, '' is ONE quote,
+    # so ''OpState'' ''Idle'' yields only two quotes per token where the source has four - the exact
+    # trap this repository has already hit twice, most recently in the previous version of this file.
+    Assert-True ($clearBlock.Contains("'OpState' 'Idle'")) '10. the funnel releases the lock'
+    Assert-True ($clearBlock.Contains("'TimeoutExpiresAt' `$null")) '10. the funnel clears the deadline (same trap as the cleanup loop)'
+    Assert-True ($clearBlock.Contains("'OperationId' ''")) '10. the funnel retires the identity so a late writer cannot present a valid token for a dead job'
+    Assert-True ($clearBlock.Contains("'Runspace' `$null")) '10. the funnel detaches the runspace'
 }
 
 # ---------------------------------------------------------------------------------------

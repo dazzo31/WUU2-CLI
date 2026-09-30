@@ -498,40 +498,25 @@ function Set-ComputerState {
         [Parameter(Mandatory=$false)][string]$StatusDetail = ''
     )
 
-    $stateToStatus = @{
-        'Queued'          = 'Waiting to start...'
-        'Connecting'      = 'Testing Connectivity.'
-        'Connected'       = 'Online.'
-        'Checking'        = 'Initializing update session...'
-        'Searching'       = 'Checking for updates...'
-        'UpdatesFound'    = 'Updates found.'
-        'Downloading'     = 'Downloading updates...'
-        'Installing'      = 'Installing updates...'
-        'RebootRequired'  = 'Reboot required.'
-        'Rebooting'       = 'Restarting...'
-        'Verifying'       = 'Verifying post-reboot state...'
-        'Complete'        = 'All updates installed.'
-        'Timeout'         = 'Operation timed out (recoverable).'
-        'Error'           = 'Error occurred.'
+    # SS16: routes through the single mutation funnel. This function no longer assigns State/Status
+    # itself - it did, which is why a superseded operation could overwrite the state of the operation
+    # that replaced it: there was no identity on the write to refuse. The canned text now comes from
+    # Get-WuuStateStatusText, so the sentence the console prints has one definition.
+    #
+    # The operation identity is read from the row (this API predates the identity and its callers do
+    # not pass one), so the write is attributed when the row has an operation and unattributed when it
+    # does not - exactly the semantics Test-WuuStaleWrite defines.
+    $writerOpId = ''
+    if ($Computer.PSObject.Properties['OperationId']) { $writerOpId = [string]$Computer.OperationId }
+
+    $result = Update-WuuOperationState -Row $Computer -OperationId $writerOpId -State $State -StatusSuffix $StatusDetail
+    if (-not $result.Applied) {
+        Write-DebugLog "[$($Computer.Computer)] State -> $State REFUSED: $($result.Reason)" -Level 'WARN'
+        return
     }
 
-    $statusString = $stateToStatus[$State]
-    if ($StatusDetail) {
-        $statusString += " $StatusDetail"
-    }
-
-    try {
-        # Console edition: write straight to the store; no dispatcher/ListView.
-        $Computer.State = $State
-        $Computer.Status = $statusString
-        $stateStore.Touch()
-    } catch {
-        Write-DebugLog "Set-ComputerState store failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
-    }
-
-    Write-DebugLog "[$($Computer.Computer)] State -> $State : $statusString" -Level 'DEBUG'
+    Write-DebugLog "[$($Computer.Computer)] State -> $State : $(Get-WuuStateStatusText -State $State -Detail $StatusDetail)" -Level 'DEBUG'
 }
-
 function Set-ComputerTimeout {
     <#
     .SYNOPSIS
@@ -552,19 +537,17 @@ function Set-ComputerTimeout {
         [Parameter(Mandatory=$false)][string]$Detail = ''
     )
 
-    try {
-        # Console edition: write straight to the store; no dispatcher/ListView.
-        $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
-        $Computer.TimeoutSource    = $Phase
-        $Computer.UpdatesStatus    = 'Timeout'
-        $Computer.State            = 'Timeout'
-        $detailSuffix = if ($Detail) { " $Detail" } else { '' }
-        $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
-        # Timeout is recoverable - yellow, not the terminal-error grey
-        $Computer.Color = 'Timeout'
-        $stateStore.Touch()
-    } catch {
-        Write-DebugLog "Set-ComputerTimeout store failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
+    # SS16: routes through the mutation funnel. -Phase implies the Timeout display state, records the
+    # deadline and its source, and sets UpdatesStatus - all from one decision, so a deadline can no
+    # longer be recorded without the row showing that it timed out.
+    $writerOpId = ''
+    if ($Computer.PSObject.Properties['OperationId']) { $writerOpId = [string]$Computer.OperationId }
+
+    $result = Update-WuuOperationState -Row $Computer -OperationId $writerOpId `
+        -Phase $Phase -TimeoutSec $TimeoutSec -StatusSuffix $Detail -Color 'Timeout'
+    if (-not $result.Applied) {
+        Write-DebugLog "[$($Computer.Computer)] TIMEOUT in $Phase REFUSED: $($result.Reason)" -Level 'WARN'
+        return
     }
 
     Write-DebugLog "[$($Computer.Computer)] TIMEOUT in $Phase after ${TimeoutSec}s. $Detail" -Level 'WARN'
@@ -1096,21 +1079,16 @@ $removeEntry = {
             # deletes the row: any future path that stops a job this way but KEEPS the row would
             # otherwise leave it permanently 'Running', and a permanently-busy computer is never
             # scheduled again.
-            if ($Computer.PSObject.Properties['OpState']) {
-                $Computer.OpState = 'Idle'
-                $Computer.OpStartedAt = $null
-                # Same trap the cleanup loop guards (SS5): releasing the lock without clearing the
-                # deadline leaves one in the past, and the NEXT operation on this computer would be
-                # judged expired on its first loop pass and killed immediately.
-                if ($Computer.PSObject.Properties['TimeoutExpiresAt']) { $Computer.TimeoutExpiresAt = $null }
-                if ($Computer.PSObject.Properties['TimeoutSource']) { $Computer.TimeoutSource = '' }
-                if ($Computer.PSObject.Properties['OpName']) { $Computer.OpName = '' }
-                if ($Computer.PSObject.Properties['LastHeartbeatAt']) { $Computer.LastHeartbeatAt = $null }
-            }
-            # Retire the identity with the operation, so a late writer cannot present a valid token
-            # for a job that no longer exists.
-            if ($Computer.PSObject.Properties['OperationId']) { $Computer.OperationId = '' }
-            if ($Computer.PSObject.Properties['Runspace']) { $Computer.Runspace = $null }
+            #
+            # SS16: routed through the mutation funnel. This is main-session code (unlike the
+            # cleanup loop and the payloads), so the funnel IS resolvable here and the 7-line
+            # cleanup block that used to be copy-pasted at four separate sites is now one call.
+            # ClearOperation covers OpState, OpStartedAt, the deadline and its source, the op name,
+            # the heartbeat, the identity and the runspace reference - note it also RETIRES THE
+            # IDENTITY, which two of the four former copies did not do.
+            $detachOpId = ''
+            if ($Computer.PSObject.Properties['OperationId']) { $detachOpId = [string]$Computer.OperationId }
+            $null = Update-WuuOperationState -Row $Computer -OperationId $detachOpId -ClearOperation
             
             # Close and dispose the runspace
             if ($Computer.Runspace) {

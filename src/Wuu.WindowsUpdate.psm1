@@ -178,9 +178,137 @@ function New-ComputerRunspace {
             }
         }.ToString()))
 
-        # Timeout state helper for worker runspaces. Mirrors Set-ComputerTimeout in
-        # Wuu.Core.psm1 but uses only language constructs + the injected $stateStore so
-        # it is safe to invoke from an isolated runspace.
+        # SS16: the state-mutation FUNNEL, inlined for isolated worker runspaces.
+        #
+        # This is the worker-side twin of Update-WuuOperationState in Wuu.State.psm1. It exists because
+        # an isolated runspace cannot resolve a module function, and the rule it enforces - a
+        # superseded operation must not write - has to hold for the payloads too, not only for the
+        # console. Before this, the two helpers below wrote State and the deadline with NO identity
+        # check at all, so the invariant held for 2 of the 6 producers of operation state.
+        #
+        # Keep in step with the module function. tests\Test-WuuOperationState.ps1 asserts both copies
+        # agree on the identity rule, the same discipline Test-OperationIdentity applies elsewhere.
+        $newRunspace.SessionStateProxy.SetVariable('UpdateWuuOperationStateScript', [scriptblock]::Create({
+            param(
+                [Parameter(Mandatory)][object]$Computer,
+                [string]$State = '',
+                [string]$Status = '',
+                [string]$StatusSuffix = '',
+                [string]$Color = '',
+                [string]$OpState = '',
+                [string]$Phase = '',
+                [int]$TimeoutSec = 0,
+                [switch]$ClearOperation,
+                [switch]$Heartbeat
+            )
+
+            if (-not $Computer) { return $false }
+
+            # IDENTITY, first. The rule is Test-WuuStaleWrite: refuse only a PROVEN staleness - the
+            # row names an operation and this runspace is running a different one. An unattributed
+            # write is permitted, or the initial row population would be discarded.
+            $rowOpId = ''
+            if ($Computer.PSObject.Properties['OperationId']) { $rowOpId = [string]$Computer.OperationId }
+            $writerOpId = ''
+            if ($WuuOperationId) { $writerOpId = [string]$WuuOperationId }
+            if ($rowOpId -ne '' -and $writerOpId -ne '' -and $rowOpId -cne $writerOpId) {
+                try {
+                    if ($WriteLogFileScript) {
+                        & $WriteLogFileScript ("[{0}] [WARN] [{1}] stale state write refused: the row belongs to operation '{2}', writer is '{3}'" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Computer.Computer, $rowOpId, $writerOpId)
+                    }
+                } catch { }
+                return $false
+            }
+
+            $stateToStatus = @{
+                'Queued' = 'Waiting to start...'; 'Connecting' = 'Testing Connectivity.'
+                'Connected' = 'Online.'; 'Checking' = 'Initializing update session...'
+                'Searching' = 'Checking for updates...'; 'UpdatesFound' = 'Updates found.'
+                'Downloading' = 'Downloading updates...'; 'Installing' = 'Installing updates...'
+                'RebootRequired' = 'Reboot required.'; 'Rebooting' = 'Restarting...'
+                'Verifying' = 'Verifying post-update state...'; 'Complete' = 'All updates installed.'
+                'Timeout' = 'Operation timed out (recoverable).'; 'Error' = 'Error occurred.'
+            }
+            $stateToColor = @{
+                'Queued' = 'Queued'; 'Connecting' = 'Connecting'; 'Connected' = 'Connected'
+                'Checking' = 'Searching'; 'Searching' = 'Searching'; 'UpdatesFound' = 'UpdatesFound'
+                'Downloading' = 'Downloading'; 'Installing' = 'Installing'; 'RebootRequired' = 'RebootRequired'
+                'Rebooting' = 'Rebooting'; 'Verifying' = 'Verifying'; 'Complete' = 'Complete'
+                'Timeout' = 'Timeout'; 'Error' = 'Error'
+            }
+
+            # A Phase IS a timeout, so it implies the display state when the caller did not name one.
+            if ($Phase -and -not $State) { $State = 'Timeout' }
+
+            try {
+                if ($State) {
+                    $Computer.State = $State
+                    if ($Status) {
+                        $Computer.Status = $Status
+                    } elseif ($Phase) {
+                        $sfx = if ($StatusSuffix) { " $StatusSuffix" } else { '' }
+                        $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$sfx"
+                    } else {
+                        $base = $stateToStatus[$State]
+                        if (-not $base) { $base = $State }
+                        if ($StatusSuffix) { $base = "$base $StatusSuffix" }
+                        $Computer.Status = $base
+                    }
+                    if ($Color) {
+                        $Computer.Color = $Color
+                    } elseif ($stateToColor[$State]) {
+                        $Computer.Color = $stateToColor[$State]
+                    }
+                } elseif ($Status) {
+                    $Computer.Status = $Status
+                }
+
+                if ($OpState) { $Computer.OpState = $OpState }
+
+                if ($Phase) {
+                    # Defensive: no budget would record a deadline in the past, and the row would be
+                    # judged expired on the next cleanup pass. 2700 mirrors the shortest real budget.
+                    if ($TimeoutSec -le 0) { $TimeoutSec = 2700 }
+                    $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
+                    $Computer.TimeoutSource = $Phase
+                    $Computer.UpdatesStatus = 'Timeout'
+                }
+
+                if ($ClearOperation) {
+                    $Computer.OpState = 'Idle'
+                    $Computer.OpStartedAt = $null
+                    $Computer.TimeoutExpiresAt = $null
+                    $Computer.TimeoutSource = ''
+                    $Computer.OpName = ''
+                    $Computer.LastHeartbeatAt = $null
+                    $Computer.OperationId = ''
+                    $Computer.Runspace = $null
+                    # A dangling recoverable-timeout DISPLAY must not outlive the deadline that made
+                    # it meaningful - 'Timeout' with no deadline never settles (see the invariant
+                    # checker). Only the unreplaced Timeout display is resolved.
+                    if ($Computer.State -eq 'Timeout') {
+                        $Computer.State = 'Queued'
+                        $Computer.Status = 'Waiting to start...'
+                    }
+                }
+
+                if ($Heartbeat) {
+                    $Computer.LastHeartbeatAt = [DateTime]::Now
+                    if ($Computer.PSObject.Properties['Heartbeats']) { $Computer.Heartbeats = [int]$Computer.Heartbeats + 1 }
+                }
+
+                if ($stateStore) { $stateStore.Touch() }
+                return $true
+            } catch {
+                return $false
+            }
+        }.ToString()))
+
+        # Timeout state helper for worker runspaces. Delegates to the inlined funnel above, so the
+        # identity rule and the status sentence have ONE worker-side definition rather than a copy per
+        # helper. Was: wrote TimeoutExpiresAt/TimeoutSource/UpdatesStatus/State/Status/Color directly
+        # with no identity check, which is how a superseded operation could stamp a timeout onto the
+        # operation that replaced it.
         $newRunspace.SessionStateProxy.SetVariable('SetComputerTimeoutScript', [scriptblock]::Create({
             param(
                 [Parameter(Mandatory)][object]$Computer,
@@ -188,50 +316,18 @@ function New-ComputerRunspace {
                 [Parameter(Mandatory)][int]$TimeoutSec,
                 [string]$Detail = ''
             )
-            try {
-                $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
-                $Computer.TimeoutSource    = $Phase
-                $Computer.UpdatesStatus    = 'Timeout'
-                $Computer.State            = 'Timeout'
-                $detailSuffix = if ($Detail) { " $Detail" } else { '' }
-                $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
-                # Was: listViewItem.Background = [Brushes]::LightYellow (recoverable = yellow)
-                $Computer.Color = 'Timeout'
-                if ($stateStore) { $stateStore.Touch() }
-            } catch { }
+            & $UpdateWuuOperationStateScript -Computer $Computer -Phase $Phase -TimeoutSec $TimeoutSec -StatusSuffix $Detail -Color 'Timeout'
         }.ToString()))
 
-        # State machine helper for worker runspaces. Mirrors Set-ComputerState in
-        # Wuu.Core.psm1.
+        # State machine helper for worker runspaces. Delegates to the inlined funnel above. Was: wrote
+        # State/Status directly with no identity check.
         $newRunspace.SessionStateProxy.SetVariable('SetComputerStateScript', [scriptblock]::Create({
             param(
                 [Parameter(Mandatory)][object]$Computer,
                 [Parameter(Mandatory)][string]$State,
                 [string]$StatusDetail = ''
             )
-            $stateToStatus = @{
-                'Queued'          = 'Waiting to start...'
-                'Connecting'      = 'Testing Connectivity.'
-                'Connected'       = 'Online.'
-                'Checking'        = 'Initializing update session...'
-                'Searching'       = 'Checking for updates...'
-                'UpdatesFound'    = 'Updates found.'
-                'Downloading'     = 'Downloading updates...'
-                'Installing'      = 'Installing updates...'
-                'RebootRequired'  = 'Reboot required.'
-                'Rebooting'       = 'Restarting...'
-                'Verifying'       = 'Verifying post-reboot state...'
-                'Complete'        = 'All updates installed.'
-                'Timeout'         = 'Operation timed out (recoverable).'
-                'Error'           = 'Error occurred.'
-            }
-            $statusString = $stateToStatus[$State]
-            if ($StatusDetail) { $statusString += " $StatusDetail" }
-            try {
-                $Computer.State = $State
-                $Computer.Status = $statusString
-                if ($stateStore) { $stateStore.Touch() }
-            } catch { }
+            & $UpdateWuuOperationStateScript -Computer $Computer -State $State -StatusSuffix $StatusDetail
         }.ToString()))
 
         # Single source of truth lives in Wuu.Remote.psm1; unbound copy so it runs in the worker runspace
@@ -581,7 +677,26 @@ function Start-UpdateCheckJob {
         # onto the JOB ENTRY (so the cleanup loop can compare the two without re-deriving anything
         # from timing - the exact defect this phase closes).
         $operationId = New-WuuOperationId -Computer $ComputerItem.Computer
-        if ($ComputerItem.PSObject.Properties['OperationId']) { $ComputerItem.OperationId = $operationId }
+
+        # SS16: the claim is made through the mutation funnel, which is where the ADMISSION RULE
+        # lives rather than where the caller remembers it. -OperationIdNew is the sanctioned adoption
+        # path: it stamps the identity AND is refused if the row is Running under a different
+        # operation (the same condition the Test-WuuComputerBusy gate above enforces, asserted here
+        # again so a future caller cannot reach BeginInvoke having skipped the gate).
+        #
+        # OpState and OpStartedAt are set in the SAME call, BEFORE BeginInvoke. They used to be set
+        # separately, ~20 lines later, AFTER BeginInvoke had already returned and the payload could
+        # have started executing on its own thread - a window in which the cleanup loop (which looks
+        # the row up by computer name) could observe a running pipeline on a row whose OpState was
+        # still 'Idle', and admit a second operation.
+        $claim = Update-WuuOperationState -Row $ComputerItem -OperationIdNew $operationId `
+            -OpState 'Running' -OpStartedAt (Get-Date)
+        if (-not $claim.Applied) {
+            # Refused: the row is owned by a live operation. This is a normal outcome, not an error -
+            # the caller leaves the row pending and the scheduler retries on a later tick.
+            Write-InfoLog "[$($ComputerItem.Computer)] submission refused: $($claim.Reason) (op=$Op)"
+            return $false
+        }
 
         # Hand the identity to the WORKER, so the payload's row-writers can attribute their writes.
         # Without this the injected UpdateWuuComputerRowScript has no way to prove which operation
@@ -614,14 +729,11 @@ function Start-UpdateCheckJob {
 
         $jobs.Add($temp) | Out-Null
 
-        # Mark the computer as Running. Cleared by the job-cleanup loop when this pipeline
-        # completes, or when the 10-minute timeout path disposes it - both are the only places a
-        # job leaves $jobs, so OpState cannot get stuck at Running. Set on the row (not in the runspace)
-        # because the gate is consulted from the scheduler thread, not from the worker.
-        if ($ComputerItem.PSObject.Properties['OpState']) {
-            $ComputerItem.OpState = 'Running'
-            $ComputerItem.OpStartedAt = Get-Date
-        }
+        # SS16: OpState/OpStartedAt were set here, AFTER BeginInvoke had already returned and the
+        # payload could be executing. They are now written by the funnel claim above, before
+        # BeginInvoke, so the row never looks Idle while a pipeline is running. (The comment that
+        # used to sit here is preserved in spirit by that ordering requirement.)
+        #
         # SS5: the deadline is recorded HERE, at submission, so it is a property of the INTENT and
         # not recomputed later from a start time the cleanup loop happens to remember. One source of
         # truth: the deadline an operator can inspect is the deadline the loop enforces.

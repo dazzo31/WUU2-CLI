@@ -501,6 +501,423 @@ function Clear-WuuOperationDeadline {
     if ($Row.PSObject.Properties['LastHeartbeatAt']) { $Row.LastHeartbeatAt = $null }
 }
 
+#region Operation transition layer
+
+# The workflow label a display State implies. Lifted verbatim from Set-ComputerState so the console
+# and any other producer report the same sentence for the same state.
+$script:WuuStateToStatus = @{
+    'Queued'          = 'Waiting to start...'
+    'Connecting'      = 'Testing Connectivity.'
+    'Connected'       = 'Online.'
+    'Checking'        = 'Initializing update session...'
+    'Searching'       = 'Checking for updates...'
+    'UpdatesFound'    = 'Updates found.'
+    'Downloading'     = 'Downloading updates...'
+    'Installing'      = 'Installing updates...'
+    'RebootRequired'  = 'Reboot required.'
+    'Rebooting'       = 'Restarting...'
+    'Verifying'       = 'Verifying post-update state...'
+    'Complete'        = 'All updates installed.'
+    'Timeout'         = 'Operation timed out (recoverable).'
+    'Error'           = 'Error occurred.'
+}
+
+# Colour implied by a display State. 'Timeout' is recoverable (yellow), 'Error' is terminal (grey) -
+# a distinction the console relies on, and one that was previously repeated at every call site.
+$script:WuuStateToColor = @{
+    'Queued'          = 'Queued'
+    'Connecting'      = 'Connecting'
+    'Connected'       = 'Connected'
+    'Checking'        = 'Searching'
+    'Searching'       = 'Searching'
+    'UpdatesFound'    = 'UpdatesFound'
+    'Downloading'     = 'Downloading'
+    'Installing'      = 'Installing'
+    'RebootRequired'  = 'RebootRequired'
+    'Rebooting'       = 'Rebooting'
+    'Verifying'       = 'Verifying'
+    'Complete'        = 'Complete'
+    'Timeout'         = 'Timeout'
+    'Error'           = 'Error'
+}
+
+function Get-WuuStateStatusText {
+    <#
+    .SYNOPSIS The canned human-readable Status sentence for a display State, plus an optional suffix.
+    .DESCRIPTION
+    One rule for the text the operator reads, so a state cannot be reported with two different
+    sentences from two different call sites. Read-only and side-effect free.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$State,
+        [string]$Detail = ''
+    )
+    $base = $script:WuuStateToStatus[$State]
+    if (-not $base) { $base = $State }
+    if ($Detail) { return "$base $Detail" }
+    return $base
+}
+
+function Test-WuuStateTransitionAllowed {
+    <#
+    .SYNOPSIS Whether a display State change is legal for a row (SS16 phase semantics).
+    .DESCRIPTION
+    THE RULE, stated once: a row that has SETTLED (Complete or Error) is terminal. Nothing may move it
+    out of a settled state except an explicit RESUBMISSION, which the caller expresses by starting a
+    new operation - and a new operation stamps a NEW OperationId, so the transition is then attributed
+    and permitted.
+
+    This is what stops the classes of defect the review named as undefined semantics:
+      * a late or superseded writer dragging a finished row back to 'Downloading' (it is refused on
+        identity before the state rule is even consulted - see Update-WuuOperationState)
+      * a CANCELLED operation being mistaken for a completed one: Cancel leaves 'Error', never
+        'Complete', so a cancelled target cannot be counted as success by Get-WuuAggregateOutcome
+      * a RETRY re-entering the workflow legitimately, because the retry is a new operation whose
+        'Queued' transition is attributed rather than anonymous
+
+    Returns a hashtable so the caller can report WHY, never a bare boolean:
+      Allowed [bool]   whether the change may proceed
+      Reason  [string] '' when allowed, else the refusal reason
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)][AllowNull()]$Row,
+        [Parameter(Mandatory)][string]$ToState,
+        [Parameter(Mandatory=$false)][AllowNull()][string]$OperationId = $null
+    )
+
+    $settled = @('Complete', 'Error')
+
+    if ($null -eq $Row) { return @{ Allowed = $false; Reason = 'no row' } }
+    if (-not $Row.PSObject.Properties['State']) { return @{ Allowed = $false; Reason = 'row has no State property' } }
+
+    $fromState = [string]$Row.State
+
+    # Any transition from a settled state requires a named operation to attribute it to.
+    #
+    # NOTE what is deliberately NOT checked here: that the operation id MATCHES the one already on
+    # the row. It cannot match - a resubmission is by definition a NEW operation, so the row still
+    # carries the OLD id and a match test would make every resubmission illegal (caught by
+    # tests\Test-WuuOperationState.ps1, which asserted the resubmission and failed). Staleness is
+    # already handled, and handled better, by the identity guard in Update-WuuOperationState: a
+    # writer presenting a SUPERSEDED id is refused there before this rule is consulted at all.
+    if ($settled -contains $fromState -and $settled -notcontains $ToState) {
+        if ([string]::IsNullOrEmpty($OperationId)) {
+            return @{ Allowed = $false; Reason = "a settled row ('$fromState') may not move to '$ToState' without a new attributed operation" }
+        }
+    }
+
+    return @{ Allowed = $true; Reason = '' }
+}
+
+function Update-WuuOperationState {
+    <#
+    .SYNOPSIS
+    THE SINGLE STATE-MUTATION FUNNEL (SS16). Validates identity and transition, then owns every write.
+    .DESCRIPTION
+    WHY THIS EXISTS. Before it, six different writers mutated a row's operation state: two guarded
+    row-writers and four unguarded state helpers, plus 46 direct `$Computer.<prop> = ...` assignments
+    in Wuu.Core that bypassed all of them. The invariant "a superseded operation cannot write" was
+    therefore only true of two of six producers - and it was asserted by a gate that looked for the
+    word OperationId in one file.
+
+    Identity is checked FIRST, before the transition rule, because a stale writer must be refused even
+    when the transition it wants would otherwise be legal. A refusal is an EXPECTED outcome of a
+    stopped or superseded operation, not a fault: callers must not treat Refused as an error.
+
+    NOTHING IS WRITTEN WHEN REFUSED. That is the whole contract - not "written then reverted", and not
+    "written to a copy". Tests assert the row is byte-identical after a refusal.
+
+    This is a PURE-ish function: it takes the row by reference and mutates only that row, plus the
+    optional store Touch(). It performs no lookups, so it is equally callable from the main session and
+    (via its inlined twin) from a worker runspace.
+
+    PARAMETERS
+      Row         the target row object. $null is a clean refusal.
+      OperationId the writer's identity. '' / $null means UNATTRIBUTED - permitted (list loading and
+                  startup populate rows that have no operation), which is why identity uses
+                  Test-WuuStaleWrite rather than Test-WuuOperationCurrent. See that function's note.
+      State       optional display State ('Checking', 'Error', ...). Drives Status and Color.
+      Status      optional literal Status text; overrides the canned text for $State.
+      StatusSuffix appended to the canned text for $State when Status is not given.
+      Color       optional literal colour; defaults to the colour implied by $State.
+      OpState     optional 'Idle' | 'Running' | 'Queued'.
+      OperationIdNew stamps a NEW operation id (starting or resubmitting an operation).
+      OpStartedAt sets OpStartedAt.
+      OpName      sets the operation NAME with no deadline change.
+      Phase       records a recoverable TIMEOUT: sets State='Timeout', the deadline and its source,
+                  and the colour. $TimeoutSec is required with it.
+      TimeoutSec  seconds from now for Phase.
+      ClearOperation ends the operation: OpState='Idle', clears the deadline, retires the identity
+                  and detaches the runspace. This is the copy-pasted 6-line cleanup block, once.
+      Heartbeat   when true, refreshes LastHeartbeatAt and increments Heartbeats.
+      Runspace    sets the runspace reference ($null to detach).
+      UpdatesStatus sets UpdatesStatus.
+      Revision    optional expected revision. When supplied and the row's Revision differs, the write
+                  is refused - an optimistic-concurrency check for callers that have a snapshot.
+      Touch       when true, calls $Store.Touch() after a successful write.
+      Store       the state store, needed only when Touch is set.
+      Now         injectable clock, so a test can assert a deadline without sleeping.
+
+    RETURNS a hashtable, never a bare boolean, because the caller needs to distinguish an expected
+    refusal from a successful write:
+      Applied [bool]   whether the row was mutated
+      Refused [bool]   whether the write was refused (stale identity, illegal transition, revision)
+      Reason  [string] '' when applied, else why it was refused
+    A caller that ignores Refused reproduces the original defect, so tests assert both the count of
+    refusals and the reason.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)][AllowNull()]$Row,
+        [Parameter(Mandatory=$false)][AllowNull()][string]$OperationId = $null,
+        [Parameter(Mandatory=$false)][string]$State = '',
+        [Parameter(Mandatory=$false)][string]$Status = '',
+        [Parameter(Mandatory=$false)][string]$StatusSuffix = '',
+        [Parameter(Mandatory=$false)][string]$Color = '',
+        [Parameter(Mandatory=$false)][switch]$ColorFromState,
+        [Parameter(Mandatory=$false)][string]$OpState = '',
+        [Parameter(Mandatory=$false)][string]$OperationIdNew = '',
+        [Parameter(Mandatory=$false)][AllowNull()]$OpStartedAt = $null,
+        [Parameter(Mandatory=$false)][string]$OpName = '',
+        [Parameter(Mandatory=$false)][string]$Phase = '',
+        [Parameter(Mandatory=$false)][int]$TimeoutSec = 0,
+        [Parameter(Mandatory=$false)][switch]$ClearOperation,
+        [Parameter(Mandatory=$false)][switch]$Heartbeat,
+        [Parameter(Mandatory=$false)][AllowNull()]$Runspace = $null,
+        [Parameter(Mandatory=$false)][string]$UpdatesStatus = '',
+        [Parameter(Mandatory=$false)][AllowNull()]$Revision = $null,
+        [Parameter(Mandatory=$false)][switch]$Touch,
+        [Parameter(Mandatory=$false)][AllowNull()]$Store = $null,
+        [Parameter(Mandatory=$false)][datetime]$Now = (Get-Date)
+    )
+
+    $refused = {
+        param([string]$Reason)
+        return @{ Applied = $false; Refused = $true; Reason = $Reason }
+    }
+
+    if ($null -eq $Row) { return (& $refused 'no row') }
+
+    # --- 1. IDENTITY, first ----------------------------------------------------------------
+    # Test-WuuStaleWrite, not Test-WuuOperationCurrent: a WRITE is refused only when it is PROVEN
+    # stale. An unattributed write is permitted, or list loading would be discarded.
+    #
+    # ADOPTION IS NOT STALENESS. Starting or resubmitting an operation means stamping an identity
+    # the row does not carry yet - by definition it differs from the old one. Running that through
+    # the stale-writer rule would refuse every resubmission (caught by this suite). Adoption is
+    # therefore a separate, EXPLICIT act: it is permitted only when no live operation owns the row,
+    # which is the same condition the admission gate (Test-WuuComputerBusy) already enforces. A
+    # late writer trying to adopt over a RUNNING operation is refused here.
+    $rowOpId = ''
+    if ($Row.PSObject.Properties['OperationId']) { $rowOpId = [string]$Row.OperationId }
+    $rowIsRunning = ($Row.PSObject.Properties['OpState'] -and ([string]$Row.OpState -eq 'Running'))
+
+    if ($OperationIdNew) {
+        if ($rowIsRunning -and $rowOpId -ne '' -and $rowOpId -cne $OperationIdNew) {
+            return (& $refused "cannot adopt '$OperationIdNew': the row is Running under '$rowOpId'")
+        }
+    } elseif (Test-WuuStaleWrite -Row $Row -OperationId $OperationId) {
+        return (& $refused "stale writer: row belongs to operation '$rowOpId', writer is '$OperationId'")
+    }
+
+    # --- 2. OPTIONAL REVISION PRECONDITION --------------------------------------------------
+    if ($null -ne $Revision -and $Row.PSObject.Properties['Revision']) {
+        if ([string]$Row.Revision -ne [string]$Revision) {
+            return (& $refused "revision changed: expected '$Revision', row is '$($Row.Revision)'")
+        }
+    }
+
+    # --- 3. TRANSITION LEGALITY -------------------------------------------------------------
+    # Only consulted when a display State is being set; a pure bookkeeping write (deadline,
+    # heartbeat) is not a transition and must not be gated by the settled rule.
+    if ($State) {
+        $legality = Test-WuuStateTransitionAllowed -Row $Row -ToState $State -OperationId $OperationId
+        if (-not $legality.Allowed) { return (& $refused $legality.Reason) }
+    }
+
+    # --- 4. APPLY ---------------------------------------------------------------------------
+    # A Phase IS a timeout, so it implies the Timeout display state when the caller did not name
+    # one. Resolved into LOCALS, never by reassigning $State / $TimeoutSec: those are parameters, and
+    # reassigning a parameter is both a documented hazard in this codebase and a gate failure (the
+    # gate caught an earlier version of this function that did `$State = 'Timeout'`).
+    $effState = $State
+    $effTimeout = $TimeoutSec
+    if ($Phase -and -not $effState) { $effState = 'Timeout' }
+    if ($Phase -and $effTimeout -le 0) {
+        # Defensive: a Phase with no budget would record a deadline in the past and the row would be
+        # judged expired on the next cleanup pass. Derive it from the operation instead.
+        $effTimeout = [int](Get-WuuOperationTimeoutSeconds -Op $Phase)
+    }
+
+    $set = {
+        param($Prop, $Value)
+        if ($Row.PSObject.Properties[$Prop]) { $Row.$Prop = $Value; return $true }
+        return $false
+    }
+
+    if ($OperationIdNew) { & $set 'OperationId' $OperationIdNew }
+
+    if ($effState) {
+        & $set 'State' $effState
+        if ($Status) {
+            & $set 'Status' $Status
+        } elseif ($Phase) {
+            # The timeout sentence, preserved verbatim from Set-ComputerTimeout. A timeout names what
+            # timed out and for how long, which the generic canned line cannot - and the operator
+            # needs that to tell a slow phase from a stuck one.
+            $detailSuffix = if ($StatusSuffix) { " $StatusSuffix" } else { '' }
+            & $set 'Status' "Timeout during $Phase after ${effTimeout}s - continuing to monitor.$detailSuffix"
+        } else {
+            & $set 'Status' (Get-WuuStateStatusText -State $effState -Detail $StatusSuffix)
+        }
+        if ($Color) {
+            & $set 'Color' $Color
+        } elseif ($ColorFromState) {
+            # Opt-in, NOT the default. Set-ComputerState must never change a row's colour, and making
+            # the implied colour automatic would have silently recoloured every row it touched - a
+            # behaviour change smuggled in by a refactor. Callers that want it ask for it.
+            $implied = $script:WuuStateToColor[$effState]
+            if ($implied) { & $set 'Color' $implied }
+        }
+        if ($Row.PSObject.Properties['StateTimestamp']) { $Row.StateTimestamp = $Now }
+    } elseif ($Status) {
+        # Literal status with no state change - used by the progress writers.
+        & $set 'Status' $Status
+    }
+
+    if ($OpState)       { & $set 'OpState' $OpState }
+    if ($null -ne $OpStartedAt) { & $set 'OpStartedAt' $OpStartedAt }
+    if ($OpName)        { & $set 'OpName' $OpName }
+    if ($UpdatesStatus) { & $set 'UpdatesStatus' $UpdatesStatus }
+    if ($null -ne $Runspace) { & $set 'Runspace' $Runspace }
+
+    if ($Phase) {
+        # A recoverable timeout: deadline + its source + the display state, in one place.
+        & $set 'TimeoutExpiresAt' $Now.AddSeconds($effTimeout)
+        & $set 'TimeoutSource' $Phase
+        & $set 'UpdatesStatus' 'Timeout'
+    }
+
+    if ($ClearOperation) {
+        # The copy-pasted cleanup block, once. Order matters only for readability; each set is
+        # independently guarded by the & $set helper.
+        & $set 'OpState' 'Idle'
+        & $set 'OpStartedAt' $null
+        & $set 'TimeoutExpiresAt' $null
+        & $set 'TimeoutSource' ''
+        & $set 'OpName' ''
+        & $set 'LastHeartbeatAt' $null
+        & $set 'OperationId' ''
+        & $set 'Runspace' $null
+
+        # A dangling recoverable-timeout DISPLAY must not outlive the deadline that made it
+        # meaningful: 'Timeout' with no deadline is the "hangs in yellow forever" defect the
+        # invariant checker reports, and the deadline is being cleared right here. Callers that want
+        # the operation's OUTCOME pass -State (as every former copy did: 'Error' for a failed row).
+        # Only the unreplaced Timeout display is resolved, to 'Queued' - the state a row with no
+        # operation is in, matching a freshly loaded row. An earlier version left this dangling and
+        # the suite's cleared-row invariant check caught it.
+        if (-not $effState -and $Row.PSObject.Properties['State'] -and ([string]$Row.State -eq 'Timeout')) {
+            & $set 'State' 'Queued'
+            & $set 'Status' (Get-WuuStateStatusText -State 'Queued')
+        }
+    }
+
+    if ($Heartbeat) {
+        if ($Row.PSObject.Properties['LastHeartbeatAt']) { $Row.LastHeartbeatAt = $Now }
+        if ($Row.PSObject.Properties['Heartbeats']) { $Row.Heartbeats = [int]$Row.Heartbeats + 1 }
+    }
+
+    if ($Touch -and $Store) {
+        try { $Store.Touch() } catch { }
+    }
+
+    return @{ Applied = $true; Refused = $false; Reason = '' }
+}
+
+function Test-WuuOperationStateInvariant {
+    <#
+    .SYNOPSIS
+    Checks the row contract's invariants and returns the VIOLATIONS found (SS16).
+    .DESCRIPTION
+    This exists so the invariant is assertable rather than merely intended, and so a gate can call it
+    against real rows instead of grepping for source text. Returns a list of violation strings - empty
+    means the row satisfies the contract. Never throws.
+
+    The invariants, each one a defect that was reachable before the transition layer:
+      1. No OperationId while running      - an operation is running, so a writer must be able to name
+                                             it. Without it the timeout path can be bypassed.
+      2. OperationId while Idle            - an identity outliving its operation lets a late writer
+                                             present a valid token for a job that no longer exists.
+      3. Deadline while no operation       - a stale deadline in the past kills the NEXT operation on
+                                             its first cleanup pass.
+      4. Timeout state without a deadline  - a Timeout display with no deadline means nothing will
+                                             ever settle the row: it hangs in yellow forever.
+      5. Settled plus PendingOp            - a follow-up queued on a finished row never runs.
+      6. Settled plus Running              - a finished operation must not hold the runspace lock.
+      7. TimeoutSource without deadline    - half-cleared timeout state.
+      8. Heartbeat count without a timestamp - counts nothing, tells a human nothing.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)][AllowNull()]$Row
+    )
+
+    $violations = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Row) { $violations.Add('row is $null'); return $violations }
+
+    $get = {
+        param([string]$Prop)
+        if ($Row.PSObject.Properties[$Prop]) { return $Row.$Prop }
+        return $null
+    }
+
+    $name  = [string](& $get 'Computer')
+    $state = [string](& $get 'State')
+    $opState = [string](& $get 'OpState')
+    $opId  = [string](& $get 'OperationId')
+    $expires = & $get 'TimeoutExpiresAt'
+    $source  = [string](& $get 'TimeoutSource')
+    $hbAt    = & $get 'LastHeartbeatAt'
+    $hbCount = & $get 'Heartbeats'
+    $pending = & $get 'Pending'
+    $pendingOp = [string](& $get 'PendingOp')
+    $tag = if ($name) { " [$name]" } else { '' }
+
+    $settled = @('Complete', 'Error')
+
+    if ($opState -eq 'Running' -and [string]::IsNullOrEmpty($opId)) {
+        $violations.Add("$tag running OpState with no OperationId - a writer cannot prove ownership")
+    }
+    if ($opState -eq 'Idle' -and -not [string]::IsNullOrEmpty($opId)) {
+        $violations.Add("$tag OperationId '$opId' survives an Idle row - a late writer could present a valid token")
+    }
+    if ($opState -eq 'Idle' -and $null -ne $expires) {
+        $violations.Add("$tag a deadline is recorded while no operation is running - the next operation would be judged expired immediately")
+    }
+    if ($state -eq 'Timeout' -and $null -eq $expires) {
+        $violations.Add("$tag State='Timeout' with no deadline - nothing can settle this row")
+    }
+    if ($settled -contains $state -and $pendingOp) {
+        $violations.Add("$tag settled row ('$state') still queues PendingOp '$pendingOp' - the follow-up cannot run")
+    }
+    if ($settled -contains $state -and $opState -eq 'Running') {
+        $violations.Add("$tag settled row ('$state') still holds the runspace lock (OpState='Running')")
+    }
+    if (-not [string]::IsNullOrEmpty($source) -and $null -eq $expires) {
+        $violations.Add("$tag TimeoutSource '$source' is set but the deadline is empty - half-cleared timeout state")
+    }
+    if ($null -ne $hbCount -and ([int]$hbCount -gt 0) -and $null -eq $hbAt) {
+        $violations.Add("$tag Heartbeats=$hbCount but LastHeartbeatAt is empty")
+    }
+
+    return $violations
+}
+
+#endregion Operation transition layer
+
 function Set-WuuComputerRowColor {
     <#
     .SYNOPSIS
@@ -1174,6 +1591,12 @@ Export-ModuleMember -Function @(
     'New-WuuOperationId'
     'Test-WuuOperationCurrent'
     'Test-WuuStaleWrite'
+    # SS16: the single state-mutation funnel. Exported because mutation happens from the main session
+    # (Wuu.Core handlers, the cleanup loop) and must be reachable wherever a row is written.
+    'Update-WuuOperationState'
+    'Test-WuuStateTransitionAllowed'
+    'Test-WuuOperationStateInvariant'
+    'Get-WuuStateStatusText'
     'Test-WuuPhaseFailureBlocks'
     'Set-WuuPhaseFailurePolicy'
     'Update-WuuConnectivityState'
