@@ -80,46 +80,23 @@ function New-ComputerRunspace {
             
             $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
             $logEntry = "[$timestamp] [$Level]$(if($Computer){" [$Computer]"}) $Message"
-            # Fault-tolerant append with retry: OneDrive/sync engines transiently lock
-            # the log mid-write ("Stream was not readable" in PS 5.1). Logging must
-            # never throw into a worker payload - retry, then give up silently.
-            $maxAttempts = 3
-            for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-                $lockTaken = $false
-                try {
-                    [System.Threading.Monitor]::Enter($LogLock); $lockTaken = $true
-                    Add-Content -Path $LogPath -Value $logEntry -Force
-                    break
-                } catch {
-                    if ($attempt -ge $maxAttempts) { return }   # give up silently
-                    Start-Sleep -Milliseconds (100 * $attempt)
-                } finally {
-                    if ($lockTaken) { [System.Threading.Monitor]::Exit($LogLock) }
-                }
-            }
+            # APPEND VIA THE SHARED APPENDER, not an inlined retry loop. This block used to carry its own
+            # copy of the loop, which made FOUR copies in src/ - Wuu.Logging, the cleanup runspace, the
+            # per-computer runspace, and this one - each annotated "keep in sync". There is now one.
+            # WriteLogFileScript is injected into this runspace before this block runs, and resolves at
+            # INVOKE time rather than define time, so the ordering of the two SetVariable calls is safe.
+            & $WriteLogFileScript -LogEntry $logEntry
         }.ToString()))
         
         # Fault-tolerant append for PRE-FORMATTED log lines (worker payload copy).
         # Worker payloads build "$logEntry" inline then call this instead of raw
         # Add-Content: same lock+retry semantics as WriteDebugLogScript, but takes
         # the finished line so payload format strings stay unchanged.
-        $newRunspace.SessionStateProxy.SetVariable('WriteLogFileScript', [scriptblock]::Create({
-            param([string]$LogEntry)
-            $maxAttempts = 3
-            for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-                $lockTaken = $false
-                try {
-                    [System.Threading.Monitor]::Enter($LogLock); $lockTaken = $true
-                    Add-Content -Path $LogPath -Value $LogEntry -Force
-                    break
-                } catch {
-                    if ($attempt -ge $maxAttempts) { return }   # give up silently
-                    Start-Sleep -Milliseconds (100 * $attempt)
-                } finally {
-                    if ($lockTaken) { [System.Threading.Monitor]::Exit($LogLock) }
-                }
-            }
-        }.ToString()))
+        #
+        # BUILT BY A FACTORY, not written here: this block was previously duplicated from Wuu.Core's
+        # cleanup runspace, with a comment in each copy telling the reader to keep them in sync. Both
+        # now call Get-WuuWorkerLogAppender (Wuu.Scheduler), so the two worker kinds cannot diverge.
+        $newRunspace.SessionStateProxy.SetVariable('WriteLogFileScript', (Get-WuuWorkerLogAppender))
         
         # Row-update helper for worker runspaces. Writes a computer ROW into the synchronized state
         # store and signals a redraw. RENAMED from `SafeUpdateListViewItemScript` for the same reason

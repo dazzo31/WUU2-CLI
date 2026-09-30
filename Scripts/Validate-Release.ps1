@@ -2339,5 +2339,63 @@ if (-not (Test-Path -LiteralPath $catchAuditPath)) {
     }
 }
 
+# (ar) ONE LOG APPENDER (reviewer P2: "reduce duplicated worker scriptblocks"). The fault-tolerant
+#      lock-and-retry append was written FOUR times - Wuu.Logging's Write-WuuLogEntry, Wuu.Core's cleanup
+#      runspace, Wuu.WindowsUpdate's per-computer runspace, and inline inside WriteDebugLogScript - each
+#      with a comment telling the reader to keep them in step. Two copies of a retry loop is exactly the
+#      arrangement that drifts, and the drift would be silent (a payload that logs in one runspace and
+#      not another). They are now one factory, so agreement is structural.
+$distinctiveRetry = 'Start-Sleep -Milliseconds (100 * $attempt)'
+$retryOutsideFactory = @()
+foreach ($rf in Get-ChildItem (Join-Path $root 'src\*.psm1') | Sort-Object Name) {
+    $rfLines = [System.IO.File]::ReadAllLines($rf.FullName)
+    $inFactory = $false
+    for ($ri = 0; $ri -lt $rfLines.Count; $ri++) {
+        # The factory's DEFINITION line does not start at column 0 in every module, so it is matched
+        # without the anchor. Only the TERMINATOR is anchored: an earlier version cleared the flag on the
+        # call site `$newRunspace.SessionStateProxy.SetVariable('WriteLogFileScript', (Get-WuuWorker...))`,
+        # whose line starts with `$` rather than `function`, so the factory's own loop was then counted
+        # as being OUTSIDE the factory.
+        if ($rfLines[$ri] -match 'Get-WuuWorkerLogAppender\s*\{') { $inFactory = $true }
+        if ($ri -gt 0 -and $rfLines[$ri] -match '^function\s+' -and $rfLines[$ri] -notmatch 'Get-WuuWorkerLogAppender') { $inFactory = $false }
+        if ($rfLines[$ri].Contains($distinctiveRetry) -and -not $inFactory) {
+            $retryOutsideFactory += "$($rf.Name):L$($ri+1)"
+        }
+    }
+}
+
+if ($retryOutsideFactory.Count -gt 0) {
+    Fail ("$($retryOutsideFactory.Count) module(s) still carry their own copy of the log retry loop: " + ($retryOutsideFactory -join ', ') + ' (P2)')
+} elseif ($stateRawA -and $false) { } else {
+    # The factory must exist, be exported from Wuu.LOGGING (logging owns logging), and be USED at every
+    # former copy site. Export location matters: Write-WuuLogEntry delegates to it, and three suites
+    # import Wuu.Logging on its own - placing it in Wuu.Scheduler made logging depend on the scheduler
+    # and broke those imports.
+    $loggingRawAR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Logging.psm1') -Raw
+    $coreRawAR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+    $wupdRawAR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+    if ($loggingRawAR -notmatch 'function Get-WuuWorkerLogAppender') {
+        Fail 'the log appender factory does not live in Wuu.Logging - logging would have to depend on another module to log (P2)'
+    } elseif ($loggingRawAR -notmatch "'Get-WuuWorkerLogAppender'") {
+        Fail 'the log appender factory is not exported from Wuu.Logging (P2)'
+    } elseif ($coreRawAR -notmatch '\(Get-WuuWorkerLogAppender\)' -or $wupdRawAR -notmatch '\(Get-WuuWorkerLogAppender\)') {
+        Fail 'a worker runspace does not use the shared log appender (P2)'
+    } elseif ($wupdRawAR -notmatch '&\s+\$WriteLogFileScript\s+-LogEntry') {
+        Fail 'WriteDebugLogScript does not delegate to the injected appender - it kept its own retry loop (P2)'
+    } else {
+        Pass 'one log appender exists in Wuu.Logging and is used by every former copy site (P2)'
+    }
+}
+
+# Wuu.Scheduler must exist and be registered, or the injected helper set has no home - and a module that
+# is not imported is a module whose helpers silently fail to inject.
+if (-not (Test-Path -LiteralPath (Join-Path $root 'src\Wuu.Scheduler.psm1'))) {
+    Fail 'src\Wuu.Scheduler.psm1 is missing - the worker helper surface has no single home (P2)'
+} elseif ($coreRawAR -notmatch "'Wuu\.Scheduler'") {
+    Fail 'Wuu.Scheduler is not in the import list - nothing would wire the worker helper set (P2)'
+} else {
+    Pass 'Wuu.Scheduler exists and is imported (P2)'
+}
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

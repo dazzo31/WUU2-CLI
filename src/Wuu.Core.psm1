@@ -11,12 +11,16 @@ function Import-WuuModules {
     # startup and tests/Test-PendingDrain.ps1 use this single import path.
     param([Parameter(Mandatory)][string]$WuuRoot)
     # Wuu.State first: Wuu.Core's startup creates the state store via New-WuuStateStore, and
-    # worker runspaces receive it. Wuu.Console is the presentation layer; Wuu.Command the
+    # worker runspaces receive it. Wuu.Logging next because it owns the single log appender
+    # (Get-WuuWorkerLogAppender) that Wuu.Scheduler injects into workers and that the cleanup and
+    # per-computer runspaces both call. Wuu.Scheduler follows: it wires a runspace's helper set from
+    # that appender. All are -Global, so the order is for readability and for the one real constraint
+    # (nothing may be CALLED before it is imported).
+    # Wuu.Console is the presentation layer; Wuu.Command the
     # scriptable verb layer; Wuu.Audit the tamper-evident trail. Wuu.Session models the computer
     # set as a first-class object and Wuu.Navigate owns the guided interactive workflow - both sit
-    # ABOVE the engine and only read/delegate to it. Order otherwise matters only for readability
-    # - all -Global.
-    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Session','Wuu.Audit','Wuu.Command','Wuu.Navigate')) {
+    # ABOVE the engine and only read/delegate to it.
+    foreach ($m in @('Wuu.State','Wuu.Logging','Wuu.Scheduler','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Session','Wuu.Audit','Wuu.Command','Wuu.Navigate')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
@@ -2376,25 +2380,12 @@ $newRunspace.SessionStateProxy.SetVariable('backgroundProcessing',$backgroundPro
 #     .ToString() of a literal    -> binds correctly (which is why the log block already worked)
 $newRunspace.SessionStateProxy.SetVariable('OperationTimeoutSeconds',$global:OperationTimeoutSeconds)
 $newRunspace.SessionStateProxy.SetVariable('OperationHeartbeatSeconds',$global:OperationHeartbeatSeconds)
-# Fault-tolerant log append for the cleanup loop (same lock+retry semantics
-# as WriteWuuLogEntry; takes pre-formatted lines - see Wuu.Logging.psm1)
-$newRunspace.SessionStateProxy.SetVariable('WriteLogFileScript', [scriptblock]::Create({
-    param([string]$LogEntry)
-    $maxAttempts = 3
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        $lockTaken = $false
-        try {
-            [System.Threading.Monitor]::Enter($LogLock); $lockTaken = $true
-            Add-Content -Path $LogPath -Value $LogEntry -Force
-            break
-        } catch {
-            if ($attempt -ge $maxAttempts) { return }   # give up silently
-            Start-Sleep -Milliseconds (100 * $attempt)
-        } finally {
-            if ($lockTaken) { [System.Threading.Monitor]::Exit($LogLock) }
-        }
-    }
-}.ToString()))
+# Fault-tolerant log append for the cleanup loop. BUILT BY A FACTORY, not written here: the identical
+# block was previously written in this module AND in Wuu.WindowsUpdate for the per-computer runspaces,
+# with a comment in each telling the reader to keep them in sync. New-WuuSubmissionRunspace and this
+# function now both call Get-WuuWorkerLogAppender (Wuu.Scheduler), so the two runspaces cannot diverge -
+# the agreement is structural rather than a discipline. Takes pre-formatted lines.
+$newRunspace.SessionStateProxy.SetVariable('WriteLogFileScript', (Get-WuuWorkerLogAppender))
 $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
     #Routine to handle completed runspaces
     Do {
