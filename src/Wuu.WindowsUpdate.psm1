@@ -568,7 +568,11 @@ function Start-UpdateCheckJob {
         # the next tick, and the auto-flow chain sets Pending so it is picked up after the current
         # operation finishes. Logged at INFO so a run can be reconstructed without guessing.
         if (Test-WuuComputerBusy -Row $ComputerItem) {
-            Write-InfoLog "[$($ComputerItem.Computer)] submission refused: an operation is already $($ComputerItem.OpState) (op=$Op) - it stays queued for the next scheduler tick"
+            # PHASE 5: record the refusal. It is NOT an error - the operation never started and the
+            # computer is undamaged - but without a record the row is indistinguishable from one
+            # waiting its turn, so a permanent refusal stalls the phase silently.
+            $refusal = Update-WuuRefusalRecord -Row $ComputerItem -Reason "computer is $($ComputerItem.OpState)"
+            Write-InfoLog "[$($ComputerItem.Computer)] submission refused: an operation is already $($ComputerItem.OpState) (op=$Op) - it stays queued for the next scheduler tick (refusal $($refusal.Count))"
             return $false
         }
 
@@ -593,7 +597,10 @@ function Start-UpdateCheckJob {
         # cheap and it defers work early; the AUTHORITATIVE test is taken under the submission lock
         # immediately before the append (see the reservation block below).
         if (-not (Test-WuuConcurrencyAvailable -Jobs $jobs -MaxConcurrentJobs $MaxConcurrentJobs)) {
-            Write-InfoLog "[$($ComputerItem.Computer)] submission deferred: global concurrency cap reached ($($jobs.Count)/$MaxConcurrentJobs in flight, op=$Op) - it stays queued for the next scheduler tick"
+            # PHASE 5: a cap refusal is the most likely kind to be TRANSIENT (the estate is full right
+            # now), and the count is what lets the gate tell a queue that is moving from one that is not.
+            $refusal = Update-WuuRefusalRecord -Row $ComputerItem -Reason 'global concurrency cap reached'
+            Write-InfoLog "[$($ComputerItem.Computer)] submission deferred: global concurrency cap reached ($($jobs.Count)/$MaxConcurrentJobs in flight, op=$Op) - it stays queued for the next scheduler tick (refusal $($refusal.Count))"
             return $false
         }
 
@@ -700,7 +707,13 @@ function Start-UpdateCheckJob {
         if (-not $claim.Applied) {
             # Refused: the row is owned by a live operation. This is a normal outcome, not an error -
             # the caller leaves the row pending and the scheduler retries on a later tick.
-            Write-InfoLog "[$($ComputerItem.Computer)] submission refused: $($claim.Reason) (op=$Op)"
+            #
+            # PHASE 5: recorded like every other refusal. This path is DEFENSIVE (Test-WuuComputerBusy
+            # above should already have refused), which is exactly why it must still record: a refusal
+            # path that forgets to record leaves a row Pending with nothing saying why, which is the
+            # silent stall this phase exists to remove. The suite counts it - it found this omission.
+            $refusal = Update-WuuRefusalRecord -Row $ComputerItem -Reason "claim refused: $($claim.Reason)"
+            Write-InfoLog "[$($ComputerItem.Computer)] submission refused: $($claim.Reason) (op=$Op) - it stays queued for the next scheduler tick (refusal $($refusal.Count))"
             return $false
         }
 
@@ -750,7 +763,8 @@ function Start-UpdateCheckJob {
             $lockTaken = Enter-WuuSubmissionLock
             if (-not $lockTaken) {
                 # Treated exactly like "no capacity": recoverable, and the scheduler retries.
-                Write-WarningLog "[$($ComputerItem.Computer)] submission refused: could not acquire the submission lock within the timeout (op=$Op) - it stays queued for the next scheduler tick"
+                $refusal = Update-WuuRefusalRecord -Row $ComputerItem -Reason 'submission lock not acquirable'
+                Write-WarningLog "[$($ComputerItem.Computer)] submission refused: could not acquire the submission lock within the timeout (op=$Op) - it stays queued for the next scheduler tick (refusal $($refusal.Count))"
                 & $rollback
                 return $false
             }
@@ -758,7 +772,8 @@ function Start-UpdateCheckJob {
             # THE AUTHORITATIVE CAP TEST, under the lock. The advisory check near the top of this
             # function may have passed a long time ago; this is the one that decides.
             if (-not (Test-WuuConcurrencyAvailable -Jobs $jobs -MaxConcurrentJobs $MaxConcurrentJobs)) {
-                Write-InfoLog "[$($ComputerItem.Computer)] submission deferred at reservation: global concurrency cap reached ($($jobs.Count)/$MaxConcurrentJobs in flight, op=$Op) - it stays queued for the next scheduler tick"
+                $refusal = Update-WuuRefusalRecord -Row $ComputerItem -Reason 'global concurrency cap reached (at reservation)'
+                Write-InfoLog "[$($ComputerItem.Computer)] submission deferred at reservation: global concurrency cap reached ($($jobs.Count)/$MaxConcurrentJobs in flight, op=$Op) - it stays queued for the next scheduler tick (refusal $($refusal.Count))"
                 & $rollback
                 return $false
             }
@@ -779,6 +794,10 @@ function Start-UpdateCheckJob {
 
             $jobs.Add($temp) | Out-Null
             $reserved = $true
+            # PHASE 5: admission CLEARS the refusal record. An operation that got in has made progress,
+            # so only CONSECUTIVE refusals indicate a stall - a refusal interleaved with progress is
+            # ordinary contention and must not accumulate towards the stall threshold.
+            $null = Update-WuuRefusalRecord -Row $ComputerItem -Admitted
         } finally {
             if ($lockTaken) { Exit-WuuSubmissionLock }
         }
@@ -978,6 +997,21 @@ function Test-PhaseCompletion {
 
         # Not yet checked (queued for the job scheduler)
         if ($computer.Pending) {
+            # PHASE 5: REFUSAL SEMANTICS. A queued row normally means "waiting its turn" and the phase
+            # correctly waits. But a row that has been REFUSED every tick is not waiting - it is
+            # STALLED, and before this it was indistinguishable from progress: a computer that can
+            # never be admitted kept the phase from advancing FOR EVER with nothing said anywhere.
+            #
+            # This does NOT reclassify the row as failed. A refusal is a distinct third outcome: the
+            # operation never started and retrying is still the right answer, so blocking here is a
+            # report, not a verdict. The row keeps Pending=$true and the scheduler keeps retrying; the
+            # difference is that the gate now STOPS and the reason is in the log, which is what turns
+            # a silent hang into an actionable condition.
+            $stall = Test-WuuRefusalStalled -Row $computer
+            if ($stall.Stalled) {
+                Write-WarningLog "Phase gate: '$($computer.Computer)' has been refused $($stall.Count) consecutive time(s) in $Phase (threshold $($stall.Threshold)) - last reason: '$($stall.Reason)'. It is STALLED, not waiting: the phase will not advance while its queue cannot be admitted."
+                return $false
+            }
             return $false
         }
 

@@ -160,6 +160,19 @@ function New-WuuComputerRow {
         Heartbeats      = 0
         RetryCount      = 0
         RetryAt         = $null
+        # SS16/PHASE 5: REFUSAL RECORDING. A submission can be refused (busy computer, global cap
+        # reached, lock not acquirable) and a refusal is currently INVISIBLE to the phase gate: it is
+        # not an Error and not a Timeout, so Test-WuuPhaseFailureBlocks does not see it, and the row
+        # keeps Pending=$true for ever. The phase then never advances and nothing anywhere says why -
+        # a permanent silent stall in a multi-phase rollout.
+        #
+        # RefusedCount counts consecutive refusals for the CURRENT queued operation (reset when the
+        # operation is admitted), RefusedReason says what the last refusal was, and RefusedAt is when
+        # it happened. Together they let the phase gate distinguish "still working through the queue"
+        # from "this computer has been refused N times and is not making progress".
+        RefusedCount    = 0
+        RefusedReason   = ''
+        RefusedAt       = $null
         # Presentation colour name. This is what Format-WuuTable maps to a console colour, and what
         # makes timeout distinguishable from a terminal error.
         Color           = 'Default'
@@ -1534,8 +1547,114 @@ function Test-WuuPhaseFailureBlocks {
     }
 }
 
-function Set-WuuPhaseFailurePolicy {
+# The number of consecutive refusals after which a queued operation is treated as STALLED rather than
+# merely waiting. Chosen so a transient condition (a busy estate, a full cap that frees up) has many
+# chances to clear - the scheduler ticks about once a second, and a refusal normally clears within one
+# or two ticks - while a permanent one (a computer that can never be admitted) surfaces within about
+# a minute instead of never.
+$script:WuuRefusalStallThreshold = 60
+
+function Update-WuuRefusalRecord {
     <#
+    .SYNOPSIS
+    Records that a submission was REFUSED, or clears the record when one is admitted (PHASE 5/SS16).
+    .DESCRIPTION
+    WHY A REFUSAL NEEDS RECORDING AT ALL. Before this, a refused submission returned $false and the
+    row kept Pending=$true. Nothing on the row changed, so:
+      * the phase gate saw only "Pending" and waited - correctly, for a queue that is moving;
+      * nothing distinguished a queue that is moving from a computer that can NEVER be admitted;
+      * an operator had no way to tell "waiting its turn" from "stuck", because both look identical.
+
+    THE FAILURE MODE THIS CLOSES is a PERMANENT SILENT STALL: a computer refused every tick (a row
+    whose runspace can never be built, a computer that stays busy) keeps the whole phase from
+    advancing for ever, with the phase gate reporting nothing and the audit trail recording nothing.
+
+    A refusal is NOT an error. The operation never started, the computer is undamaged, and retrying is
+    the right response - which is exactly why it must not be reported as a failure. It is a distinct
+    third outcome, and this function is where it is recorded so the gate can act on it without
+    conflating it with Error.
+
+    -Admitted clears the record: an operation that got in has made progress, so the consecutive count
+    restarts. Only CONSECUTIVE refusals indicate a stall; a refusal interleaved with progress is
+    ordinary contention.
+
+    Returns the record so a caller can log it without re-reading the row.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)][AllowNull()]$Row,
+        [Parameter(Mandatory=$false)][string]$Reason = '',
+        [Parameter(Mandatory=$false)][switch]$Admitted,
+        [Parameter(Mandatory=$false)][datetime]$Now = (Get-Date)
+    )
+
+    if ($null -eq $Row) { return $null }
+
+    if ($Admitted) {
+        if ($Row.PSObject.Properties['RefusedCount'])  { $Row.RefusedCount = 0 }
+        if ($Row.PSObject.Properties['RefusedReason']) { $Row.RefusedReason = '' }
+        if ($Row.PSObject.Properties['RefusedAt'])     { $Row.RefusedAt = $null }
+        return @{ Count = 0; Reason = ''; At = $null; Stalled = $false }
+    }
+
+    $count = 0
+    if ($Row.PSObject.Properties['RefusedCount']) { $count = [int]$Row.RefusedCount + 1 }
+    if ($Row.PSObject.Properties['RefusedCount'])  { $Row.RefusedCount = $count }
+    if ($Row.PSObject.Properties['RefusedReason']) { $Row.RefusedReason = $Reason }
+    if ($Row.PSObject.Properties['RefusedAt'])     { $Row.RefusedAt = $Now }
+
+    return @{
+        Count   = $count
+        Reason  = $Reason
+        At      = $Now
+        Stalled = ($count -ge $script:WuuRefusalStallThreshold)
+    }
+}
+
+function Get-WuuRefusalStallThreshold {
+    <#
+    .SYNOPSIS The consecutive-refusal count at which a queued operation is treated as stalled (PHASE 5).
+    .DESCRIPTION
+    Exposed as a function rather than read as a variable so the value cannot be silently retyped at a
+    call site, and so a test can assert the gate and the recorder agree on ONE threshold.
+    #>
+    [CmdletBinding()]
+    param()
+    return $script:WuuRefusalStallThreshold
+}
+
+function Test-WuuRefusalStalled {
+    <#
+    .SYNOPSIS Whether a queued row has been refused so many times that it is stalled, not waiting (PHASE 5).
+    .DESCRIPTION
+    The predicate the phase gate uses. Returns a hashtable rather than a boolean because the caller
+    must be able to SAY WHY a phase is blocked - "N consecutive refusals, last reason X" is actionable;
+    "the phase did not advance" is not.
+
+    A null or fresh row is never stalled: with no refusal recorded there is no evidence of a stall, and
+    treating absent evidence as a stall would block every phase the moment it started.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)][AllowNull()]$Row
+    )
+
+    if ($null -eq $Row) { return @{ Stalled = $false; Count = 0; Reason = ''; Threshold = $script:WuuRefusalStallThreshold } }
+
+    $count = 0
+    if ($Row.PSObject.Properties['RefusedCount']) { $count = [int]$Row.RefusedCount }
+    $reason = ''
+    if ($Row.PSObject.Properties['RefusedReason']) { $reason = [string]$Row.RefusedReason }
+
+    return @{
+        Stalled   = ($count -ge $script:WuuRefusalStallThreshold)
+        Count     = $count
+        Reason    = $reason
+        Threshold = $script:WuuRefusalStallThreshold
+    }
+}
+
+function Set-WuuPhaseFailurePolicy {    <#
     .SYNOPSIS Sets the phase failure policy with validation (SS9).
     .DESCRIPTION
     Separate from Set-WuuSetting because that function's ValidateSet is boolean settings; keeping the
@@ -1708,6 +1827,12 @@ Export-ModuleMember -Function @(
     'Enter-WuuSubmissionLock'
     'Exit-WuuSubmissionLock'
     'Test-WuuSubmissionLockHeld'
+    # PHASE 5: refusal semantics. Exported because the RECORDING happens at the submission point
+    # (Wuu.WindowsUpdate) and the DECISION happens in the phase gate (the same module), and a test must
+    # be able to drive both without a store or a network.
+    'Update-WuuRefusalRecord'
+    'Test-WuuRefusalStalled'
+    'Get-WuuRefusalStallThreshold'
     'Test-WuuPhaseFailureBlocks'
     'Set-WuuPhaseFailurePolicy'
     'Update-WuuConnectivityState'

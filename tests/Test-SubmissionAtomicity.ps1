@@ -231,6 +231,29 @@ Assert-True ($rbBody -ne '') 'the rollback block was located'
 Assert-True ($rbBody.Contains('Update-WuuOperationState')) 'the rollback goes through the funnel'
 Assert-True ($rbBody.Contains('-ClearOperation')) 'the rollback uses ClearOperation, which also retires the identity'
 
+# EVERY refusal inside the critical section must CALL the rollback. Asserting only the body was a real
+# gap: deleting a refusal's `& $rollback` line leaves the body intact, so the earlier version of this
+# section passed on a tree where a refusal stranded the row as Running for ever. Found by the tautology
+# harness (the gate caught it via its pairing count; this suite did not).
+$secStart = $sub.IndexOf('Enter-WuuSubmissionLock')
+$secEnd = $sub.LastIndexOf('Exit-WuuSubmissionLock')
+$section = ''
+if ($secStart -ge 0 -and $secEnd -gt $secStart) { $section = $sub.Substring($secStart, $secEnd - $secStart) }
+Assert-True ($section -ne '') 'the critical section was located'
+$sectionRefusals = ([regex]::Matches($section, 'return\s+\$false')).Count
+$sectionRollbacks = ([regex]::Matches($section, '&\s+\$rollback')).Count
+Assert-True ($sectionRefusals -ge 1) "the critical section can refuse a reservation ($sectionRefusals refusal path(s))"
+Assert-Equal $sectionRollbacks $sectionRefusals "every refusal in the critical section rolls the claim back ($sectionRollbacks rollback(s) for $sectionRefusals refusal(s))"
+
+# The section must ACT on the capacity test, not merely run it. A call in an `if` BODY rather than its
+# condition satisfies plain ordering checks while ignoring the result.
+$capInSection = $section.LastIndexOf('Test-WuuConcurrencyAvailable')
+$addInSection = $section.LastIndexOf('$jobs.Add')
+Assert-True ($capInSection -ge 0) 'the capacity test is inside the critical section'
+Assert-True ($capInSection -lt $addInSection) 'the capacity test precedes the append inside the section'
+$between = $section.Substring($capInSection, $addInSection - $capInSection)
+Assert-True ($between -match 'return\s+\$false') 'the capacity test result is acted on before the append'
+
 ''
 if ($failures.Count -eq 0) {
     Write-Host "ALL PASSED" -ForegroundColor Green

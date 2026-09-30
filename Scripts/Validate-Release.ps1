@@ -2131,7 +2131,26 @@ if (-not $subText) {
     } elseif ($addAt -gt $exitAt) {
         Fail 'the slot is appended OUTSIDE the critical section - the test and the append are not atomic (P1)'
     } else {
-        Pass 'the capacity test and the slot append are one indivisible step under the submission lock (P1)'
+        # ORDERING ALONE IS NOT ENOUGH, and this is a real hole rather than a hypothetical one: a call
+        # written inside the `if` BODY instead of its condition satisfies every ordering test above
+        # while ignoring the result - `if (...) { Test-WuuConcurrencyAvailable ... }` still runs the
+        # test, still refuses nothing, and still appends. So the section is also required to CONTAIN A
+        # REFUSAL, and the refusal must come after the test and before the append.
+        $section = $subCode.Substring($acqAt, $exitAt - $acqAt)
+        $sectionRefusals = ([regex]::Matches($section, 'return\s+\$false')).Count
+        $sectionRollbacks = ([regex]::Matches($section, '&\s+\$rollback')).Count
+        $testToAdd = $section.Substring($section.LastIndexOf('Test-WuuConcurrencyAvailable'),
+                                        $section.LastIndexOf('$jobs.Add') - $section.LastIndexOf('Test-WuuConcurrencyAvailable'))
+
+        if ($sectionRefusals -lt 1) {
+            Fail 'the critical section cannot REFUSE - the capacity test result is not acted on, so the reservation always succeeds (P1)'
+        } elseif ($testToAdd -notmatch 'return\s+\$false') {
+            Fail 'the capacity test inside the critical section is followed by no refusal before the append - a full cap would still reserve (P1)'
+        } elseif ($sectionRollbacks -lt $sectionRefusals) {
+            Fail "the critical section has $sectionRefusals refusal path(s) but only $sectionRollbacks rollback(s) - a refusal would leave the row claimed and Running for ever (P1)"
+        } else {
+            Pass 'the capacity test and the slot append are one indivisible step under the submission lock, and every refusal in that section rolls the claim back (P1)'
+        }
     }
 }
 
@@ -2163,6 +2182,72 @@ if ($subCode -notmatch 'rollback') {
     Fail 'a failed reservation does not roll back the operation claim - no cleanup pass would ever settle that row (P1)'
 } else {
     Pass 'a failed reservation rolls back the claim through the funnel, so no row is left permanently busy (P1)'
+}
+
+# (ap) REFUSAL SEMANTICS (reviewer P1: "define cancellation/refusal phase semantics"). A refusal is
+#      neither an Error nor a Timeout, so Test-WuuPhaseFailureBlocks never saw it and NOTHING recorded
+#      it - a refused submission left Pending=$true and the phase gate waited for ever, unable to tell
+#      a moving queue from a computer that can never be admitted. That is a permanent silent stall.
+$subTextP = Get-WuuFunctionBody $wupdRawO 'Start-UpdateCheckJob'
+$subCodeP = Get-WuuTextWithoutComments -Text $subTextP
+
+if ($stateRawO -notmatch "RefusedCount") {
+    Fail 'the row contract has no refusal record - a refused submission is invisible to the phase gate (P1)'
+} elseif ($stateRawO -notmatch 'function Update-WuuRefusalRecord') {
+    Fail 'there is no recorder for refusals (P1)'
+} elseif ($stateRawO -notmatch 'function Test-WuuRefusalStalled') {
+    Fail 'there is no stall predicate - the phase gate cannot distinguish "waiting" from "stalled" (P1)'
+} else {
+    Pass 'refusals are recorded and stallable (P1)'
+}
+
+# The threshold must have ONE home. A gate that re-derives its own number would let the recorder call a
+# row stalled while the gate waits, or the reverse.
+if ($stateRawO -notmatch 'function Get-WuuRefusalStallThreshold') {
+    Fail 'the stall threshold is not exposed by a function, so callers could retype it (P1)'
+} elseif ($wupdRawO -match 'RefusedCount\s*-ge\s*\d') {
+    Fail 'the phase gate hard-codes its own refusal threshold instead of asking for the shared value (P1)'
+} else {
+    Pass 'the stall threshold has a single home (P1)'
+}
+
+# Every REFUSAL path must record, and the gate must BRANCH on the stall result.
+if ($subCodeP) {
+    $refusalKinds = @()
+    foreach ($m in @('submission refused', 'submission deferred')) { if ($subCodeP.Contains($m)) { $refusalKinds += $m } }
+    $unrecorded = @()
+    foreach ($m in $refusalKinds) {
+        $i = $subCodeP.IndexOf($m)
+        $lo = [Math]::Max(0, $i - 700)
+        if (-not $subCodeP.Substring($lo, $i - $lo).Contains('Update-WuuRefusalRecord')) { $unrecorded += $m }
+    }
+    if ($unrecorded.Count -gt 0) {
+        Fail ("these refusal paths do not record the refusal: " + ($unrecorded -join '; ') + ' (P1)')
+    } elseif ($subCodeP -notmatch 'Update-WuuRefusalRecord\s+-Row\s+\$ComputerItem\s+-Admitted') {
+        Fail 'admission does not clear the refusal record, so only LIFETIME refusals are counted rather than consecutive (P1)'
+    } else {
+        Pass 'every refusal path records, and admission clears the record (P1)'
+    }
+} else {
+    Fail 'could not extract Start-UpdateCheckJob for the refusal check'
+}
+
+# The gate must BRANCH on the stall, and report why. Computing a stall and continuing is an inert check.
+# Searched in the COMMENT-STRIPPED WindowsUpdate source: the stall branch is explained by a long comment
+# that names Test-WuuRefusalStalled, so searching the raw text would find the prose rather than the call.
+$wupdCodePhase = Get-WuuTextWithoutComments -Text $wupdRawO
+if ($wupdCodePhase -notmatch 'Test-WuuRefusalStalled') {
+    Fail 'the phase gate never consults the stall predicate - a stalled row blocks by accident, not by design (P1)'
+} else {
+    $si = $wupdCodePhase.IndexOf('Test-WuuRefusalStalled')
+    $sw = $wupdCodePhase.Substring($si, [Math]::Min(900, $wupdCodePhase.Length - $si))
+    if ($sw -notmatch 'return\s+\$false') {
+        Fail 'the phase gate computes the stall but does not BLOCK on it - the check is inert (P1)'
+    } elseif ($sw -notmatch 'Write-WarningLog') {
+        Fail 'the phase gate blocks on a stall without saying why - a silent block is the original defect (P1)'
+    } else {
+        Pass 'the phase gate blocks on a stalled refusal and reports the reason (P1)'
+    }
 }
 
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
