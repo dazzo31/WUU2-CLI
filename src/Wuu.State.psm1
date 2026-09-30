@@ -732,6 +732,93 @@ function Set-WuuPendingOperation {
     return @{ Set = $true; Op = $Op; Replaced = $replaced }
 }
 
+function Resolve-WuuVersion {
+    <#
+    .SYNOPSIS
+    The ONE authoritative version, with provenance (SS18).
+    .DESCRIPTION
+    WHY THIS EXISTS. The version is recorded on every audit record, so a wrong value is a provenance
+    defect rather than a cosmetic one: a reviewer reading `wuuVersion: v1.5.0-beta.1-cli` on evidence
+    produced by beta.2 cannot tell which build made it. That mismatch has already happened once in
+    this repository's history, which is why the version is now RESOLVED rather than merely declared.
+
+    PRECEDENCE, and the reason for each step:
+      1. `-Override` (an explicit caller value - used by tests, and by anything that needs to pin it)
+      2. a real git TAG at HEAD     - provenance for an operator, and it self-corrects on a tag
+      3. the value EMBEDDED in source
+
+    A mismatch between (2) and (3) is REPORTED, never silently resolved. Choosing a winner quietly
+    would recreate the original bug: the caller would not know the two disagreed. The returned object
+    carries `Source` and `Mismatch` so a gate, a test, or a log line can act on the disagreement
+    instead of trusting a number.
+
+    A tag is normalised to the version form: `v1.5.0-beta.3-cli` stays as it is, and a tag without
+    the leading `v` gains one, so `git describe` and an embedded literal can be compared directly.
+
+    The `git` lookup is BEST-EFFORT and never fatal: a release zip has no `.git` directory, so an
+    operator running the packaged build will legitimately fall back to the embedded value with
+    `Source='embedded'`. Treating that as an error would make the packaged build refuse to start.
+
+    Pure apart from the read-only git probe, and safe to call from a gate or a test.
+    #>
+    param(
+        [Parameter(Mandatory = $false)][string]$Embedded = '',
+        [Parameter(Mandatory = $false)][string]$Override = '',
+        [Parameter(Mandatory = $false)][string]$RepoRoot = '',
+        [Parameter(Mandatory = $false)][switch]$SkipGit
+    )
+
+    $result = [pscustomobject]@{
+        Version  = $Embedded
+        Source   = 'embedded'
+        Tag      = ''
+        Mismatch = $false
+        Note     = ''
+    }
+
+    # 1. explicit override wins outright, and says so.
+    if (-not [string]::IsNullOrWhiteSpace($Override)) {
+        $result.Version = $Override.Trim()
+        $result.Source = 'override'
+        $result.Note = 'version supplied by the caller; provenance is the caller''s responsibility'
+        return $result
+    }
+
+    # 2. a real tag at HEAD, best-effort. No repo (packaged build) is an expected case, not an error.
+    if ($SkipGit -or [string]::IsNullOrWhiteSpace($RepoRoot)) { return $result }
+
+    $tag = ''
+    try {
+        if (Test-Path (Join-Path $RepoRoot '.git')) {
+            $tag = (& git -C $RepoRoot describe --tags --exact-match HEAD 2>$null | Select-Object -First 1)
+            if (-not $tag) {
+                # Not exactly on a tag - report the last one as context, but do NOT adopt it as the
+                # version: a commit between two releases is not that release, and labelling it so would
+                # make the audit record claim a release that does not contain the code.
+                $nearest = (& git -C $RepoRoot describe --tags --abbrev=0 HEAD 2>$null | Select-Object -First 1)
+                if ($nearest) { $result.Note = "HEAD is not on a tag; nearest is $nearest" }
+            }
+        }
+    } catch {
+        $tag = ''
+    }
+
+    if (-not $tag) { return $result }
+
+    $tag = [string]$tag.Trim()
+    $normalised = if ($tag.StartsWith('v')) { $tag } else { "v$tag" }
+    $result.Tag = $normalised
+    $result.Version = $normalised
+    $result.Source = 'tag'
+
+    # 3. report a disagreement rather than hiding it.
+    if (-not [string]::IsNullOrWhiteSpace($Embedded) -and $Embedded.Trim() -ne $normalised) {
+        $result.Mismatch = $true
+        $result.Note = "tag $normalised disagrees with the embedded version $($Embedded.Trim())"
+    }
+    return $result
+}
+
 function Get-WuuTargetOutcome {
     <#
     .SYNOPSIS
@@ -1071,6 +1158,9 @@ Export-ModuleMember -Function @(
     # the reporting of a replacement, while the policy itself must live in one place; and because
     # the payloads inline the -OnlyIfEmpty half, which tests assert against this function.
     'Set-WuuPendingOperation'
+    # SS18: the authoritative version. Exported so the release gate can assert tag == embedded ==
+    # package, and so a test can drive the precedence without starting the application.
+    'Resolve-WuuVersion'
     # SS10: per-target and aggregate outcomes. Exported because the exit-code decision lives in
     # Wuu.Core (command mode) and the classification must be one rule, not two.
     'Get-WuuTargetOutcome'

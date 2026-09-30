@@ -119,9 +119,76 @@ Enhanced Version - 2025-07-08
 # docs/HARDENING_COMPLETION_REPORT.md.
 $global:WuuVersion = 'v1.5.0-beta.3-cli'
 
-# Toggle debug logging. Set to $true to enable detailed logging (performance impact).
-# WARNING: Enabling this creates large log files and reduces performance.
-$global:EnableDebugLogging = $true
+# SS18: PROVENANCE, immediately after the literal so the resolved value cannot be overwritten by it.
+#
+# WHY THE ORDER MATTERS AND WHY THIS IS NOT AT MODULE SCOPE. This whole configuration region lives
+# inside Start-WuuApplication, not at module top level, so the literal above is evaluated when the
+# application starts. An earlier placement of this block was ABOVE the literal - the resolver ran
+# first, then the literal overwrote it, silently reverting to the embedded value. That is the same
+# class of bug as the version mismatch this is meant to prevent, which is why the resolved value is
+# written after the literal and nowhere else.
+#
+# A git tag at HEAD wins (provenance for an operator, and it self-corrects when a release is tagged);
+# otherwise the embedded literal stands. A DISAGREEMENT is reported rather than quietly resolved:
+# the version is written on every audit record, so picking a winner silently is exactly how evidence
+# would end up labelled with a build that did not produce it.
+#
+# A release zip has no .git, so an operator running the packaged build legitimately falls back to the
+# embedded value - that is an expected case, not an error.
+try {
+    $versionInfo = Resolve-WuuVersion -Embedded $global:WuuVersion -RepoRoot $WuuRoot
+    if ($versionInfo) {
+        if ($versionInfo.Version) { $global:WuuVersion = [string]$versionInfo.Version }
+        $global:WuuVersionSource = [string]$versionInfo.Source
+        $global:WuuVersionTag = [string]$versionInfo.Tag
+        if ($versionInfo.Mismatch) {
+            Write-Warning ("Version mismatch: $($versionInfo.Note). Audit records will carry '$global:WuuVersion' (source: $global:WuuVersionSource). Fix the embedded literal or re-tag.")
+        }
+    }
+} catch {
+    Write-Warning "Could not resolve the version from the repository; using '$global:WuuVersion'."
+}
+if ($global:WuuVersionSource -eq 'tag') {
+    Write-Host ("  Version {0} (from git tag)" -f $global:WuuVersion) -ForegroundColor DarkGray
+}
+
+# Toggle debug logging. DEFAULT IS OFF.
+#
+# WHY OFF. This is a patch-management tool, so the default has to suit unattended operation: a
+# scheduled task or a CI job cannot act on a log size it was never told about. With verbose logging
+# on by default the consequences are real rather than cosmetic - large logs, unnecessary I/O on
+# every run, extra filesystem contention, operational detail written to disk by default, and
+# diagnostic noise interleaved with the audit records an ISO 27001 review reads.
+#
+# The comment here used to claim "$false by default" while the assignment said $true - the file's
+# own history block and the README both described the off default. The code was the outlier.
+#
+# HOW TO TURN IT ON WITHOUT EDITING SOURCE (editing a shipped file is not a supported way to change
+# behaviour - a reinstall silently reverts it, and the change is invisible to anyone reading the
+# configuration):
+#   1. environment variable  WUU_DEBUG=1   (best for a scheduled task or a CI job)
+#   2. source edit                          (last resort - see the warning above)
+# There is deliberately no config-file key for this yet: the only config the tool carries is the
+# encrypted computer list, and inventing a half-plumbed setting would be worse than the env var.
+# The env var wins over the default, so an operator can force it on for one run without touching
+# anything persistent.
+$global:EnableDebugLogging = $false
+
+# Apply the overrides. Kept here, immediately after the default, so there is one place to read for
+# "how is this decided?" rather than a value here and a re-assignment far away.
+try {
+    if ($env:WUU_DEBUG -and @('1', 'true', 'yes', 'on') -contains $env:WUU_DEBUG.ToLowerInvariant()) {
+        $global:EnableDebugLogging = $true
+    }
+} catch {
+    # A malformed environment value must not stop startup; the default (off) stands.
+    Write-Warning "Could not interpret WUU_DEBUG='$($env:WUU_DEBUG)'; debug logging stays disabled."
+}
+# SS18 provenance ($global:WuuVersionSource / $global:WuuVersionTag) is set with the version itself,
+# further up this region - the resolver has to run AFTER the literal, or the literal overwrites it.
+if ($global:EnableDebugLogging) {
+    Write-Host '  Debug logging is ENABLED (verbose; large logs).' -ForegroundColor Yellow
+}
 
 # Timeout settings (seconds)
 $global:sessionTimeout = 30       # Timeout for creating Windows Update session
@@ -509,8 +576,10 @@ function Set-ComputerTimeout {
     Write-Error "Environment validation failed: $($_.Exception.Message)"
     Write-DebugLog "Error details: $($_.Exception.GetType().FullName)" -Level 'ERROR'
     Write-DebugLog "Stack trace: $($_.ScriptStackTrace)" -Level 'ERROR'
-    Read-Host "Press Enter to exit"
-    exit
+    # No Read-Host: an unattended caller (scheduled task, CI, agent test) has nobody to press Enter,
+    # so the prompt turned a startup error into a hung process. Stop-WuuFatal waits only for a real
+    # interactive console, and exits NON-ZERO - the bare `exit` here reported success on a failure.
+    Stop-WuuFatal -WhatHappened "Environment validation failed: $($_.Exception.Message)"
 }
 #endregion Environment validation
 
@@ -564,8 +633,8 @@ try {
 } catch {
     Write-Error "Failed to load required assemblies: $($_.Exception.Message)"
     Write-Host "This usually indicates a problem with a required .NET assembly." -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit
+    # Unattended-safe, and non-zero: see the note on the environment-validation path above.
+    Stop-WuuFatal -WhatHappened "Failed to load required assemblies: $($_.Exception.Message)"
 }
 #endregion Load required assemblies
 
@@ -581,8 +650,8 @@ try {
 } catch {
     Write-Error "Failed to load required modules: $($_.Exception.Message)"
     Write-Host "This usually indicates a problem with PowerShell module installation." -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit
+    # Unattended-safe, and non-zero: see the note on the environment-validation path above.
+    Stop-WuuFatal -WhatHappened "Failed to load required modules: $($_.Exception.Message)"
 }
 #endregion Load required modules
 
@@ -722,17 +791,34 @@ function Update-StatusBackground {
 
 # Console password prompt (replaces the WPF Show-PasswordPrompt dialog).
 # Returns a SecureString, or $null if the operator cancelled (empty password).
+#
+# ROUTED THROUGH Read-WuuAnswer (the single input choke point) rather than calling Read-Host here.
+# The project rule is that all input goes through the choke point because a screen calling Read-Host
+# directly cannot be driven in non-interactive mode; the choke point's -Secure path is also the one
+# that supplies a queued test answer, so a scripted run can exercise this prompt. A bare Read-Host
+# here would block a command-mode run at the unlock prompt with no way to answer it.
 function _WuuReadPassword {
     param([string]$Prompt = 'Password')
+    $sec = $null
     try {
-        $sec = Read-Host -Prompt $Prompt -AsSecureString
+        $sec = Read-WuuAnswer -Prompt $Prompt -Secure
     } catch {
-        # -AsSecureString is PS 5.1+; if unavailable, fail closed rather than echo a password
-        Write-ErrorLog "Secure password prompt unavailable: $($_.Exception.Message)"
+        # The choke point throws when a REQUIRED input is missing in non-interactive mode. That is the
+        # correct outcome (fail the command rather than hang), so it is reported and turned into $null
+        # for this caller's existing contract - never into a silent empty password.
+        Write-ErrorLog "Secure password prompt failed: $($_.Exception.Message)"
         return $null
     }
-    if ($null -eq $sec -or $sec.Length -eq 0) { return $null }
-    return $sec
+    if ($null -eq $sec) { return $null }
+    # -AsSecureString returns a SecureString; a queued non-interactive answer arrives as a plain
+    # string. Convert so the caller always receives the type it expects (it calls Protect-Credential).
+    if ($sec -is [System.Security.SecureString]) { return $sec }
+    try {
+        return (ConvertTo-SecureString -String ([string]$sec) -AsPlainText -Force)
+    } catch {
+        Write-ErrorLog "Could not convert the supplied password to a SecureString: $($_.Exception.Message)"
+        return $null
+    }
 }
 
 # Function to log success messages
@@ -3990,10 +4076,11 @@ catch {
     if ($_.Exception.InnerException) {
         Write-ErrorLog "Inner exception: $($_.Exception.InnerException.Message)"
     }
-    Write-Host ''
-    Write-Host "  Fatal error: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host '  See the debug log for details.' -ForegroundColor Red
-    Read-Host '  Press Enter to exit'
+    # No Read-Host and no bare exit: an unattended caller must not hang here, and a fatal failure must
+    # not report success. Stop-WuuFatal writes the message, waits only for a real interactive console,
+    # and exits non-zero. The error text is repeated rather than assumed, because Write-Host output is
+    # not what a wrapper reads - the exit code is.
+    Stop-WuuFatal -WhatHappened "Fatal error: $($_.Exception.Message)"
 }
 finally {
     # Comprehensive cleanup on exit

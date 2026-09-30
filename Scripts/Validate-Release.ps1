@@ -1863,5 +1863,97 @@ if ($coreDebris -notmatch 'function Update-WuuComputerRow') {
     Pass 'both row-writer copies carry the accurate name (SS14)'
 }
 
+# (am) RELEASE HYGIENE: debug logging OFF by default, and no interactive prompt on a fatal path
+#      (brief SS17 / SS15). Two defects that are cheap to reintroduce and expensive to notice.
+#
+#      WHY A GATE AND NOT A COMMENT. Both were wrong in the shipped tree at the same time: the
+#      comment above the assignment said "$false by default" while the assignment said $true, and
+#      four startup failure paths ended in `Read-Host "Press Enter to exit"` followed by a bare
+#      `exit` that reports SUCCESS. Neither is caught by any behavioural test, because a test can
+#      start the application successfully without ever exercising either.
+$coreRawM = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+$consoleRawM = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Console.psm1') -Raw
+
+# 1. Debug logging must default to OFF. Verbose-by-default is wrong for an unattended patch tool:
+#    large logs, I/O on every run, operational detail written by default, and diagnostic records
+#    interleaved with the audit trail.
+if ($coreRawM -notmatch '\$global:EnableDebugLogging\s*=\s*\$false') {
+    Fail 'debug logging does not default to $false - verbose-by-default is wrong for an unattended patch tool (large logs, extra I/O, operational detail on disk) (SS17)'
+} elseif ($coreRawM -match '\$global:EnableDebugLogging\s*=\s*\$true') {
+    # The override path legitimately assigns $true inside the WUU_DEBUG branch, so its presence is
+    # only a failure if it is NOT guarded by that branch.
+    if ($coreRawM -notmatch 'WUU_DEBUG') {
+        Fail 'debug logging is set to $true with no documented override - production behaviour would depend on editing source (SS17)'
+    } else {
+        Pass 'debug logging defaults to $false and is enabled by the WUU_DEBUG override (SS17)'
+    }
+} else {
+    Pass 'debug logging defaults to $false (SS17)'
+}
+# The override must exist, so an operator can diagnose without editing a shipped file.
+if ($coreRawM -notmatch 'WUU_DEBUG') {
+    Fail 'there is no way to enable debug logging without editing source - a shipped file edit is reverted by the next install and invisible in the configuration (SS17)'
+}
+
+# 2. No interactive prompt may block a FATAL path. A prompt there hangs every unattended caller; the
+#    exit code must also be non-zero, because a bare `exit` reported success on a failed startup.
+$fatalPrompts = ([regex]::Matches($coreRawM, 'Read-Host\s+[''"]?\s*Press Enter')).Count
+if ($fatalPrompts -gt 0) {
+    Fail "$fatalPrompts 'Read-Host ... Press Enter' prompt(s) remain - a startup error would hang a scheduled task, a CI job or an agent-driven test instead of failing (SS15)"
+} else {
+    Pass 'no interactive prompt blocks a fatal startup path (SS15)'
+}
+if ($consoleRawM -notmatch 'function Stop-WuuFatal') {
+    # In Wuu.Console, not Wuu.Core: the presentation layer owns console interaction, so the helper
+    # belongs beside Read-WuuAnswer. Asserted against the CONSOLE source - an earlier version of this
+    # check looked in Wuu.Core and reported the function missing while it was present.
+    Fail 'Stop-WuuFatal is missing - the fatal paths have no unattended-safe exit'
+}
+if ($consoleRawM -notmatch "'Stop-WuuFatal'") {
+    Fail 'Stop-WuuFatal is not exported from Wuu.Console - the fatal paths in Wuu.Core could not call it'
+}
+# It must exit NON-ZERO and must not wait without checking for a real console.
+$consoleCodeM = Get-WuuTextWithoutComments -Text $consoleRawM
+$fatalBodyM = Get-WuuFunctionBody $consoleRawM 'Stop-WuuFatal'
+if ($fatalBodyM -notmatch 'exit \$ExitCode') {
+    Fail 'Stop-WuuFatal does not exit with a code - a fatal startup would report success (SS15)'
+} elseif ($fatalBodyM -notmatch 'IsInputRedirected') {
+    Fail 'Stop-WuuFatal waits without checking for a console - it would still hang a redirected/unattended run (SS15)'
+} else {
+    Pass 'fatal exits are non-zero and wait only for a real interactive console (SS15)'
+}
+
+# 3. The password prompt must route through the input choke point, or a command-mode run blocks at
+#    the unlock prompt with no way to answer it.
+if ($coreRawM -notmatch 'Read-WuuAnswer -Prompt \$Prompt -Secure') {
+    Fail 'the password prompt bypasses Read-WuuAnswer - a scripted or non-interactive run could not answer the unlock prompt (SS15)'
+} else {
+    Pass 'the password prompt routes through the input choke point (SS15)'
+}
+
+# 4. THE VERSION GUARD (the defect that started this). The embedded literal and a real git tag at HEAD
+#    must agree, or audit records carry a version no release used. Checked by RUNNING the resolver -
+#    a text comparison here would duplicate its logic instead of exercising it.
+$embeddedVersionM = ''
+$versionMatchM = [regex]::Match($coreRawM, "\`$global:WuuVersion\s*=\s*'([^']+)'")
+if ($versionMatchM.Success) { $embeddedVersionM = $versionMatchM.Groups[1].Value }
+if (-not $embeddedVersionM) {
+    Fail 'could not read the embedded $global:WuuVersion literal - the version is not single-sourced (SS18)'
+} else {
+    try {
+        $versionCheck = Resolve-WuuVersion -Embedded $embeddedVersionM -RepoRoot $root
+        if ($versionCheck -and $versionCheck.Mismatch) {
+            Fail ("version mismatch: " + $versionCheck.Note + " - every audit record would carry a version that did not produce the evidence (SS18)")
+        } elseif ($versionCheck -and $versionCheck.Source -eq 'tag') {
+            Pass "the embedded version matches the git tag at HEAD ($($versionCheck.Version)) (SS18)"
+        } else {
+            # Not on a tag (a commit between releases) is legitimate - report it rather than fail.
+            Pass "version $($versionCheck.Version) resolved from source; $($versionCheck.Note) (SS18)"
+        }
+    } catch {
+        Fail "could not resolve the version for the mismatch check: $($_.Exception.Message)"
+    }
+}
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

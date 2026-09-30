@@ -397,6 +397,60 @@ function Read-WuuAnswer {
 
 #endregion Non-interactive input provider
 
+#region Fatal exit
+function Stop-WuuFatal {
+    <#
+    .SYNOPSIS
+    Exits on a fatal startup error, without waiting for a keypress.
+
+    .DESCRIPTION
+    WHY THIS REPLACES `Read-Host "Press Enter to exit"`.
+
+    Four startup failure paths ended with that prompt. It violates the project's own input rule (all
+    input goes through Read-WuuAnswer / Read-WuuYesNo / Read-WuuSelection), and the failure mode is
+    worse than an untestable prompt: **it hangs every unattended caller**. A scheduled task, a CI job,
+    or an agent-driven test has nobody to press Enter, so a startup error became a hung process -
+    the operator sees no failure, just a job that never finishes.
+
+    The prompt was presumably meant to keep a double-clicked window open so a human could read the
+    message. That intent is kept WITHOUT blocking: write the error, and wait only when there is a real
+    interactive console attached. Redirection, `-NonInteractive`, and a missing console all return
+    immediately.
+
+    THE EXIT CODE IS PART OF THIS. The bare `exit` these paths used exits 0, so a failed startup
+    reported SUCCESS to the caller - a script would treat "could not validate the environment" as a
+    clean run. Fatal startup is exit 1, matching the documented contract (see docs/EXIT_CODES.md;
+    startup faults are operation failures, not usage errors).
+
+    -WhatHappened names the failure for the log and the console, so the two agree.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WhatHappened,
+        [Parameter(Mandatory = $false)][int]$ExitCode = 1
+    )
+
+    # Best-effort logging: this runs on a path where logging itself may be broken.
+    try { Write-ErrorLog "Fatal: $WhatHappened" } catch { }
+
+    Write-Host ''
+    Write-Host ("  $WhatHappened") -ForegroundColor Red
+    Write-Host "  See the debug log for details." -ForegroundColor Red
+
+    # Wait ONLY for a human at a real console. Every unattended caller must continue.
+    if (-not $script:WuuNonInteractive) {
+        try {
+            if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+                Write-Host '  Press Enter to close...' -ForegroundColor DarkGray
+                [void][Console]::ReadLine()
+            }
+        } catch { }
+    }
+
+    exit $ExitCode
+}
+
+#endregion Fatal exit
+
 #region Selectors (shared by menu actions)
 
 function Read-WuuSelection {
@@ -480,4 +534,5 @@ Export-ModuleMember -Function @(
     'Read-WuuAnswer'
     'Read-WuuSelection'
     'Read-WuuYesNo'
+    'Stop-WuuFatal'
 )
