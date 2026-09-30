@@ -586,6 +586,12 @@ function Start-UpdateCheckJob {
         # A refusal is a NORMAL outcome, not an error - the same contract as the per-computer gate.
         # The caller leaves the row Pending, and the scheduler admits it on a later tick once capacity
         # frees. Logged at INFO so a run can be reconstructed.
+        #
+        # SS4: THIS CHECK IS ADVISORY. Passing it reserves nothing - the job entry that the cap COUNTS
+        # is appended ~140 lines below, after runspace creation and pipeline composition, so a second
+        # submission during that span sees the same count and admits too. It is kept because it is
+        # cheap and it defers work early; the AUTHORITATIVE test is taken under the submission lock
+        # immediately before the append (see the reservation block below).
         if (-not (Test-WuuConcurrencyAvailable -Jobs $jobs -MaxConcurrentJobs $MaxConcurrentJobs)) {
             Write-InfoLog "[$($ComputerItem.Computer)] submission deferred: global concurrency cap reached ($($jobs.Count)/$MaxConcurrentJobs in flight, op=$Op) - it stays queued for the next scheduler tick"
             return $false
@@ -713,21 +719,78 @@ function Start-UpdateCheckJob {
             Write-WarningLog "Could not stamp the operation identity into the runspace for $($ComputerItem.Computer): $($_.Exception.Message)"
         }
 
-        #Save handle so we can later end the runspace
-        $temp = New-Object PSObject -Property @{
-            PowerShell  = $PowerShell
-            Runspace    = $PowerShell.BeginInvoke()
-            StartTime   = Get-Date
-            Computer    = $ComputerItem.Computer
-            # The identity of the operation this job IS. Without it the cleanup loop holds only
-            # (Computer, Runspace, StartTime) and cannot tell which operation it is settling - so a
-            # job stopped on timeout and settled later would release the lock of whatever operation
-            # had since taken the computer.
-            OperationId = $operationId
-            Op          = $Op
+        # Save handle so we can later end the runspace.
+        #
+        # SS4: THE RESERVATION. Everything above is per-submission preparation that consumed no
+        # capacity. Appending this entry is what CONSUMES a slot, so the capacity test and the append
+        # must be one indivisible step - otherwise two submissions that prepared concurrently both
+        # count the same $jobs and both admit, and a cap of 10 runs 12.
+        #
+        # The lock is taken HERE and released after the append, so the serialised region is a count and
+        # an append rather than 140 lines of runspace construction. A submission that prepared while
+        # another thread took the last slot finds no room here and rolls back (below).
+        #
+        # $PowerShell.BeginInvoke() is INSIDE the lock on purpose. Starting the pipeline before the
+        # entry exists would leave a running payload that no cleanup pass can see or time out.
+        $lockTaken = $false
+        $reserved = $false
+        # ROLLBACK. The row was already claimed (OpState='Running' plus this operation's identity) and
+        # the runspace already carries the identity. If the reservation then fails, that claim is a
+        # LIE: no job entry exists, so no cleanup pass will ever settle it - the row would stay
+        # 'Running' for ever and a permanently-busy computer is never scheduled again. The claim is
+        # therefore undone, through the funnel (which is also what retires the identity, so no late
+        # writer can act on it).
+        $rollback = {
+            try {
+                $null = Update-WuuOperationState -Row $ComputerItem -OperationId $operationId -ClearOperation
+            } catch { }
+            try { if ($PowerShell) { $PowerShell.Dispose() } } catch { }
+        }
+        try {
+            $lockTaken = Enter-WuuSubmissionLock
+            if (-not $lockTaken) {
+                # Treated exactly like "no capacity": recoverable, and the scheduler retries.
+                Write-WarningLog "[$($ComputerItem.Computer)] submission refused: could not acquire the submission lock within the timeout (op=$Op) - it stays queued for the next scheduler tick"
+                & $rollback
+                return $false
+            }
+
+            # THE AUTHORITATIVE CAP TEST, under the lock. The advisory check near the top of this
+            # function may have passed a long time ago; this is the one that decides.
+            if (-not (Test-WuuConcurrencyAvailable -Jobs $jobs -MaxConcurrentJobs $MaxConcurrentJobs)) {
+                Write-InfoLog "[$($ComputerItem.Computer)] submission deferred at reservation: global concurrency cap reached ($($jobs.Count)/$MaxConcurrentJobs in flight, op=$Op) - it stays queued for the next scheduler tick"
+                & $rollback
+                return $false
+            }
+
+            #Save handle so we can later end the runspace
+            $temp = New-Object PSObject -Property @{
+                PowerShell  = $PowerShell
+                Runspace    = $PowerShell.BeginInvoke()
+                StartTime   = Get-Date
+                Computer    = $ComputerItem.Computer
+                # The identity of the operation this job IS. Without it the cleanup loop holds only
+                # (Computer, Runspace, StartTime) and cannot tell which operation it is settling - so a
+                # job stopped on timeout and settled later would release the lock of whatever operation
+                # had since taken the computer.
+                OperationId = $operationId
+                Op          = $Op
+            }
+
+            $jobs.Add($temp) | Out-Null
+            $reserved = $true
+        } finally {
+            if ($lockTaken) { Exit-WuuSubmissionLock }
         }
 
-        $jobs.Add($temp) | Out-Null
+        if (-not $reserved) {
+            # Defensive: the only way to reach here is an exception between BeginInvoke and the append.
+            # A started-but-unlisted pipeline is precisely the row-stuck-Running case the rollback
+            # exists for, so it is handled rather than assumed impossible.
+            Write-WarningLog "[$($ComputerItem.Computer)] reservation did not complete (op=$Op) - the claim is rolled back so the row is not left permanently busy"
+            & $rollback
+            return $false
+        }
 
         # SS16: OpState/OpStartedAt were set here, AFTER BeginInvoke had already returned and the
         # payload could be executing. They are now written by the funnel claim above, before

@@ -2101,5 +2101,69 @@ if (-not (Get-Command Test-WuuOperationStateInvariant -ErrorAction SilentlyConti
     }
 }
 
+# (ao) ATOMIC SLOT RESERVATION (reviewer P1). The cap was ENFORCED at the top of the submission point
+#      but CONSUMED 141 lines later at $jobs.Add, so two overlapping submissions both read the same
+#      count and both admitted - a cap of 10 could run 12. The invariant is not "the cap is checked"
+#      but "the check and the append are ONE step". This gates the ordering, which is the whole fix.
+$wupdRawO = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+$subText = Get-WuuFunctionBody $wupdRawO 'Start-UpdateCheckJob'
+$subCode = Get-WuuTextWithoutComments -Text $subText
+
+if (-not $subText) {
+    Fail 'could not extract Start-UpdateCheckJob for the reservation check'
+} elseif ($subCode -notmatch 'Enter-WuuSubmissionLock') {
+    Fail 'the submission point does not take the submission lock - the capacity test and the slot append are not one step (P1)'
+} elseif ($subCode -notmatch 'Exit-WuuSubmissionLock') {
+    Fail 'the submission point takes the submission lock but never releases it (P1)'
+} else {
+    # ORDERING IS THE INVARIANT. The authoritative cap test and the append must both sit between the
+    # acquisition and the release, with the append LAST.
+    $acqAt  = $subCode.IndexOf('Enter-WuuSubmissionLock')
+    $exitAt = $subCode.LastIndexOf('Exit-WuuSubmissionLock')
+    $capAt  = $subCode.LastIndexOf('Test-WuuConcurrencyAvailable')
+    $addAt  = $subCode.LastIndexOf('$jobs.Add')
+    if ($capAt -lt $acqAt) {
+        Fail 'the authoritative capacity test runs BEFORE the lock - it reserves nothing (P1)'
+    } elseif ($capAt -gt $exitAt) {
+        Fail 'the authoritative capacity test runs OUTSIDE the critical section - the race is still open (P1)'
+    } elseif ($addAt -lt $capAt) {
+        Fail 'the slot is appended BEFORE the capacity test - the cap can be overshot (P1)'
+    } elseif ($addAt -gt $exitAt) {
+        Fail 'the slot is appended OUTSIDE the critical section - the test and the append are not atomic (P1)'
+    } else {
+        Pass 'the capacity test and the slot append are one indivisible step under the submission lock (P1)'
+    }
+}
+
+# The lock primitive must be a real mutual-exclusion object, and re-entrant so a nested submission
+# cannot deadlock against itself.
+$stateRawO = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+if ($stateRawO -notmatch 'System\.Threading\.Monitor') {
+    Fail 'the submission lock is not built on a mutual-exclusion primitive (P1)'
+} elseif ($stateRawO -notmatch 'Monitor\]::TryEnter') {
+    Fail 'the submission lock blocks indefinitely instead of timing out - a dead holder would hang every submission (P1)'
+} else {
+    Pass 'the submission lock uses a re-entrant mutual-exclusion primitive with a timeout (P1)'
+}
+
+# A reservation that fails AFTER the row was claimed must undo the claim, or no cleanup pass will
+# ever settle that row and the computer stays permanently busy.
+#
+# The rollback BODY is asserted, not the whole function: checking the function text for
+# 'ClearOperation' also matches the claim ABOVE the reservation, so removing the rollback's own clear
+# still passed. (Caught by the tautology harness, not by review.)
+$rbStart = $subCode.IndexOf('$rollback = {')
+$rbBody = ''
+if ($rbStart -ge 0) { $rbBody = $subCode.Substring($rbStart, [Math]::Min(600, $subCode.Length - $rbStart)) }
+if ($subCode -notmatch 'rollback') {
+    Fail 'a failed reservation has no rollback path - the row would stay Running for ever (P1)'
+} elseif ($rbBody -notmatch 'Update-WuuOperationState') {
+    Fail 'the rollback does not go through the mutation funnel, so it cannot retire the identity (P1)'
+} elseif ($rbBody -notmatch 'ClearOperation') {
+    Fail 'a failed reservation does not roll back the operation claim - no cleanup pass would ever settle that row (P1)'
+} else {
+    Pass 'a failed reservation rolls back the claim through the funnel, so no row is left permanently busy (P1)'
+}
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

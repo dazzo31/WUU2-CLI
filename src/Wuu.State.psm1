@@ -918,6 +918,111 @@ function Test-WuuOperationStateInvariant {
 
 #endregion Operation transition layer
 
+#region Submission critical section
+
+# The gate object for the submission critical section. A plain reference type is all Monitor needs -
+# its identity is the lock, not its contents.
+$script:WuuSubmissionGate = New-Object System.Object
+
+function Enter-WuuSubmissionLock {
+    <#
+    .SYNOPSIS
+    Acquires sole right to read-and-reserve a concurrency slot (SS4).
+    .DESCRIPTION
+    WHY A LOCK AND NOT A SIMPLER CHECK. The global cap was enforced by
+    `Test-WuuConcurrencyAvailable` at the TOP of Start-UpdateCheckJob, but the job entry that the cap
+    COUNTS was appended 141 lines later, after the credential-epoch check, runspace creation, pipeline
+    composition, the identity claim and the runspace variable stamp. Two submissions arriving during
+    that span both see the same `$jobs.Count` and both admit - so a cap of 10 admits 12, and the
+    overshoot grows with the work done in between.
+
+    Adding the entry is what CONSUMES capacity, so the check and the add must be one indivisible step.
+    Everything between them is per-submission work that does not need to be serialised, so the lock is
+    taken only at the end: capacity is re-tested immediately before the append. A submission that
+    prepared while another thread consumed the last slot then finds no room and rolls back.
+
+    NOT-A-SENTINEL, DELIBERATELY. The obvious alternative - append a placeholder at the top and fill it
+    in later - keeps `$jobs.Count` truthful without a lock, but the cleanup loop enumerates a SNAPSHOT
+    (`@($jobs)`), so a placeholder would be observed and processed as if it were a real job. A lock
+    leaves the collection containing only complete entries.
+
+    Monitor rather than a SemaphoreSlim: Monitor is RE-ENTRANT on the same thread, so a nested
+    submission (a payload that eventually re-enters the submission point) cannot deadlock against
+    itself, and it costs no allocation per acquisition.
+
+    A caller that cannot take the lock in time must treat it as "no capacity" and refuse: blocking
+    indefinitely on a lock held by a thread that may have died would hang the whole submission path.
+    Refusing is recoverable - the row stays Pending and the scheduler retries the next tick.
+
+    -Gate EXISTS FOR TESTABILITY, AND IT IS LOAD-BEARING. `$script:` state is per MODULE INSTANCE, so
+    a test that imports this module into each of N runspaces gets N gate objects and proves nothing -
+    it would observe perfect "mutual exclusion" that in fact never shared a lock. Production imports
+    the modules -Global exactly once, so every caller shares one gate. Passing the gate explicitly
+    lets a test share ONE object across real threads and observe genuine exclusion, without any
+    change to production call sites (which omit the parameter).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)][int]$TimeoutMs = 30000,
+        # The lock object. Identity is what matters, not contents. Omit to use the module's gate.
+        [Parameter(Mandatory=$false)][AllowNull()]$Gate = $null
+    )
+
+    # Resolved into a LOCAL, never by reassigning $Gate: reassigning a parameter is a documented
+    # hazard in this codebase and a gate failure (this gate has now caught the same mistake twice).
+    $gateObject = $Gate
+    if ($null -eq $gateObject) { $gateObject = $script:WuuSubmissionGate }
+    if ($null -eq $gateObject) { return $false }
+    try {
+        return [System.Threading.Monitor]::TryEnter($gateObject, $TimeoutMs)
+    } catch {
+        return $false
+    }
+}
+
+function Exit-WuuSubmissionLock {
+    <#
+    .SYNOPSIS
+    Releases the submission critical section (SS4). Idempotent and never throws.
+    .DESCRIPTION
+    Swallows its own failure on purpose. This is called from a `finally`, and a throw here would
+    replace whatever exception was propagating - turning a real diagnosis into a lock-release error.
+    A failed release means the lock was not held (a double release), which is a defect in the caller
+    and is reported by tests\Test-SubmissionAtomicity.ps1 rather than by an exception mid-flight.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)][AllowNull()]$Gate = $null
+    )
+
+    $gateObject = $Gate
+    if ($null -eq $gateObject) { $gateObject = $script:WuuSubmissionGate }
+    if ($null -eq $gateObject) { return }
+    try { [System.Threading.Monitor]::Exit($gateObject) } catch { }
+}
+
+function Test-WuuSubmissionLockHeld {
+    <#
+    .SYNOPSIS
+    Whether the CALLING thread currently holds the submission lock (SS4).
+    .DESCRIPTION
+    Exists so a test can assert the critical section really excludes, rather than asserting that a
+    lock function was called. Also useful to a caller that wants to know whether a nested submission
+    is already inside the section.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)][AllowNull()]$Gate = $null
+    )
+
+    $gateObject = $Gate
+    if ($null -eq $gateObject) { $gateObject = $script:WuuSubmissionGate }
+    if ($null -eq $gateObject) { return $false }
+    try { return [System.Threading.Monitor]::IsEntered($gateObject) } catch { return $false }
+}
+
+#endregion Submission critical section
+
 function Set-WuuComputerRowColor {
     <#
     .SYNOPSIS
@@ -1597,6 +1702,12 @@ Export-ModuleMember -Function @(
     'Test-WuuStateTransitionAllowed'
     'Test-WuuOperationStateInvariant'
     'Get-WuuStateStatusText'
+    # SS4: the submission critical section. Exported because the reservation happens in
+    # Wuu.WindowsUpdate (the single submission point) while the gate object lives here with the rest of
+    # the state contract, and a test must be able to drive the exclusion directly.
+    'Enter-WuuSubmissionLock'
+    'Exit-WuuSubmissionLock'
+    'Test-WuuSubmissionLockHeld'
     'Test-WuuPhaseFailureBlocks'
     'Set-WuuPhaseFailurePolicy'
     'Update-WuuConnectivityState'
