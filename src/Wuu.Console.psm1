@@ -443,7 +443,11 @@ function Stop-WuuFatal {
                 Write-Host '  Press Enter to close...' -ForegroundColor DarkGray
                 [void][Console]::ReadLine()
             }
-        } catch { }
+        } catch {
+            # Best-effort convenience only. A console that cannot be read must not prevent the exit, and
+            # the exit code below is the contract a wrapper actually reads - so there is nothing to
+            # recover here and nothing the caller could act on.
+        }
     }
 
     exit $ExitCode

@@ -415,7 +415,11 @@ function Invoke-WuuRemoteTask {
         try {
             [void](Invoke-CimMethod -CimSession $cim -Namespace 'root/default' -ClassName 'StdRegProv' -MethodName 'DeleteKey' `
                 -Arguments @{ hDefKey = $hklm; sSubKeyName = "$jobsKey\$Id" } -ErrorAction Stop)
-        } catch { }
+        } catch {
+            # Best-effort cleanup of the job's registry key. The key may already be absent, and the host
+            # may have gone away mid-call. The caller treats the removal as done either way, so there is
+            # no recovery to attempt and nothing for the caller to act on.
+        }
     }
 
     try {

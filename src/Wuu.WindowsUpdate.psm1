@@ -433,7 +433,13 @@ function New-ComputerRunspace {
                     return $cred
                 }
                 $detail = ''
-                try { if ($result -and $result.Result -and $result.Result.Error) { $detail = [string]$result.Result.Error } } catch { }
+                try {
+                    if ($result -and $result.Result -and $result.Result.Error) { $detail = [string]$result.Result.Error }
+                } catch {
+                    # $detail only improves the message below. If it cannot be read the throw still
+                    # happens with an empty detail, so the failure is reported either way and there is
+                    # nothing to recover - the silence cannot hide a failure.
+                }
                 # NO FALLBACK. Report and fail loudly - an unlogged identity substitution is worse
                 # than a refused operation.
                 try { & $WriteDebugLogScript -Message "Custom credential '$userName' FAILED for $ComputerName ($detail) - operation refused; no fallback to the process identity" -Level 'ERROR' } catch { }

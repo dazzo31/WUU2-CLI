@@ -2250,5 +2250,94 @@ if ($wupdCodePhase -notmatch 'Test-WuuRefusalStalled') {
     }
 }
 
+# (aq) SILENT CATCHES (reviewer P2: "a release gate could even reject empty catches outside a small
+#      allowlist"). A catch whose body performs no statement turns a fault into apparent success: the
+#      caller cannot tell "nothing to do" from "the work failed". The rule is therefore not "no silent
+#      catches" but "no UNJUSTIFIED ones" - a disposal failure must not mask the original error, and a
+#      logging failure cannot be logged.
+#
+#      THE POLICY IS SHARED WITH ITS SUITE, NOT COPIED. Scripts\Wuu.CatchAudit.ps1 is dot-sourced by
+#      both this gate and tests\Test-SilentCatchPolicy.ps1. If each carried its own rule they would
+#      drift and one would pass while the other failed. This gate is the ENFORCEMENT; the suite carries
+#      the false-negative control (it drives the detector with synthetic silences), because a checker
+#      that only ever runs against the real tree cannot be shown to detect anything.
+$catchAuditPath = Join-Path $root 'Scripts\Wuu.CatchAudit.ps1'
+if (-not (Test-Path -LiteralPath $catchAuditPath)) {
+    Fail 'Scripts\Wuu.CatchAudit.ps1 is missing - the silent-catch policy has no home (P2)'
+} else {
+    . $catchAuditPath
+
+    if (-not (Get-Command Get-WuuSilentCatch -ErrorAction SilentlyContinue)) {
+        Fail 'the shared catch policy does not provide Get-WuuSilentCatch (P2)'
+    } else {
+        # Every allowlist entry must state WHY. An entry without a justification is indistinguishable
+        # from "we stopped looking", which is the outcome this policy exists to prevent.
+        $allow = @(Get-WuuSilentCatchAllowlist)
+        $noWhy = @($allow | Where-Object { -not $_.Why -or $_.Why.Length -lt 20 })
+        if ($noWhy.Count -gt 0) {
+            Fail "$($noWhy.Count) allowlist entr(ies) do not state why they are allowed - an unjustified exemption is not a policy (P2)"
+        } elseif ($allow.Count -gt 12) {
+            Fail "the allowlist has $($allow.Count) entries - too large to be a policy rather than a list of everything that happens to exist (P2)"
+        } else {
+            Pass "the allowlist is small ($($allow.Count) entries) and every entry states why (P2)"
+        }
+
+        $catchFindings = @()
+        $catchTotal = 0
+        foreach ($cf in Get-ChildItem (Join-Path $root 'src\*.psm1') | Sort-Object Name) {
+            $cfText = [System.IO.File]::ReadAllText($cf.FullName)
+            foreach ($c in (Get-WuuSilentCatch -Text $cfText)) {
+                $catchTotal++
+                $verdict = Test-WuuSilentCatchAllowed -Guarded $c.Guarded -Body $c.Body
+                if (-not $verdict.Allowed) {
+                    $catchFindings += "$($cf.Name) L$($c.Line): $($verdict.Reason)"
+                }
+            }
+        }
+
+        if ($catchTotal -eq 0) {
+            # A ZERO RESULT MUST BE DISTINGUISHABLE FROM A BROKEN SCAN. If the detector silently stopped
+            # finding anything, "no findings" would look like a pass.
+            Fail 'the scan found NO silent catches at all in src/ - the detector is not working, so this check proves nothing (P2)'
+        } elseif ($catchFindings.Count -gt 0) {
+            Fail ("$($catchFindings.Count) unjustified silent catch(es) of $catchTotal - each turns a fault into apparent success (P2): " + ($catchFindings -join ' | '))
+        } else {
+            Pass "all $catchTotal silent catch(es) in src/ are documented or allowlisted (P2)"
+        }
+
+        # FALSE-NEGATIVE CONTROL. Without this, the check above passes whenever there are no findings -
+        # including when the POLICY HAS BEEN DISABLED and refuses nothing. The gate would then report
+        # "all silences are justified" for a tree where nothing is ever refused, which is a check that
+        # cannot fail. The tautology harness found this by making the predicate return Allowed=$true
+        # unconditionally: the gate PASSED that broken tree. The predicate is therefore DRIVEN here -
+        # it must refuse a silence that is neither documented nor allowlisted, and permit a documented
+        # one. Both directions, because permitting everything and refusing everything are equally broken.
+        $fnUnjustified = Test-WuuSilentCatchAllowed -Guarded 'try { Invoke-SomeVitalWork }' -Body ''
+        $fnDocumented = Test-WuuSilentCatchAllowed -Guarded 'try { Invoke-SomeVitalWork }' -Body '# best effort by design'
+        if ($fnUnjustified.Allowed) {
+            Fail 'the policy permits an UNJUSTIFIED silence - the check above cannot fail, so its clean result proves nothing (P2)'
+        } elseif (-not $fnDocumented.Allowed) {
+            Fail 'the policy refuses a DOCUMENTED silence - an explicit justification is being ignored (P2)'
+        } else {
+            Pass 'the policy refuses an unjustified silence and permits a documented one (P2)'
+        }
+
+        # The detector must FIND the multi-line form, which is the form the real code uses and the form
+        # an earlier broken brace-count could not see. Without this, a detector that only handled
+        # one-liners would report a clean tree while inspecting almost nothing.
+        $multiProbe = "function P {`n    try {`n        Do-Work`n    } catch {`n    }`n}`n"
+        $multiFound = @(Get-WuuSilentCatch -Text $multiProbe)
+        if ($multiFound.Count -ne 1) {
+            Fail 'the silent-catch detector does not find the MULTI-LINE empty catch - the form src/ uses - so its clean result means nothing (P2)'
+        } elseif ($multiFound[0].Kind -ne 'empty') {
+            Fail 'the detector classifies a genuinely empty multi-line catch as something other than empty (P2)'
+        } elseif (-not $multiFound[0].Guarded.Contains('Do-Work')) {
+            Fail 'the detector does not identify WHAT the silent catch guards, so the allowlist cannot be applied (P2)'
+        } else {
+            Pass 'the detector finds the multi-line form it is judging, and the statement it guards (P2)'
+        }
+    }
+}
+
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
 else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }
