@@ -98,17 +98,26 @@ Enhanced Version - 2025-07-08
 # so a release could ship with the log claiming one version and the audit trail recording
 # another - a genuine compliance problem for a field an ISO 27001 review relies on.
 #
-# v1.5.0-beta.2-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
-# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.2-cli` knows the evidence
+# v1.5.0-beta.3-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
+# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.3-cli` knows the evidence
 # came from pre-release software. Do not reuse this string for a final release.
 #
-# beta.2 is the HARDENING build: same commands and same engine, but a substantial correctness pass
-# over behaviour that used to fail SILENTLY (exit codes that meant "queued", phase gating driven by
-# a display string, a dead timeout field, credential identity written empty and never read). Those
-# are behaviour changes, which is why they are a release and not a patch. See
-# docs/HARDENING_P0_FINDINGS.md for the findings and docs/RELEASE_NOTES_v1.5.0-beta.2-cli.md for
-# what changed and what to re-test.
-$global:WuuVersion = 'v1.5.0-beta.2-cli'
+# beta.3 is the SEQUENTIAL HARDENING build. Same commands and same engine as beta.2; the change is
+# that the concurrency and identity guarantees the brief asked for are now ENFORCED rather than
+# described. Concretely:
+#
+#   * the global concurrency cap is applied at the SUBMISSION POINT, not only in the scheduler tick
+#     (it did not apply to the handlers that call the submission point directly, which is all of them);
+#   * every operation has an identity, and a superseded worker cannot restamp the operation that
+#     replaced it (previously the invariant was "unreachable" rather than "rejected");
+#   * a queued request that is displaced by a newer one is REPORTED, so work cannot disappear silently;
+#   * exit code 4 (PartialSuccess) is produced - it was reserved and unreachable before.
+#
+# Two of the four are BEHAVIOUR changes, so read the release notes before deploying:
+# docs/RELEASE_NOTES_v1.5.0-beta.3-cli.md. The per-invariant status table (what is enforced versus
+# still target) is in .github/copilot-instructions.md §8, and the pass is recorded in
+# docs/HARDENING_COMPLETION_REPORT.md.
+$global:WuuVersion = 'v1.5.0-beta.3-cli'
 
 # Toggle debug logging. Set to $true to enable detailed logging (performance impact).
 # WARNING: Enabling this creates large log files and reduces performance.
