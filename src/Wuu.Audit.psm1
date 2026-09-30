@@ -591,6 +591,275 @@ function Get-WuuAuditChainHead {
 
 #endregion Session + record writing
 
+#region External anchoring
+
+function New-WuuAuditAnchor {
+    <#
+    .SYNOPSIS
+    Produces a CHAIN-HEAD ANCHOR: the evidence needed to prove, later and OUT OF BAND, that the log has
+    not been rewritten (reviewer P3: "external audit anchoring").
+    .DESCRIPTION
+    THE PROBLEM THIS ADDRESSES, stated plainly because the module's own header already admits it. A
+    hash-chained log is tamper-EVIDENT only to someone who already knows what the head was. Anyone with
+    write access to the log AND the code can recompute a complete, internally consistent chain over
+    their own edits - every hash matches, and verification reports a clean log. That is a property of
+    every hash chain, not a defect here, and the fix is not more hashing: it is putting the head
+    SOMEWHERE THE LOG'S EDITOR DOES NOT CONTROL.
+
+    WHAT AN ANCHOR IS. A small record - sequence number, head hash, timestamp, log size - written to a
+    SEPARATE location. It proves nothing on its own. Its value is entirely in the comparison that
+    becomes possible later: if the head recorded in the anchor at time T is not on the chain that the
+    log presents now, then everything before that point was rewritten. Without an anchor there is
+    nothing to compare against, and a perfectly forged chain is indistinguishable from a real one.
+
+    WHY IT IS A SEPARATE FILE AND NOT A ROW IN THE LOG. An anchor inside the log it anchors is worthless:
+    the same write access that rewrites the log rewrites the anchor with it. The whole value is
+    SEPARATION, so the caller must place the anchor file on a different volume, a share the audited
+    operator cannot write, or in source control - somewhere this process's log-write path does not reach.
+    The file's own location is therefore part of the control, and the note on every anchor says so.
+
+    WHAT IT IS NOT. It is NOT non-repudiation, and this comment will not pretend otherwise: an operator
+    who can rewrite the anchor too has the same power as before. Anchoring raises the cost from
+    "rewrite one file" to "rewrite two files in two places, and any copy anyone else already holds", and
+    that is the honest claim. Real non-repudiation needs a trusted timestamp or a signature by a key the
+    operator does not have - both deliberately out of scope for a tool that must run unattended with no
+    external service.
+
+    Returns a hashtable describing the anchor, and never throws: an anchor that cannot be written must
+    not fail the operation that produced the log entry. The caller decides whether to treat that as fatal
+    (an audited change with no anchor is weaker evidence, and an operator may want to know).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$AnchorPath,
+        [Parameter(Mandatory = $false)][string]$Operator = '',
+        [datetime]$Now = (Get-Date)
+    )
+
+    $result = @{ Written = $false; Seq = 0; Hash = ''; Reason = '' }
+
+    if (-not (Test-Path -LiteralPath $LogPath)) {
+        $result.Reason = "log file not found: $LogPath"
+        return $result
+    }
+    if (-not $AnchorPath) {
+        $result.Reason = 'no anchor path supplied'
+        return $result
+    }
+
+    # REFUSE TO ANCHOR INTO THE LOG'S OWN DIRECTORY. An anchor beside the log is written by the same
+    # access path as the log, so it adds no separation and creates a false sense of one. Refusing is the
+    # honest behaviour: silently writing a useless anchor is worse than not writing one, because the
+    # operator would believe they had an external anchor.
+    try {
+        $logDir = [System.IO.Path]::GetFullPath((Split-Path -Parent $LogPath))
+        $anchorDir = [System.IO.Path]::GetFullPath((Split-Path -Parent $AnchorPath))
+        if ($logDir -eq $anchorDir) {
+            $result.Reason = "anchor refused: the anchor directory is the log's own directory ('$logDir'), so it offers no separation from the log it anchors"
+            return $result
+        }
+    } catch {
+        # A path we cannot normalise is a caller error; reported rather than guessed at.
+        $result.Reason = "anchor refused: paths could not be normalised - $($_.Exception.Message)"
+        return $result
+    }
+
+    try {
+        $head = Get-WuuAuditChainHead -LogPath $LogPath
+        $size = 0
+        try { $size = (Get-Item -LiteralPath $LogPath).Length } catch { }
+
+        $anchor = [ordered]@{
+            Schema      = 'wuu.audit.anchor.v1'
+            AnchoredUtc = $Now.ToUniversalTime().ToString('o')
+            LogPath     = [System.IO.Path]::GetFullPath($LogPath)
+            LogBytes    = $size
+            Seq         = $head.Seq
+            HeadHash    = $head.Hash
+            Operator    = $Operator
+            # The claim is recorded WITH the artifact so nobody has to infer it from documentation.
+            Claim       = 'tamper-evident to the extent that this file is held separately from the log; NOT non-repudiation'
+            Note        = 'Hold this file somewhere the audited operator cannot write (another volume, a protected share, source control). If this file and the log are both writable by the same account, it proves nothing.'
+        }
+
+        $anchorDirPath = Split-Path -Parent $AnchorPath
+        if ($anchorDirPath -and -not (Test-Path -LiteralPath $anchorDirPath)) {
+            $null = New-Item -ItemType Directory -Path $anchorDirPath -Force -ErrorAction Stop
+        }
+        # UTF8 WITHOUT a BOM: this is an interchange artifact read by other tooling, and a BOM is a parse
+        # error in some JSON readers. (Source files in this repo DO need BOMs; this is not a source file.)
+        $json = $anchor | ConvertTo-Json -Depth 4
+        [System.IO.File]::WriteAllText($AnchorPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+
+        $result.Written = $true
+        $result.Seq = $head.Seq
+        $result.Hash = $head.Hash
+        $result.Reason = "anchored seq $($head.Seq) to $AnchorPath"
+    } catch {
+        $result.Reason = "anchor write failed: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Test-WuuAuditAnchor {
+    <#
+    .SYNOPSIS
+    Compares an anchor against the chain as it stands now (reviewer P3).
+    .DESCRIPTION
+    THE COMPARISON THE ANCHOR EXISTS FOR. It answers one question: is the hash the anchor recorded still
+    ON the chain the log presents? Three outcomes, and the distinction between them is the whole value:
+
+      Consistent  the anchored head is the current head, or the current head's chain reaches back to it
+                  intact. Nothing before the anchor point has changed.
+      Rewritten   the chain no longer contains the anchored hash at the anchored sequence number. THIS IS
+                  THE FINDING: the log was rebuilt after the anchor was taken, and a rebuilt log verifies
+                  cleanly on its own terms, so no amount of chain verification would have found it.
+      Unavailable the anchor is missing, unreadable, or does not cover this log.
+
+    Deliberately does NOT re-verify the whole log - that is Test-WuuAuditChain's job, and doing both here
+    would conflate two findings: "the chain is broken" and "the chain was rebuilt". A rewritten chain is
+    perfectly valid arithmetic; that is exactly why it needs an external comparison to detect.
+
+    A TRUNCATION is reported as Rewritten, not as a special case: a log whose head moved BACKWARD lost
+    records, and "the log no longer contains what it did" is the finding regardless of direction. An
+    anchor whose Seq exceeds the current head's Seq is the clearest form of it, and gets its own message.
+
+    Never throws: this is called from a release gate and a status command, and neither may fail because
+    the anchor is a day old or was written by a different host.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$AnchorPath
+    )
+
+    $verdict = @{
+        Available = $false; Consistent = $false; Rewritten = $false
+        AnchoredSeq = 0; AnchoredHash = ''; CurrentSeq = 0; CurrentHash = ''
+        Reason = ''
+    }
+
+    if (-not (Test-Path -LiteralPath $AnchorPath)) {
+        $verdict.Reason = "no anchor at $AnchorPath - nothing to compare against, so a rewritten log would be undetectable"
+        return $verdict
+    }
+    if (-not (Test-Path -LiteralPath $LogPath)) {
+        $verdict.Reason = "log file not found: $LogPath"
+        return $verdict
+    }
+
+    try {
+        $anchorRaw = Get-Content -LiteralPath $AnchorPath -Raw
+        $anchor = $anchorRaw | ConvertFrom-Json
+    } catch {
+        $verdict.Reason = "anchor could not be read: $($_.Exception.Message)"
+        return $verdict
+    }
+
+    if (-not $anchor.PSObject.Properties['HeadHash'] -or -not $anchor.PSObject.Properties['Seq']) {
+        $verdict.Reason = 'anchor is malformed (no HeadHash/Seq) - it cannot be compared'
+        return $verdict
+    }
+
+    $verdict.Available = $true
+    $verdict.AnchoredSeq = [int]$anchor.Seq
+    $verdict.AnchoredHash = [string]$anchor.HeadHash
+
+    # An anchor with no sequence number records nothing yet; treat as unavailable rather than as a break.
+    if ($verdict.AnchoredSeq -le 0 -or -not $verdict.AnchoredHash) {
+        $verdict.Reason = 'anchor records no records yet (seq 0) - nothing was anchored to compare'
+        $verdict.Available = $false
+        return $verdict
+    }
+
+    try {
+        $head = Get-WuuAuditChainHead -LogPath $LogPath
+        $verdict.CurrentSeq = [int]$head.Seq
+        $verdict.CurrentHash = [string]$head.Hash
+
+        if ($verdict.CurrentSeq -lt $verdict.AnchoredSeq) {
+            $verdict.Rewritten = $true
+            $verdict.Reason = "the log is SHORTER than when it was anchored (anchor seq $($verdict.AnchoredSeq), log now $($verdict.CurrentSeq)) - records were removed"
+            return $verdict
+        }
+
+        if ($verdict.CurrentSeq -eq $verdict.AnchoredSeq) {
+            if ($verdict.CurrentHash -ceq $verdict.AnchoredHash) {
+                $verdict.Consistent = $true
+                $verdict.Reason = "the log is unchanged since the anchor (seq $($verdict.AnchoredSeq))"
+            } else {
+                # Same length, different head: the log was replaced with a log of the same size. The
+                # most deliberate-looking form of tampering, and the one a length check alone would miss.
+                $verdict.Rewritten = $true
+                $verdict.Reason = "the log has the anchored LENGTH but a different head hash at seq $($verdict.AnchoredSeq) - it was replaced, not merely appended to"
+            }
+            return $verdict
+        }
+
+        # The log has grown. The anchored hash must still appear at the anchored sequence number.
+        $found = Get-WuuAuditRecordAtSeq -LogPath $LogPath -Seq $verdict.AnchoredSeq
+        if ($null -eq $found) {
+            $verdict.Rewritten = $true
+            $verdict.Reason = "the anchored sequence $($verdict.AnchoredSeq) is gone, though the log is longer now (seq $($verdict.CurrentSeq)) - the earlier records were rebuilt"
+        } elseif ([string]$found.Hash -ceq $verdict.AnchoredHash) {
+            $verdict.Consistent = $true
+            $verdict.Reason = "the anchored record is intact at seq $($verdict.AnchoredSeq); the log has since grown to seq $($verdict.CurrentSeq)"
+        } else {
+            $verdict.Rewritten = $true
+            $verdict.Reason = "seq $($verdict.AnchoredSeq) now hashes to a DIFFERENT value than when it was anchored - the record was rewritten"
+        }
+    } catch {
+        $verdict.Reason = "comparison failed: $($_.Exception.Message)"
+    }
+
+    return $verdict
+}
+
+function Get-WuuAuditRecordAtSeq {
+    <#
+    .SYNOPSIS The recorded Hash of the record with a given sequence number, or $null (P3).
+    .DESCRIPTION
+    Used only by Test-WuuAuditAnchor, to check that an anchored record survives in a log that has since
+    grown. Reads the file ONCE and scans it; the log is line-delimited JSON, so this is a simple scan
+    rather than a second implementation of the chain walk.
+
+    Returns $null when the sequence number is absent, which the caller reports as a rewrite rather than
+    as an error: a missing record in a log that claims to be longer is a finding.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][int]$Seq
+    )
+
+    if (-not (Test-Path -LiteralPath $LogPath)) { return $null }
+    try {
+        $lines = [System.IO.File]::ReadAllLines($LogPath)
+    } catch {
+        return $null
+    }
+
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try {
+            $rec = $line | ConvertFrom-Json
+        } catch {
+            continue   # a partially written trailing line is normal; skip it
+        }
+        if ($rec.PSObject.Properties['Seq'] -and [int]$rec.Seq -eq $Seq) {
+            return [pscustomobject]@{
+                Seq  = [int]$rec.Seq
+                Hash = if ($rec.PSObject.Properties['Hash']) { [string]$rec.Hash } else { '' }
+            }
+        }
+    }
+    return $null
+}
+
+#endregion External anchoring
+
 #region Verification
 
 function Test-WuuAuditChain {
@@ -760,6 +1029,12 @@ Export-ModuleMember -Function @(
     'Write-WuuAuditRecord'
     'Get-WuuAuditChainHead'
     'Test-WuuAuditChain'
+    # P3: EXTERNAL ANCHORING. Exported because the anchor must be written and compared by callers that
+    # HOLD IT SOMEWHERE ELSE - a release gate, a status command, a scheduled job that copies it off-box.
+    # The separation is the control, so the functions cannot be private to this module.
+    'New-WuuAuditAnchor'
+    'Test-WuuAuditAnchor'
+    'Get-WuuAuditRecordAtSeq'
     'Invoke-WuuAuditedAction'
     'Write-WuuAuditDenial'
     'Resolve-WuuAuditCategory'

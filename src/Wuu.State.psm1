@@ -378,6 +378,121 @@ function Format-WuuDuration {
     return ('{0}h{1:d2}m' -f $h, $rem)
 }
 
+function Get-WuuOperationRemainingSeconds {
+    <#
+    .SYNOPSIS
+    Seconds left before a running operation's deadline (P3: remaining-budget propagation).
+    .DESCRIPTION
+    WHY THIS EXISTS. The deadline was enforced only at the OUTERMOST level: the cleanup loop kills a
+    payload that overruns its budget. But a payload's inner probes each take a FIXED timeout of their
+    own (Invoke-CimWithTimeout defaults to 5s, Invoke-ServiceWithTimeout to 30s), and those numbers are
+    chosen independently of how much budget the operation has left.
+
+    The failure that produces, and it is not theoretical: an operation with a 45-minute budget reaches
+    the 44-minute mark and starts a probe with a 10-second timeout, so a probe that would have answered
+    in 15 seconds is killed for no reason other than timing - the operator sees a probe failure and
+    concludes the host is broken. Conversely an operation ONE second from expiry still starts a 30-second
+    probe, and the pool slot is held for 29 seconds AFTER the cleanup loop has already given up on the
+    operation, starving other work (see the pool diagnostics).
+
+    THE RULE THIS ENABLES: an inner call takes min(its own timeout, what is left). Both halves matter -
+    capping only at the budget keeps a call from outliving its operation, and keeping the call's own
+    timeout as the ceiling stops a generous operation from handing a probe a budget it was never designed
+    for.
+
+    Returns a hashtable, never a bare number, because the caller has to distinguish three cases that a
+    number cannot express:
+      Known        $false means NO deadline is recorded, so there is nothing to cap against - the caller
+                   must use its own timeout rather than being handed a fabricated one. This is the
+                   load-bearing distinction: returning 0 for "unknown" would make every probe fail
+                   immediately, and returning a large number would silently remove the ceiling.
+      Remaining    seconds left, or $null when not Known. NEVER clamped to 0: a negative value means the
+                   operation is ALREADY past its deadline, and collapsing that to 0 would hide the
+                   overshoot from the caller's log.
+      Op           the operation name recorded on the row, for the caller's message.
+      ExpiresAt    the deadline itself.
+
+    Pure, side-effect free, $null-tolerant: called from payload scriptblocks, which have no exception
+    handling around them and must never be broken by a diagnostic.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$Row,
+        [datetime]$Now = (Get-Date)
+    )
+
+    $result = @{ Known = $false; Remaining = $null; Op = ''; ExpiresAt = $null }
+
+    if ($null -eq $Row) { return $result }
+    if (-not $Row.PSObject.Properties['TimeoutExpiresAt']) { return $result }
+
+    $expires = $Row.TimeoutExpiresAt
+    if ($null -eq $expires) { return $result }
+    # A string that cannot be parsed as a date is treated as "no deadline" rather than as epoch, which
+    # would report an enormous remaining budget and silently remove the ceiling.
+    try { $expires = [datetime]$expires } catch { return $result }
+
+    if ($Row.PSObject.Properties['OpName']) { $result.Op = [string]$Row.OpName }
+    $result.Known = $true
+    $result.ExpiresAt = $expires
+    # NOT clamped: a negative result is the overshoot, which the caller reports.
+    $result.Remaining = [int][math]::Floor(($expires - $Now).TotalSeconds)
+    return $result
+}
+
+function Get-WuuEffectiveInnerTimeout {
+    <#
+    .SYNOPSIS
+    An inner call's timeout, capped by what is left of the operation's budget (P3).
+    .DESCRIPTION
+    THE RULE, in one place: min(TheInnerTimeout, remaining budget). Both halves are load-bearing:
+      * cap at the remaining budget, so an inner call cannot outlive the operation that owns it, holding
+        a pool slot and reporting a failure after the cleanup loop has already given up;
+      * keep the inner call's own timeout as the ceiling, so a generous operation does not hand a probe a
+        far larger timeout than it was designed for - the probe's own number encodes an expectation about
+        how long that call SHOULD take, and overriding it upward would defeat it.
+    A floor is applied so a probe that is genuinely about to expire still gets a usable slice rather than
+    1 second: a 1-second CIM call reports "timed out" for a host that was merely slow, which is a false
+    negative that costs an operator a real investigation.
+
+    Returns @{ Seconds; Capped; Reason } - the reason carries into the caller's log, because "the probe
+    timed out after 4s instead of 30s" is only explicable if the log says the operation was about to
+    expire.
+
+    When no deadline is recorded (Known = $false) the inner timeout is returned UNCHANGED and Capped is
+    $false: there is no budget to cap against, and inventing one would silently change the behaviour of
+    every operation submitted outside the normal path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$InnerTimeoutSeconds,
+        [Parameter(Mandatory = $false)][AllowNull()]$Row = $null,
+        [Parameter(Mandatory = $false)][int]$FloorSeconds = 5,
+        [datetime]$Now = (Get-Date)
+    )
+
+    if ($InnerTimeoutSeconds -le 0) {
+        return @{ Seconds = $InnerTimeoutSeconds; Capped = $false; Reason = 'no inner timeout to cap' }
+    }
+
+    $budget = Get-WuuOperationRemainingSeconds -Row $Row -Now $Now
+    if (-not $budget.Known) {
+        return @{ Seconds = $InnerTimeoutSeconds; Capped = $false; Reason = 'no deadline recorded - the inner timeout stands' }
+    }
+
+    $remaining = [int]$budget.Remaining
+    if ($remaining -ge $InnerTimeoutSeconds) {
+        return @{ Seconds = $InnerTimeoutSeconds; Capped = $false; Reason = "budget permits the full $InnerTimeoutSeconds s (${remaining}s left)" }
+    }
+
+    # Below the ceiling, so cap - but never below the floor.
+    $capped = [math]::Max($FloorSeconds, $remaining)
+    if ($capped -eq $remaining) {
+        return @{ Seconds = $capped; Capped = $true; Reason = "capped to the $remaining s left of operation '$($budget.Op)'" }
+    }
+    return @{ Seconds = $capped; Capped = $true; Reason = "capped to the ${FloorSeconds}s floor (only $remaining s of operation '$($budget.Op)' remained - the operation is about to expire)" }
+}
+
 function Test-WuuOperationExpired {
     <#
     .SYNOPSIS
@@ -1844,5 +1959,10 @@ Export-ModuleMember -Function @(
     'Set-WuuOperationDeadline'
     'Clear-WuuOperationDeadline'
     'Update-WuuOperationHeartbeat'
+    # P3: REMAINING-BUDGET PROPAGATION. Exported because the inner probes that need capping live in
+    # payload scriptblocks, and the rule has to be applied at each call site - one place for the rule,
+    # many places that ask for it.
+    'Get-WuuOperationRemainingSeconds'
+    'Get-WuuEffectiveInnerTimeout'
     'New-WuuOperatorContext'
 )

@@ -1361,8 +1361,56 @@ $GetUpdates = {
                 [int]$TimeoutSeconds = 5,
                 # PSCredential (never a plain string) so a password can't leak into logs/UI
                 [pscredential]$Credential = $null,
-                [string]$Operation = 'CIM operation'
+                [string]$Operation = 'CIM operation',
+                # P3: the row this probe belongs to, so the timeout can be capped by the operation's
+                # REMAINING budget. Optional because a probe may run outside any operation (a pre-flight
+                # connectivity test), in which case there is no budget to cap against and $null is honest.
+                $Row = $null
             )
+            # P3: min(own timeout, remaining budget). Without this a probe whose own timeout is 10s can
+            # still run for 10s AFTER the operation's deadline has passed, holding a pool slot the cleanup
+            # loop has already abandoned - and it reports a timeout for a host that was merely slow at the
+            # wrong moment.
+            #
+            # INLINED ON PURPOSE. This function is DEFINED inside a payload scriptblock, so it executes in
+            # an isolated runspace whose InitialSessionState is CreateDefault() with no module imported -
+            # and a module function is NOT callable there. Verified on this host (tests\Probe-PayloadFunctionReach.ps1):
+            # Get-Command Get-WuuEffectiveInnerTimeout returns nothing inside such a runspace, so the call
+            # this replaced would have thrown on EVERY production probe. Only $WuuWorkerPool, $Row and the
+            # other SetVariable'd objects are reachable.
+            #
+            # The rule (min(own, remaining), with a floor, and "no deadline means do not cap") is duplicated
+            # arithmetic, so it is ASSERTED to agree with Get-WuuEffectiveInnerTimeout by
+            # tests\Test-RemainingBudget.ps1 rather than left to drift. Keep the two in step.
+            #
+            # $TimeoutSeconds -gt 0 mirrors the helper's early return: 0 means "no timeout" to the
+            # underlying API, and raising it to the floor would turn "wait indefinitely" into "wait 5
+            # seconds" exactly when the operation is overdue.
+            #
+            # The cap lands in a LOCAL ($effectiveTimeout), not back onto the $TimeoutSeconds parameter.
+            # Reassigning a parameter is a gated defect class in this project (the gate's case-insensitive
+            # collision check): a declared type is enforced on every assignment, so a later coercion can
+            # throw where a local cannot. The original version of this block reassigned the parameter and
+            # the gate rejected it.
+            $effectiveTimeout = $TimeoutSeconds
+            if ($TimeoutSeconds -gt 0 -and $null -ne $Row) {
+                $rowExpiry = $Row.PSObject.Properties['TimeoutExpiresAt']
+                if ($rowExpiry -and $Row.TimeoutExpiresAt) {
+                    # A row whose deadline cannot be parsed is treated as HAVING one, and the cap applies:
+                    # an unreadable deadline is not evidence that there is no deadline.
+                    $rowExpiryDate = $null
+                    try { $rowExpiryDate = [datetime]$Row.TimeoutExpiresAt } catch { $rowExpiryDate = $null }
+                    if ($null -eq $rowExpiryDate) {
+                        $effectiveTimeout = [math]::Max(5, $TimeoutSeconds)
+                    } else {
+                        # Truncated toward zero, matching [int] on the helper's float: an int cast would
+                        # be identical for positive values and would diverge for negatives, and the two
+                        # sides of this duplicated rule are required to agree (tests\Test-RemainingBudget).
+                        $remaining = [int](($rowExpiryDate - (Get-Date)).TotalSeconds)
+                        if ($remaining -lt $TimeoutSeconds) { $effectiveTimeout = [math]::Max(5, $remaining) }
+                    }
+                }
+            }
             try {
                 $cimResult = & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock {
                     # $Cred is always a PSCredential (or $null for default credentials).
@@ -1383,7 +1431,7 @@ $GetUpdates = {
                     } finally {
                         if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
                     }
-                } -ArgumentList @($ComputerName, $ClassName, $Credential) -TimeoutSeconds $TimeoutSeconds -OperationName $Operation
+                } -ArgumentList @($ComputerName, $ClassName, $Credential) -TimeoutSeconds $effectiveTimeout -OperationName $Operation
                 if ($cimResult.Success) {
                     $inner = $cimResult.Result
                     if ($inner -and $inner.Success) {
@@ -1418,10 +1466,45 @@ $GetUpdates = {
         [ValidateRange(1, 300)]
         [int]$TimeoutSeconds = 30,
 
+        # P3: the row this probe belongs to, so the timeout can be capped by the operation's REMAINING
+        # budget. Optional for the same reason as Invoke-CimWithTimeout's.
+        [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        $Row = $null,
+
         [Parameter(Mandatory=$false)]
         [ValidateRange(0, 60)]
         [int]$PostActionDelay = 5
     )
+
+    # P3: min(own timeout, remaining budget), the same rule Invoke-CimWithTimeout applies. A service
+    # action holds the pool slot for its duration, so letting it outlive the operation is exactly the
+    # starvation case the pool diagnostics exist to expose.
+    #
+    # INLINED ON PURPOSE - see the longer note in Invoke-CimWithTimeout. Both functions execute inside an
+    # isolated payload runspace with no module imported, where Get-WuuEffectiveInnerTimeout is NOT
+    # callable (verified: tests\Probe-PayloadFunctionReach.ps1). The rule is shared arithmetic, asserted to
+    # agree with the Wuu.State helper by tests\Test-RemainingBudget.ps1. Keep the two in step.
+    #
+    # $TimeoutSeconds -gt 0 mirrors the helper's early return - see Invoke-CimWithTimeout.
+    #
+    # The cap lands in a LOCAL for the same reason as Invoke-CimWithTimeout: reassigning a parameter is a
+    # gated defect class here, because a declared type is enforced on every assignment and a later
+    # coercion can throw where a local cannot. The gate rejected the parameter-reassigning version.
+    $effectiveTimeout = $TimeoutSeconds
+    if ($TimeoutSeconds -gt 0 -and $null -ne $Row) {
+        $rowExpiry = $Row.PSObject.Properties['TimeoutExpiresAt']
+        if ($rowExpiry -and $Row.TimeoutExpiresAt) {
+            $rowExpiryDate = $null
+            try { $rowExpiryDate = [datetime]$Row.TimeoutExpiresAt } catch { $rowExpiryDate = $null }
+            if ($null -eq $rowExpiryDate) {
+                $effectiveTimeout = [math]::Max(5, $TimeoutSeconds)
+            } else {
+                $remaining = [int](($rowExpiryDate - (Get-Date)).TotalSeconds)
+                if ($remaining -lt $TimeoutSeconds) { $effectiveTimeout = [math]::Max(5, $remaining) }
+            }
+        }
+    }
 
     try {
         # A service check is a simple remote SCM query.
@@ -1480,7 +1563,7 @@ $GetUpdates = {
                 }
             }
 
-        } -ArgumentList @($ComputerName, $ServiceName, $Action, $PostActionDelay) -TimeoutSeconds $TimeoutSeconds -OperationName "Service $Action"
+} -ArgumentList @($ComputerName, $ServiceName, $Action, $PostActionDelay) -TimeoutSeconds $effectiveTimeout -OperationName "Service $Action"
 
         if ($poolResult.Success -and $poolResult.Result) {
             return $poolResult.Result
@@ -1655,7 +1738,7 @@ $GetUpdates = {
                         & $WriteLogFileScript $logEntry
                     }
                     
-                    $wmiResult = Invoke-CimWithTimeout -ComputerName $Computer.computer -ClassName 'Win32_ComputerSystem' -TimeoutSeconds 5 -Operation 'WMI connectivity test'
+                    $wmiResult = Invoke-CimWithTimeout -ComputerName $Computer.computer -ClassName 'Win32_ComputerSystem' -TimeoutSeconds 5 -Operation 'WMI connectivity test' -Row $Computer
                     
                     if ($wmiResult -and $wmiResult.Success) {
                         $wmiTest = $wmiResult.Result
@@ -1686,7 +1769,7 @@ $GetUpdates = {
                     if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
                         $wuService = Get-Service -Name "wuauserv" -ErrorAction Stop
                     } else {
-                        $serviceResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Check' -TimeoutSeconds 5
+                        $serviceResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Check' -TimeoutSeconds 5 -Row $Computer
                         
                         if ($serviceResult -and $serviceResult.Success) {
                             $wuService = $serviceResult.Service
@@ -1708,7 +1791,7 @@ $GetUpdates = {
                             Write-Warning "Windows Update service is not running on $($Computer.computer). Attempting to start..."
                             
                             # Best-effort start: failure here is not fatal either (COM search auto-starts)
-                            $startResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Start' -TimeoutSeconds 10 -PostActionDelay 5
+                            $startResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Start' -TimeoutSeconds 10 -PostActionDelay 5 -Row $Computer
                             
                             if ($startResult -and $startResult.Success) {
                                 $wuService = $startResult.Service
