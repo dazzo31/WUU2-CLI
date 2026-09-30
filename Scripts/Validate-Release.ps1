@@ -9,9 +9,51 @@
 #   3. every module in src/ imports through the real path (Import-WuuModules);
 #   4. the engine imports WITHOUT a WPF assembly being loaded (the Phase 1 acceptance property);
 #   5. each console menu key maps to an action the action layer actually defines.
+#
+# --- MACHINE-READABLE MODE (reviewer P4) ---------------------------------------------------------
+# -Json writes every verdict to a JSON file so CI can gate on a FIELD rather than on scraping text,
+# and so the five verdict kinds are distinguishable. Without it a consumer had exactly two signals
+# (a line matching '^FAIL:' and the exit code), which cannot express "this check did not run" or
+# "this is advisory".
+#
+# THE DEFAULT OUTPUT IS DELIBERATELY UNCHANGED. The verdict helpers still write to the host with the
+# same wording and colours in both modes, so a human reading a -Json run sees exactly what they see
+# today; -Json ADDS a file. The risk this avoids is the usual one with a machine-readable mode: the
+# human output becomes a rendering of the machine output and quietly loses detail that only ever
+# lived in a sentence.
+#
+# THE FIVE VERDICTS AND WHY THEY ARE FIVE (not two):
+#   PASS             the assertion holds
+#   FAIL             the assertion is violated - the release must not ship
+#   WARN             a concern that is not a release blocker
+#   SKIP             NOT RUN, and this is why it must not be reported as a pass. A skipped check that
+#                    reads as PASS is worse than no check: it buys confidence without evidence
+#   NOT_IMPLEMENTED  the property has no check at all. The reviewer asked for this explicitly, and the
+#                    distinction matters: "we verified this" and "we have not built a verifier" are
+#                    different facts, and conflating them is how a gap becomes invisible.
+#
+# The verdict list is ORDERED by severity and the summary counts every kind, so a NOT_IMPLEMENTED can
+# never be mistaken for a PASS by a consumer that only looks at totals.
+param(
+    [Parameter(Mandatory = $false)][string]$Json = ''
+)
+
 $failed = $false
-function Fail($m) { Write-Host "FAIL: $m" -ForegroundColor Red; $script:failed = $true }
-function Pass($m) { Write-Host "PASS: $m" -ForegroundColor Green }
+$script:WuuGateVerdicts = New-Object System.Collections.Generic.List[object]
+
+function Add-WuuGateVerdict([string]$Status, [string]$Message) {
+    $script:WuuGateVerdicts.Add([pscustomobject]@{ Status = $Status; Message = $Message }) | Out-Null
+}
+
+function Fail($m) { Write-Host "FAIL: $m" -ForegroundColor Red; $script:failed = $true; Add-WuuGateVerdict 'FAIL' $m }
+function Pass($m) { Write-Host "PASS: $m" -ForegroundColor Green; Add-WuuGateVerdict 'PASS' $m }
+# Warn does NOT set $failed: an advisory verdict that blocked a release would make WARN a synonym for
+# FAIL, and then nobody would dare emit one.
+function Warn($m) { Write-Host "WARN: $m" -ForegroundColor Yellow; Add-WuuGateVerdict 'WARN' $m }
+# Skip records that a check did not run. It is a distinct verdict precisely so that
+# "not evaluated" cannot be counted as "evaluated and clean".
+function Skip($m) { Write-Host "SKIP: $m" -ForegroundColor DarkGray; Add-WuuGateVerdict 'SKIP' $m }
+function Not-Implemented($m) { Write-Host "NOT_IMPLEMENTED: $m" -ForegroundColor DarkYellow; Add-WuuGateVerdict 'NOT_IMPLEMENTED' $m }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
@@ -1961,8 +2003,10 @@ if (-not $embeddedVersionM) {
         } elseif ($versionCheck -and $versionCheck.Source -eq 'tag') {
             Pass "the embedded version matches the git tag at HEAD ($($versionCheck.Version)) (SS18)"
         } else {
-            # Not on a tag (a commit between releases) is legitimate - report it rather than fail.
-            Pass "version $($versionCheck.Version) resolved from source; $($versionCheck.Note) (SS18)"
+            # NOT ON A TAG (a commit between releases). This is legitimate, but the check did not
+            # actually run - and reporting it as PASS would claim a verified property that was never
+            # evaluated. SKIP says exactly that, which is why the kind exists.
+            Skip "version provenance not evaluated: $($versionCheck.Note) - the tag comparison does not apply off a release tag (SS18)"
         }
     } catch {
         Fail "could not resolve the version for the mismatch check: $($_.Exception.Message)"
@@ -2395,6 +2439,237 @@ if (-not (Test-Path -LiteralPath (Join-Path $root 'src\Wuu.Scheduler.psm1'))) {
     Fail 'Wuu.Scheduler is not in the import list - nothing would wire the worker helper set (P2)'
 } else {
     Pass 'Wuu.Scheduler exists and is imported (P2)'
+}
+
+function Write-WuuGateJsonReport([string]$Path) {
+    <#
+    .SYNOPSIS
+    Writes the verdicts to a JSON file (P4). Called before EVERY exit path.
+    .DESCRIPTION
+    WHY A FUNCTION AND NOT INLINE. The gate has two exit points (the normal one and the failure one),
+    and a report written on only one of them would be missing exactly when it is most useful - a
+    failing run. One function, called from both, removes that possibility.
+    #>
+    # .ToArray(), NOT @(...). On PowerShell 5.1 `@($list)` over a
+    # System.Collections.Generic.List[object] raises "Argument types do not match" - reproduced in
+    # isolation - and because that is a NON-TERMINATING error, the assignment silently yields $null.
+    # The report then contained ONE verdict whose fields were all null, because `$null | ForEach-Object`
+    # still iterates once. Every total read 0 while the gate itself passed. `.ToArray()` enumerates the
+    # list correctly. Any future `@()` over this list inherits the same trap.
+    $verdicts = $script:WuuGateVerdicts.ToArray()
+
+    try {
+        # Count EVERY verdict kind. A consumer that only reads Failures and Passes would treat a
+        # NOT_IMPLEMENTED as absent rather than as "no verifier exists", and an unreported gap is the
+        # failure mode this mode exists to remove.
+        $report = [ordered]@{
+            Schema        = 'wuu.gate.v1'
+            GeneratedUtc  = (Get-Date).ToUniversalTime().ToString('o')
+            Root          = $root
+            Passed        = (-not $script:failed)
+            Totals        = [ordered]@{
+                PASS            = @($verdicts | Where-Object { $_.Status -eq 'PASS' }).Count
+                FAIL            = @($verdicts | Where-Object { $_.Status -eq 'FAIL' }).Count
+                WARN            = @($verdicts | Where-Object { $_.Status -eq 'WARN' }).Count
+                SKIP            = @($verdicts | Where-Object { $_.Status -eq 'SKIP' }).Count
+                NOT_IMPLEMENTED = @($verdicts | Where-Object { $_.Status -eq 'NOT_IMPLEMENTED' }).Count
+            }
+            Verdicts      = @($verdicts | ForEach-Object { [ordered]@{ Status = $_.Status; Message = $_.Message } })
+        }
+
+        $json = $report | ConvertTo-Json -Depth 6
+        # UTF8 WITHOUT a BOM: a BOM is legal JSON in some readers and a parse error in others, and the
+        # consumers here are scripts and CI tools. (The SOURCE files need BOMs; this artifact does not.)
+        [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "  gate report written to $Path ($($verdicts.Count) verdict(s))" -ForegroundColor DarkGray
+        return $true
+    } catch {
+        # A report-write failure must not change the gate's verdict - the exit code is the contract, and
+        # this is the diagnostic. Reported loudly rather than swallowed, because a silently missing
+        # report would make CI's own gate look like a configuration error.
+        Write-Host "  WARNING: could not write the gate report to $Path : $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+if ($Json) {
+    $jsonPath = if ([System.IO.Path]::IsPathRooted($Json)) { $Json } else { Join-Path $root $Json }
+}
+
+# (as) THE JSON REPORT AND THE FIVE VERDICT KINDS (reviewer P4). The gate had two signals - a line
+#      matching '^FAIL:' and the exit code - which cannot express "did not run" or "advisory". It now
+#      has five kinds, and a consumer can gate on a FIELD rather than scraping text.
+#
+#      WHY THIS BLOCK IS NEEDED AT ALL, given the report is generated by the code it describes: the
+#      verdict kinds were DEFINED and NEVER EMITTED. WARN, SKIP and NOT_IMPLEMENTED appeared in the
+#      helper definitions and in the report schema but at no call site, so the report's own totals read
+#      WARN=0 SKIP=0 NOT_IMPLEMENTED=0 on every run - a schema advertising capability that did not
+#      exist. That is the same defect as exit code 4 being reserved-but-unproducible, and a reserved
+#      verdict is worse than an absent one because the report claims the distinction is available.
+$selfText = Get-Content -LiteralPath $PSCommandPath -Raw
+$gateCode = Get-WuuTextWithoutComments -Text $selfText
+foreach ($kind in @('Warn', 'Skip', 'Not-Implemented')) {
+    # Count INVOCATIONS, not the definition. `function Warn($m) {` and the report's 'WARN' string both
+    # contain the word; only a call site means the kind is reachable.
+    $calls = ([regex]::Matches($gateCode, "(?m)^\s*$([regex]::Escape($kind))\s")).Count
+    if ($calls -eq 0) {
+        Fail "the '$kind' verdict is defined but never emitted - the report advertises a distinction no check can produce (P4)"
+    }
+}
+if (-not $failed) {
+    Pass 'every verdict kind (PASS/FAIL/WARN/SKIP/NOT_IMPLEMENTED) is emitted by at least one check (P4)'
+}
+
+# The report must be produced before the exit, so a FAILING run also yields a report - the case where
+# it is most useful - and it must be produced AFTER every check, or the last blocks are missing from it.
+#
+# THE PROPERTY ASSERTED IS "NO VERDICT IS EMITTED AFTER THE WRITER", not "there is exactly one exit".
+# An earlier version counted exit statements and kept counting its own quoted token: comment-stripping
+# removes comments but NOT string literals, so the check's own pattern text inflated the count twice in a
+# row. Counting occurrences of a token the check must quote is self-defeating. The window between the
+# writer and the exit contains no such token and states the real requirement directly.
+$writerCalls = ([regex]::Matches($gateCode, 'Write-WuuGateJsonReport')).Count
+$writerIdx = $gateCode.LastIndexOf('Write-WuuGateJsonReport -Path')
+$exitIdx = $gateCode.LastIndexOf('Validation FAILED')
+$lastCheckIdx = $gateCode.LastIndexOf('Not-Implemented')
+
+if ($writerCalls -lt 2) {
+    Fail "the report writer is referenced $writerCalls time(s) - it must be both defined and called (P4)"
+} elseif ($writerIdx -lt 0) {
+    Fail 'the report writer is never CALLED (only defined) - no report would be produced (P4)'
+} elseif ($exitIdx -lt 0 -or $exitIdx -lt $writerIdx) {
+    Fail 'the report writer is not followed by the failure exit - a failing run could produce no report (P4)'
+} else {
+    $window = $gateCode.Substring($writerIdx, $exitIdx - $writerIdx)
+    $lateVerdicts = ([regex]::Matches($window, '(?m)^\s*(Pass|Fail|Warn|Skip|Not-Implemented)\s')).Count
+    if ($lateVerdicts -gt 0) {
+        # THE BUG THIS CATCHES, and it was real: the writer was placed BEFORE the final blocks, so the
+        # report was written WITHOUT them. It held 145 verdicts while the gate had emitted more, and
+        # WARN / SKIP / NOT_IMPLEMENTED never appeared in it at all - the three kinds this mode exists to
+        # expose were absent from the artifact that exposes them. A report silently missing its last
+        # checks is worse than no report, because it looks complete.
+        Fail "the report is written before $lateVerdicts further verdict(s) - they would be missing from it (P4)"
+    } elseif ($lastCheckIdx -gt $writerIdx) {
+        Fail 'a check block appears after the report writer - its verdicts would be missing from the report (P4)'
+    } else {
+        Pass 'the report is written after every check and before the failure exit, so a failing run still reports (P4)'
+    }
+}
+
+# The trap that silently produced an EMPTY report: @() over a generic List throws on PS 5.1.
+if ($gateCode -match '@\(\s*\$script:WuuGateVerdicts\s*\)') {
+    Fail 'the report reads the verdict list with @(...) - on PS 5.1 that throws over a generic List and the assignment silently becomes $null, producing a report of one null verdict (P4)'
+} elseif ($gateCode -notmatch 'WuuGateVerdicts\.ToArray\(\)') {
+    Fail 'the report does not enumerate the verdict list with .ToArray() (P4)'
+} else {
+    Pass 'the report enumerates the verdict list safely (.ToArray(), not @() which throws on PS 5.1) (P4)'
+}
+
+# (at) WORKER POOL DIAGNOSTICS (reviewer P3). The pool is a HARD CAP on concurrent bounded probes, and
+#      two of its failure modes are invisible without this: POOL EXHAUSTION (every worker waiting on a
+#      probe that cannot start, with no error raised) and ABANDONED WRAPPERS (a probe whose DCOM/RPC call
+#      would not abort is deliberately left running, permanently holding a pool slot until the stuck call
+#      returns - sustained abandonment walks capacity to zero). Both present to a caller as "every host is
+#      slow", which is a wrong diagnosis that costs real time.
+#
+#      The checks here are the WARN and NOT_IMPLEMENTED sites the report schema promises. A gate whose
+#      schema offers WARN while no check can emit one is advertising a distinction it does not have; that
+#      was true until this block existed.
+$workersRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Workers.psm1') -Raw
+$workersCode = Get-WuuTextWithoutComments -Text $workersRaw
+
+if ($workersCode -notmatch 'function Get-WuuWorkerPoolDiagnostics') {
+    Fail 'the worker pool has no diagnostics surface - saturation and abandoned wrappers are invisible (P3)'
+} elseif ($workersCode -notmatch 'function Test-WuuWorkerPoolStarved') {
+    Fail 'the pool exposes no starvation predicate, so "the pool is nearly out of slots" cannot be asserted (P3)'
+} elseif ($workersCode -notmatch "'Get-WuuWorkerPoolDiagnostics'") {
+    Fail 'Get-WuuWorkerPoolDiagnostics is not exported - session-state isolation hides $script: values, so an unexported function is unreachable (P3)'
+} else {
+    Pass 'the worker pool exposes exported capacity, utilisation, abandoned-wrapper and starvation diagnostics (P3)'
+}
+
+# The four fields the reviewer named must be present by name, because a consumer keys on them.
+foreach ($field in @('ActivePoolWorkers', 'AbandonedWorkers', 'PoolCapacity', 'PoolUtilisation')) {
+    # The reviewer's names are the CONTRACT. They are aliased onto the diagnostic record so a consumer
+    # written against them works, while the record keeps its shorter internal names.
+    if ($workersCode -notmatch ([regex]::Escape($field))) {
+        Fail "the pool diagnostics do not expose '$field', which is the field name the reviewer specified (P3)"
+    }
+}
+
+# DRIVE THE PREDICATE, not just its presence. A starvation check that always returns $false would make
+# anything built on it inert. This calls it and requires a well-formed answer on a real pool state.
+if (Get-Command Test-WuuWorkerPoolStarved -ErrorAction SilentlyContinue) {
+    try {
+        $starve = Test-WuuWorkerPoolStarved
+        # INDEXED, not dot-PSObject-property. The predicate returns a Hashtable (as its own contract
+        # says), and .PSObject.Properties does NOT surface hashtable keys - an earlier version of this
+        # check therefore reported "does not return a Starved field" for a predicate that returns it.
+        # Indexing works for a Hashtable, an OrderedDictionary and a PSCustomObject alike.
+        if ($null -eq $starve -or -not ($starve -is [System.Collections.IDictionary])) {
+            Fail 'Test-WuuWorkerPoolStarved does not return a dictionary - callers cannot look up Starved (P3)'
+        } elseif (-not $starve.Contains('Starved')) {
+            Fail 'Test-WuuWorkerPoolStarved does not return a Starved field - callers cannot branch on it (P3)'
+        } elseif ([int]$starve['Capacity'] -le 0) {
+            Fail "the pool reports a non-positive capacity ($($starve['Capacity'])) - the starvation threshold is a share of capacity and cannot be computed (P3)"
+        } else {
+            # ADVISORY, NOT A BLOCKER. Abandoned wrappers are a consequence of a stuck remote call, not a
+            # defect in this tree - a release must not be blocked by a host that would not answer an RPC
+            # request, and blocking on it would train people to ignore the gate.
+            if ($starve['Starved']) {
+                Warn "the worker pool is starved: $($starve['Reason']) - bounded probes will queue and present as slow hosts (P3)"
+            } else {
+                Pass "the worker pool is not starved (abandoned $($starve['Abandoned']) of $($starve['Capacity']), threshold $($starve['Threshold'])) (P3)"
+            }
+        }
+    } catch {
+        Fail "Test-WuuWorkerPoolStarved threw instead of returning a verdict: $($_.Exception.Message)"
+    }
+}
+
+# NOT_IMPLEMENTED: an honest record of a property that has no verifier. The reviewer asked for the
+# verdict kind explicitly, and this is a real gap rather than a placeholder: the pool's capacity is
+# configured by hand against $MaxConcurrentJobs (see the comment above $MaxPoolSize), and NOTHING
+# checks the two are compatible. A deployment that raises $MaxConcurrentJobs above the pool size
+# starves the pool - every worker contends for the same slots - and no existing check would notice.
+if ($workersCode -notmatch 'MaxPoolSize\s*.*MaxConcurrentJobs|MaxConcurrentJobs\s*.*MaxPoolSize') {
+    Not-Implemented 'no check asserts that the worker pool size is compatible with $MaxConcurrentJobs - raising the job cap above the pool size would starve every worker, and nothing detects it (P3)'
+} else {
+    Pass 'the worker pool size is asserted against $MaxConcurrentJobs (P3)'
+}
+
+# (au) CI MUST USE THE MACHINE-READABLE MODES, and obtain the summary from the run that produced the
+#      verdict. The previous workflow ran the whole behavioural suite TWICE - once for the exit code and
+#      once more inside an `if: always()` step whose only purpose was to print JSON - which doubled CI
+#      time and meant the summary described a different execution than the one it summarised.
+$ciPath = Join-Path $root '.github\workflows\validate.yml'
+if (-not (Test-Path -LiteralPath $ciPath)) {
+    Warn 'no CI workflow found, so nothing enforces this gate on push - local discipline is the only guard (P4)'
+} else {
+    $ciText = Get-Content -LiteralPath $ciPath -Raw
+    $suiteInvocations = ([regex]::Matches($ciText, 'Invoke-TestSuites\.ps1')).Count
+    if ($ciText -notmatch 'Validate-Release\.ps1[^\r\n]*-Json') {
+        Fail 'CI does not use the gate''s -Json mode, so the machine-readable report is never produced where it matters (P4)'
+    } elseif ($ciText -notmatch 'Invoke-TestSuites\.ps1[^\r\n]*-Json') {
+        Fail 'CI does not capture the suite summary as JSON (P4)'
+    } elseif ($suiteInvocations -gt 1) {
+        Fail "CI invokes the suite runner $suiteInvocations times - the summary must come from the SAME run that produced the verdict (P4)"
+    } else {
+        Pass 'CI runs the suite once, captures JSON from that run, and uses the gate''s -Json mode (P4)'
+    }
+}
+
+# --- JSON REPORT (P4), written LAST --------------------------------------------------------------
+# THE PLACEMENT IS THE POINT. The call was originally placed just after the report function was
+# defined, which is ~140 lines BEFORE the final blocks - so the report was written without them. It
+# held 145 verdicts while the gate had emitted more, and WARN / SKIP / NOT_IMPLEMENTED never appeared
+# in it at all: the three kinds this mode exists to expose were absent from the artifact that exposes
+# them. A report that is silently missing its last checks is worse than no report, because it looks
+# complete. It is written here, after every check, and before the single failure exit so that a
+# FAILING run still produces one.
+if ($Json) {
+    $jsonPath = if ([System.IO.Path]::IsPathRooted($Json)) { $Json } else { Join-Path $root $Json }
+    $null = Write-WuuGateJsonReport -Path $jsonPath
 }
 
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }

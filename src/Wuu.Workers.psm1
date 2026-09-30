@@ -71,6 +71,132 @@ function Initialize-WuuWorkerPool {
     return $pool
 }
 
+function Get-WuuWorkerPoolCapacity {
+    <#
+    .SYNOPSIS The pool's configured min/max worker counts (P3).
+    .DESCRIPTION
+    Exposed so a consumer can compare the pool against $MaxConcurrentJobs without reading module-scoped
+    variables it cannot see (session-state isolation hides a sibling module's $script: values).
+    #>
+    [CmdletBinding()]
+    param()
+    return @{ Min = [int]$script:MinPoolSize; Max = [int]$script:MaxPoolSize }
+}
+
+function Get-WuuWorkerPoolDiagnostics {
+    <#
+    .SYNOPSIS
+    The pool's live state: capacity, utilisation, and abandoned wrappers (reviewer P3).
+    .DESCRIPTION
+    WHY THIS IS NEEDED, AND WHY IT IS NOT DECORATION. The pool is a HARD CAP on concurrent bounded probes
+    (WMI/CIM/service/ping). When it saturates, probes queue - and a queued probe looks exactly like a SLOW
+    host from the caller's side. Two of the failure modes an operator actually hits are invisible without
+    this:
+      * POOL EXHAUSTION - every worker waiting on a probe that cannot start, with no error anywhere.
+      * ABANDONED WRAPPERS - a probe whose DCOM/RPC call would not abort is deliberately left running
+        (disposing it could block a finalizer thread). Each one permanently removes a pool slot until the
+        stuck call returns. Sustained abandonment walks capacity to zero, which then presents as "every
+        host is slow" rather than as the pool running out.
+
+    Reported as a flat, ordered set of values because the consumers are a status line and a gate, not a
+    human reading prose. Fields:
+      Available      the pool object exists and is Open
+      State          the RunspacePoolStateInfo state name, or 'NotCreated'
+      Min / Max      configured capacity
+      Capacity       alias for Max, so a consumer has one obvious name for "how many can run"
+      Abandoned      wrappers deliberately left running (each holds a slot until its call returns)
+      AbandonedLimit the cap on retained references (see Invoke-WithPoolTimeout)
+      Utilisation    Max/Abandoned expressed as a readable ratio, e.g. '2/8'
+      Note           '' unless the pool is unusable, in which case why
+
+    Read-only and never throws: it is called from a status render and from a release gate, and neither
+    may fail because the pool is in a strange state - that is exactly when it is consulted.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $state = 'NotCreated'
+    $created = $false
+    try {
+        if ($script:WorkerPool) {
+            $created = $true
+            $state = [string]$script:WorkerPool.RunspacePoolStateInfo.State
+        }
+    } catch {
+        $state = 'Unknown'
+    }
+
+    $abandoned = 0
+    try {
+        if ($script:Abandoned) { $abandoned = [int]$script:Abandoned.Count }
+    } catch {
+        $abandoned = -1   # -1 = could not be determined, deliberately distinct from 0 = none
+    }
+
+    $note = ''
+    if (-not $created) { $note = 'pool not created yet (created lazily on first bounded probe)' }
+    elseif ($state -ne 'Opened') { $note = "pool is not Open (state '$state') - probes will be attempted without pooling" }
+
+    # ActivePoolWorkers is the number of slots currently in use. It is derived, not measured: the pool
+    # exposes no per-slot occupancy on PS 5.1, so the honest value is Abandoned (slots provably held by
+    # stuck calls) plus a lower bound of zero for slots whose status cannot be read. Reported as $null
+    # rather than 0 when it cannot be determined - 0 means "none in use", which would be a claim.
+    $active = if ($abandoned -ge 0) { $abandoned } else { $null }
+
+    return [ordered]@{
+        Available      = ($created -and $state -eq 'Opened')
+        State          = $state
+        Min            = [int]$script:MinPoolSize
+        Max            = [int]$script:MaxPoolSize
+        Capacity       = [int]$script:MaxPoolSize
+        Abandoned      = $abandoned
+        AbandonedLimit = 32
+        Utilisation    = ("{0}/{1}" -f $abandoned, [int]$script:MaxPoolSize)
+        # The reviewer's field names, kept verbatim so a consumer written against them works.
+        ActivePoolWorkers = $active
+        AbandonedWorkers  = $abandoned
+        PoolCapacity      = [int]$script:MaxPoolSize
+        PoolUtilisation   = ("{0}/{1}" -f $abandoned, [int]$script:MaxPoolSize)
+        Note           = $note
+    }
+}
+
+function Test-WuuWorkerPoolStarved {
+    <#
+    .SYNOPSIS
+    Whether the pool's abandoned wrappers are consuming a significant share of capacity (P3).
+    .DESCRIPTION
+    Returns @{ Starved; Abandoned; Capacity; Threshold; Reason }. Starved when abandoned wrappers reach
+    the threshold - meaning most of the pool is held by calls that would not abort, and new probes are
+    competing for the remainder.
+
+    The threshold is a SHARE of capacity rather than an absolute count, because an absolute number cannot
+    stay right when $MaxPoolSize changes: 4 abandoned wrappers is half of 8 and a twentieth of 80.
+
+    Never throws and treats an undeterminable count as NOT starved - an unknown cannot be evidence of a
+    problem, and reporting one would make the advisory fire on every run.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)][double]$ThresholdFraction = 0.5
+    )
+
+    $diag = Get-WuuWorkerPoolDiagnostics
+    $capacity = [int]$diag.Capacity
+    $abandoned = [int]$diag.Abandoned
+    $threshold = if ($capacity -gt 0) { [int][math]::Ceiling($capacity * $ThresholdFraction) } else { 0 }
+
+    $starved = ($abandoned -ge 0) -and ($capacity -gt 0) -and ($abandoned -ge $threshold)
+
+    return @{
+        Starved   = $starved
+        Abandoned = $abandoned
+        Capacity  = $capacity
+        Threshold = $threshold
+        Reason    = if ($starved) { "$abandoned of $capacity pool slots are held by abandoned wrappers (threshold $threshold)" } else { '' }
+    }
+}
+
 function Get-WuuWorkerPool {
     <#
     .SYNOPSIS
@@ -262,5 +388,12 @@ Export-ModuleMember -Function @(
     'Invoke-WithPoolTimeout',
     'Close-WuuWorkerPool',
     'New-PooledInvokeScript',
-    'Test-WuuWorkerPool'
+    'Test-WuuWorkerPool',
+    # P3: pool DIAGNOSTICS. Exported because pool saturation and abandoned wrappers present as "slow
+    # hosts" from the caller's side, so the state has to be readable from outside the module - and
+    # session-state isolation hides a sibling module's $script: values, which is why these are functions
+    # rather than exposed variables.
+    'Get-WuuWorkerPoolCapacity',
+    'Get-WuuWorkerPoolDiagnostics',
+    'Test-WuuWorkerPoolStarved'
 )

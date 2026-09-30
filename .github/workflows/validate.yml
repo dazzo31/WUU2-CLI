@@ -47,10 +47,19 @@ jobs:
         shell: powershell
         run: |
           # -STA is required. The validator asserts STA-sensitive wiring and the relaunch paths.
-          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Validate-Release.ps1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Release validation failed with exit code $LASTEXITCODE"
-            exit $LASTEXITCODE
+          # -Json writes the full verdict list (PASS/FAIL/WARN/SKIP/NOT_IMPLEMENTED) to a file so a
+          # consumer gates on a FIELD rather than scraping text, and so a check that did NOT run is
+          # distinguishable from one that passed.
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Validate-Release.ps1 -Json gate-report.json
+          $code = $LASTEXITCODE
+          if (Test-Path gate-report.json) {
+            $r = Get-Content gate-report.json -Raw | ConvertFrom-Json
+            Write-Host ("gate: passed={0} PASS={1} FAIL={2} WARN={3} SKIP={4} NOT_IMPLEMENTED={5}" -f `
+              $r.Passed, $r.Totals.PASS, $r.Totals.FAIL, $r.Totals.WARN, $r.Totals.SKIP, $r.Totals.NOT_IMPLEMENTED)
+          }
+          if ($code -ne 0) {
+            Write-Error "Release validation failed with exit code $code"
+            exit $code
           }
 
       - name: Test suites (behavioural)
@@ -59,17 +68,29 @@ jobs:
           # The aggregate runner returns nonzero if any suite fails, counts assertions, and imposes a
           # per-suite timeout. Do NOT replace this with a bare ForEach-Object loop - that is precisely
           # the pattern that discarded exit codes and reported green on a failing tree.
-          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Invoke-TestSuites.ps1 -TimeoutSeconds 600
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Test run failed with exit code $LASTEXITCODE"
-            exit $LASTEXITCODE
+          #
+          # -Json is captured here rather than in a separate step: the previous workflow re-RAN the whole
+          # suite just to obtain the summary, which doubled CI time and made the summary describe a
+          # second, different execution than the one that produced the verdict.
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Invoke-TestSuites.ps1 -TimeoutSeconds 600 -Json |
+            Tee-Object -FilePath suite-output.txt
+          $code = $LASTEXITCODE
+          Select-String -Path suite-output.txt -Pattern '^SUMMARY_JSON ' | ForEach-Object {
+            $_.Line -replace '^SUMMARY_JSON ', '' | Set-Content suite-summary.json -Encoding utf8
+          }
+          if ($code -ne 0) {
+            Write-Error "Test run failed with exit code $code"
+            exit $code
           }
 
-      - name: Machine-readable summary
+      - name: Upload reports
         if: always()
-        shell: powershell
-        # `if: always()` so the summary is produced even when a previous step failed - the JSON is
-        # what makes a failure diagnosable without opening the log.
-        run: |
-          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Invoke-TestSuites.ps1 -TimeoutSeconds 600 -Json |
-            Where-Object { $_ -like 'SUMMARY_JSON*' }
+        uses: actions/upload-artifact@v4
+        # `if: always()` so the reports survive a failure - they are what makes a failure diagnosable
+        # without opening the log, and a failing run is exactly when they are needed.
+        with:
+          name: validation-reports
+          path: |
+            gate-report.json
+            suite-summary.json
+          if-no-files-found: warn
