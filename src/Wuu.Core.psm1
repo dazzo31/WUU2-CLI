@@ -822,17 +822,17 @@ function Resume-BackgroundProcessing {
 
 #region ScriptBlocks
 
-# Helper function to safely update computer rows (main-session copy).
-# The runspace copy is injected as $SafeUpdateListViewItemScript in
+# Helper function to update computer rows (main-session copy).
+# The runspace copy is injected as $UpdateWuuComputerRowScript in
 # New-ComputerRunspace (Wuu.WindowsUpdate.psm1) - keep both in sync.
 #
-# Console edition: writes into the presentation-agnostic state store. The GUI edition
-# needed a Dispatcher.Invoke here because the ListView lives on the UI thread; the store
-# is a synchronized hashtable, so no dispatch is required and the historical deadlock
-# class is gone. The LANGUAGE-CONSTRUCTS-ONLY rule is kept: this path can still be
-# reached while a worker is blocked waiting on us, and a pipeline cmdlet would bind to
-# the busy caller's engine.
-function SafeUpdateListViewItem {
+# RENAMED (was SafeUpdateListViewItem). The old name described the GUI edition, where this wrote into
+# a WPF ListView; it writes a row into the state store and there is no ListView anywhere in this
+# repository. The name was actively misleading - a reviewer reading `Safe*ListView*` would look for a
+# view dependency that does not exist, and a new operation might reasonably have been routed around
+# it on that basis. The console edition is the shipped one, so the name now describes what the
+# function does.
+function Update-WuuComputerRow {
     param(
         [string]$ComputerName,
         [hashtable]$Properties
@@ -1256,13 +1256,16 @@ $GetUpdates = {
             }
         }
         
-        # Define safe ListView update function
-        function SafeUpdateListViewItem {
+        # Define the row-update wrapper for the isolated worker runspace. The real work is the
+        # scriptblock injected by New-ComputerRunspace; this is a local binding so the payload can
+        # call it by name. Named for what it does - it updates a computer ROW (the old
+        # `SafeUpdateListViewItem` named a WPF control this console edition does not have).
+        function Update-WuuComputerRow {
             param(
                 [string]$ComputerName,
                 [hashtable]$Properties
             )
-            & $SafeUpdateListViewItemScript -ComputerName $ComputerName -Properties $Properties
+            & $UpdateWuuComputerRowScript -ComputerName $ComputerName -Properties $Properties
         }
         
         # Define Invoke-AutoRecovery function
@@ -1474,7 +1477,7 @@ $GetUpdates = {
                 
                 # Monitor performance with error handling (only if enhanced error handling is enabled)
                 if ($EnableEnhancedErrorHandling) {
-                    SafeUpdateListViewItem $Computer.computer @{
+                    Update-WuuComputerRow $Computer.computer @{
                         Status = "Monitoring system performance (attempt $retryCount/$maxRetries)..."
                     }
                     
@@ -1494,26 +1497,26 @@ $GetUpdates = {
                     
                     # Check performance thresholds
                     if ($performance.CPUPercent -gt $PerformanceThreshold.CPUPercent) {
-                        SafeUpdateListViewItem $Computer.computer @{
+                        Update-WuuComputerRow $Computer.computer @{
                             Status = "Warning: High CPU usage ($($performance.CPUPercent)%). Proceeding with caution..."
                         }
                         Start-Sleep -Seconds 5
                     }
                     
                     if ($performance.NetworkLatencyMs -gt $PerformanceThreshold.NetworkLatencyMs) {
-                        SafeUpdateListViewItem $Computer.computer @{
+                        Update-WuuComputerRow $Computer.computer @{
                             Status = "Warning: High network latency ($($performance.NetworkLatencyMs)ms). Connection may be slow..."
                         }
                         Start-Sleep -Seconds 3
                     }
                     
                     # Test basic connectivity
-                    SafeUpdateListViewItem $Computer.computer @{
+                    Update-WuuComputerRow $Computer.computer @{
                         Status = "Testing connectivity (attempt $retryCount/$maxRetries) - CPU: $($performance.CPUPercent)%, Latency: $($performance.NetworkLatencyMs)ms"
                     }
                 } else {
                     # Simple connectivity test
-                    SafeUpdateListViewItem $Computer.computer @{
+                    Update-WuuComputerRow $Computer.computer @{
                         Status = "Testing connectivity..."
                     }
                 }
@@ -1548,7 +1551,7 @@ $GetUpdates = {
                 }
                 
                 # Test WMI connectivity
-                SafeUpdateListViewItem $Computer.computer @{
+                Update-WuuComputerRow $Computer.computer @{
                     Status = "Testing WMI connectivity (attempt $retryCount/$maxRetries)..."
                 }
                 
@@ -1587,14 +1590,14 @@ $GetUpdates = {
                 
                 if (-not $wmiTest) {
                     $errorMessage = "WMI is not accessible on $($Computer.computer). This could indicate network connectivity issues, firewall blocking, or WMI service problems. Suggestions: verify WMI service is running, check firewall WMI exceptions, ensure proper credentials."
-                    SafeUpdateListViewItem $Computer.computer @{
+                    Update-WuuComputerRow $Computer.computer @{
                         Status = $errorMessage
                     }
                     throw $errorMessage
                 }
                 
                 # Test RPC connectivity by checking Windows Update service
-                SafeUpdateListViewItem $Computer.computer @{
+                Update-WuuComputerRow $Computer.computer @{
                     Status = "Testing Windows Update service (attempt $retryCount/$maxRetries)..."
                 }
                 
@@ -1621,7 +1624,7 @@ $GetUpdates = {
                         }
                         
                         if ($wuService -and $wuService.Status -ne 'Running') {
-                            SafeUpdateListViewItem $Computer.computer @{
+                            Update-WuuComputerRow $Computer.computer @{
                                 Status = "Starting Windows Update service..."
                             }
                             
@@ -1717,7 +1720,7 @@ $GetUpdates = {
                         # Try auto-recovery if available
                         $recoveryAttempted = $false
                         if ($errorInfo.AutoFix) {
-                            SafeUpdateListViewItem $Computer.computer @{
+                            Update-WuuComputerRow $Computer.computer @{
                                 Status = "Attempting automatic recovery for: $($errorInfo.Description)..."
                             }
                             
@@ -1725,14 +1728,14 @@ $GetUpdates = {
                             $recoveryAttempted = $true
                             
                             if ($recoverySuccess) {
-                                SafeUpdateListViewItem $Computer.computer @{
+                                Update-WuuComputerRow $Computer.computer @{
                                     Status = "Recovery successful. Retrying... (attempt $retryCount/$maxRetries)"
                                 }
                             }
                         }
                         
                         if (-not $recoveryAttempted -or -not $recoverySuccess) {
-                            SafeUpdateListViewItem $Computer.computer @{
+                            Update-WuuComputerRow $Computer.computer @{
                                 Status = "Error: $friendlyError. Retrying in 5 seconds... (attempt $retryCount/$maxRetries)"
                             }
                             Start-Sleep -Seconds 5
@@ -1749,7 +1752,7 @@ $GetUpdates = {
         }
         
         # If we get here, connection was successful
-        SafeUpdateListViewItem $Computer.computer @{
+        Update-WuuComputerRow $Computer.computer @{
             Status = 'Checking for updates, this may take some time.'
             State  = 'Searching'
         }
@@ -1775,7 +1778,7 @@ $GetUpdates = {
             # Update status with progress indicator
             if ($timeoutCounter % 10 -eq 0) {
                 try {
-                    SafeUpdateListViewItem $Computer.computer @{
+                    Update-WuuComputerRow $Computer.computer @{
                         Status = "Checking for updates... ($([math]::Round($timeoutCounter/60,1)) min elapsed)"
                     }
                 } catch {
@@ -3850,17 +3853,32 @@ try {
             # The classification decides the code. Each condition is distinct: a timeout is not a
             # usage error, an audit-integrity failure is not an operation failure, and queued work
             # is not success unless the caller asked for it with -Async.
+            #
+            # SS10: PARTIAL SUCCESS is now produced. "A succeeded, B failed" used to be unobservable
+            # - the selection was resolved by one shared answer - so exit 4 was reserved but never
+            # returned, and a mixed fleet reported a flat failure. Get-WuuAggregateOutcome reads the
+            # per-target verdicts and returns PartialSuccess for a genuine mix, ignoring targets that
+            # have not settled (an in-progress run is not a partial failure).
+            $aggregate = Get-WuuAggregateOutcome -Rows $targetRows
+
             $exitCode = 0
             if ($busy -and -not $parsed.Options['Async']) {
                 $exitCode = Get-WuuExitCode -Result 'Timeout'
             } elseif ($parsed.Options['Async'] -and $busy) {
                 $exitCode = Get-WuuExitCode -Result 'Queued'
+            } elseif ($aggregate -eq 'PartialSuccess') {
+                # Settled, mixed: some targets succeeded and some did not. This outranks the generic
+                # failure below, because it is strictly more informative and the caller can act on it.
+                $exitCode = Get-WuuExitCode -Result 'PartialSuccess'
             } elseif (-not $result.Ok) {
                 if ($result.PSObject.Properties['Result'] -and $result.Result) {
                     $exitCode = Get-WuuExitCode -Result $result.Result
                 } else {
                     $exitCode = Get-WuuExitCode -Result 'OperationFailed'
                 }
+            } elseif ($aggregate -eq 'OperationFailed') {
+                # The handler reported success but every settled target failed - trust the store.
+                $exitCode = Get-WuuExitCode -Result 'OperationFailed'
             } elseif ($busy) {
                 # -Async was requested and the work was finished inside the window, so the wait
                 # merely observed a completion. That is a success, not a queue notification.

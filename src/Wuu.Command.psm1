@@ -377,10 +377,10 @@ function Get-WuuExitCode {
     conflated five different situations.
 
         0  Success         the requested operation actually completed successfully
-        1  OperationFailed one or more targets failed
+        1  OperationFailed one or more targets failed, or every settled target failed
         2  UsageError      unknown verb, missing argument, invalid input
         3  Timeout         the wait elapsed with work still outstanding
-        4  PartialSuccess  (reserved; not currently produced - see the note below)
+        4  PartialSuccess  SOME settled targets succeeded and some did not
         5  AuditFailure    the audit chain failed to verify, or a fail-closed audit write failed
         6  Queued          -Async was requested and the work was ACCEPTED, not completed
         7  Refused         refused before running: missing -Reason, or a pre-flight/confirmation refusal
@@ -389,11 +389,13 @@ function Get-WuuExitCode {
     period and then reports), so a script saw "success" for an install that had not happened. Returning
     a distinct code keeps the async behaviour useful without letting it masquerade as completion.
 
-    WHY 4 IS NOT PRODUCED. With `-Computer A,B` the selection is resolved by ONE shared answer, so
-    "A worked and B failed" is not observable per target from here - the payload updates rows, not a
-    result set. The code is reserved so the number is not later assigned a different meaning, and the
-    honest answer today is 1 (the operation did not succeed for everything requested). Producing a real
-    4 would need per-target completion results, which is a larger change than an exit-code pass.
+    WHY 4 IS PRODUCED (it used to be reserved). A mixed result was unobservable: `-Computer A,B` was
+    resolved by one shared answer, so "A worked and B failed" could not be seen from here. The code was
+    reserved so the number would not later mean something else, and the honest answer was 1. It now has
+    a real source - Get-WuuAggregateOutcome over the per-target verdicts in Wuu.State - so a mixed fleet
+    reports 4 rather than a flat failure. Targets that have NOT settled are ignored, not counted as
+    failures: a still-running estate op is not a partial failure, and the caller has a separate
+    measured signal for outstanding work (the bounded wait -> 3, or 6 with -Async).
     #>
     [CmdletBinding()]
     param(
@@ -426,7 +428,7 @@ function Get-WuuExitCodeMeaning {
         1 { 'operation failed - one or more targets did not succeed' }
         2 { 'usage error - check the verb and its arguments (wuu -Help)' }
         3 { 'timeout - the wait elapsed with work still outstanding' }
-        4 { 'partial success' }
+        4 { 'partial success - some targets succeeded and some did not' }
         5 { 'audit failure - the audit trail could not be trusted or written' }
         6 { 'queued - the work was accepted, not completed (-Async)' }
         7 { 'refused - the operation was declined before it ran (often a missing -Reason)' }

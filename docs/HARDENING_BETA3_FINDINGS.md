@@ -161,6 +161,13 @@ never `git checkout` on uncommitted work.
 
 ---
 
+**Note:** this file records phases 0–2 in the most detail because they were implemented first. Phases
+3, 4, 7 and 11 landed in a later revision; their evidence is summarised in
+[`HARDENING_COMPLETION_REPORT.md`](HARDENING_COMPLETION_REPORT.md), which also carries the brief's
+required final-report format and the honest per-phase status.
+
+---
+
 ## Phase 2 — Stale-worker / race correctness (PASS)
 
 ### The rule
@@ -241,4 +248,31 @@ Four of my own checks were wrong before the code was. The guard logic was never 
 Each was diagnosed by isolating it, not by guessing, and (2)/(3) are now written up in the suite so
 the next reader does not repeat them. Note the pattern: **every one was a false failure on correct
 code** — the same failure class as matching the comment describing the code.
+
+### Phase 2 addendum — the forced-race test (closes the gate that was bypassed)
+
+Strictly, phase 2's gate was not met when the identity work landed: the brief's T0–T7 forced-race test
+did not exist, and I proceeded on the argument that operation identity makes the race *unreachable*
+rather than *detected*. That argument is the brief's own preferred design, but it is not the
+acceptance criterion. `tests\Test-ForcedRace.ps1` (38 assertions) now supplies the missing evidence:
+
+* **T0–T5** drive a real submission, then impose a real 1-second deadline on the already-submitted
+  operation, prove the 5-second payload **actually started**, detect expiry through the shipped
+  `Test-WuuOperationExpired`, stop the worker, and release the lock through the **shipped** (extracted)
+  release condition — so the test cannot approve a rule the cleanup loop does not use.
+* **T6–T7** submit the replacement (new identity), then invoke the **shipped injected writer**, read out
+  of a live runspace and stamped with the superseded identity, to prove it cannot touch the
+  replacement's state — and that the owner still can.
+* Variants: success before the deadline, late completion after a replacement exists (refused),
+  cancellation, and the runspace-creation-failure path.
+
+**Technique worth keeping:** an IDLE runspace exposes its injected scriptblocks through
+`SessionStateProxy.GetVariable`, and they can then be invoked through that runspace. A *busy* runspace
+refuses with "A pipeline is already running. Concurrent SessionStateProxy method calls are not
+allowed." That is what makes it possible to test the real writer instead of a re-implementation.
+
+**Two of my own bugs surfaced while writing it**, both false failures on correct code: the guard
+extraction required `if ((` when the shipped guards are single-parenthesised, and `''''` inside a
+double-quoted PowerShell string is FOUR quotes where the source has TWO. The extraction now builds the
+literal and uses `[string].Contains`, which removes the whole double-escaping class.
 

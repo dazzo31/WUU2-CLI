@@ -114,6 +114,7 @@ A skipped test proves nothing. When quoting evidence, say "skipped in this envir
 | Workflow state vs display state | **asserted** | validator gate (ac) |
 | Reboot / cancellation | **asserted** | validator gate (ag) |
 | Encoding / BOM | **asserted** | validator gate (af); measured per file |
+| Migration debris (SS14) | **asserted** | gate (al): the GUI-era `SafeUpdateListViewItem` name is gone and both row-writer copies carry the accurate name |
 
 ## 6. Method: how these tests were verified
 

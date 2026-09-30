@@ -121,16 +121,13 @@ function New-ComputerRunspace {
             }
         }.ToString()))
         
-        # Safe row-update helper for worker runspaces (console edition).
-        # Replaces the GUI's ListView EditItem/CommitEdit/Refresh + Dispatcher.Invoke with a
-        # plain write into the synchronized state store, then a Touch() to signal a redraw.
-        #
-        # HISTORY / WHY THIS SHAPE: in the GUI edition the dispatcher action executed on the
-        # UI thread while this worker runspace was BLOCKED inside Dispatcher.Invoke waiting
-        # for it, so any pipeline cmdlet (Where-Object/Select-Object/...) inside the action
-        # deadlocked the whole app. The store removes the dispatch entirely, but the rule is
-        # kept: LANGUAGE CONSTRUCTS ONLY below. Do not add pipeline cmdlets.
-        $newRunspace.SessionStateProxy.SetVariable('SafeUpdateListViewItemScript', [scriptblock]::Create({
+        # Row-update helper for worker runspaces. Writes a computer ROW into the synchronized state
+        # store and signals a redraw. RENAMED from `SafeUpdateListViewItemScript` for the same reason
+        # as its module-scope twin in Wuu.Core.psm1: the old name described a WPF ListView that this
+        # edition does not have. The GUI edition needed Dispatcher.Invoke here because its ListView
+        # lived on the UI thread; the store is a synchronized hashtable, so no dispatch is required
+        # and the historical deadlock class is gone.
+        $newRunspace.SessionStateProxy.SetVariable('UpdateWuuComputerRowScript', [scriptblock]::Create({
             param(
                 [string]$ComputerName,
                 [hashtable]$Properties
@@ -143,7 +140,7 @@ function New-ComputerRunspace {
                 $targetRow = $stateStore.ByName[$ComputerName.ToLowerInvariant()]
                 if (-not $targetRow) { return }
 
-                # SS3: STALE-WRITER GUARD. Identical rule to the module-scope SafeUpdateListViewItem
+                # SS3: STALE-WRITER GUARD. Identical rule to the module-scope Update-WuuComputerRow
                 # in Wuu.Core.psm1 - keep both in sync (tests\Test-OperationIdentity.ps1 drives both
                 # and asserts they agree).
                 #
@@ -587,7 +584,7 @@ function Start-UpdateCheckJob {
         if ($ComputerItem.PSObject.Properties['OperationId']) { $ComputerItem.OperationId = $operationId }
 
         # Hand the identity to the WORKER, so the payload's row-writers can attribute their writes.
-        # Without this the injected SafeUpdateListViewItemScript has no way to prove which operation
+        # Without this the injected UpdateWuuComputerRowScript has no way to prove which operation
         # it is acting for, and the guard could only ever refuse a write that named a different id
         # explicitly - which no payload does. Set on every submission: the runspace is REUSED, so the
         # value must be refreshed or a later operation would write under the previous identity.

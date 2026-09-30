@@ -153,9 +153,10 @@ Current reality, which is more nuanced than "legacy code to avoid":
   class of silent failure, not decoration.
 * **`uiHash` still exists and is passed to runspaces**, but it is created as an empty synchronized
   hashtable and **no member holding a control is ever assigned**. Do not repopulate it.
-* The name `SafeUpdateListViewItem` survives as a **naming leftover** — it is defined twice
-  (`Wuu.Core.psm1` L835 and L1200) and invoked once, via a runspace-injected scriptblock. It is a
-  Phase 11 rename candidate, not a GUI dependency.
+* The row-writer is named `Update-WuuComputerRow` (module-scope) / `UpdateWuuComputerRowScript`
+  (runspace-injected) — **renamed** from `SafeUpdateListViewItem`, which described a WPF ListView this
+  edition does not have. It is defined twice, once per context, which is why it outlived the GUI-removal
+  pass under the old name. Gate (al) fails if the old name returns.
 
 Therefore:
 

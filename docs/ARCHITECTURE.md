@@ -328,8 +328,10 @@ Two related facts:
 
 * `uiHash` still exists and is passed into runspaces, but it is an **empty** synchronized hashtable;
   no control member is ever assigned to it.
-* `SafeUpdateListViewItem` is a **name**, not a dependency — defined twice and invoked once through a
-  runspace-injected scriptblock.
+* The row-writer is `Update-WuuComputerRow` / `UpdateWuuComputerRowScript` — **renamed** from
+  `SafeUpdateListViewItem`, a GUI-era name for a WPF control this edition does not have. It is defined
+  twice (module scope and runspace-injected) and invoked once through the injected copy; gate (al)
+  asserts the misleading name does not return.
 * `$eventInstallUpdates` is mentioned in comments but **not defined**; it is not an existing closure.
 
 **Do not introduce WPF dependencies into new code.**

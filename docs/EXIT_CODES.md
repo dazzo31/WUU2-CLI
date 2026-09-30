@@ -10,7 +10,7 @@ branches on them, so the meaning is fixed and is implemented in exactly one plac
 | 1 | OperationFailed | one or more targets failed | a handler threw, or a target errored |
 | 2 | UsageError | unknown verb, missing argument, invalid input | `wuu shwo`, `wuu show` with no subverb |
 | 3 | Timeout | the wait elapsed with work still outstanding | work still running after `$CommandWaitSeconds` |
-| 4 | PartialSuccess | *reserved — not currently produced* | see "Reserved codes" below |
+| 4 | PartialSuccess | **some settled targets succeeded and some did not** | `wuu install -Computer A,B,C` where A and B succeeded and C failed |
 | 5 | AuditFailure | the audit chain failed to verify, or a fail-closed audit write failed | `wuu audit verify` on a tampered log |
 | 6 | Queued | `-Async` was requested and the work was **accepted**, not completed | `wuu install -All -Async` |
 | 7 | Refused | declined before running | a mutating verb without `-Reason` |
@@ -58,14 +58,32 @@ alone:
 { "Command": "install", "Ok": true, "ExitCode": 6, "Completed": false, "Outstanding": 2, "Computers": [ ] }
 ```
 
-## Reserved codes
+## Partial success (4)
 
-* **4 (PartialSuccess)** is reserved but **not produced**. With `-Computer A,B` the selection is
-  resolved by one shared answer, so "A succeeded, B failed" is not observable per target from the
-  command layer — the payload updates rows rather than returning a result set. Today that situation
-  reports `1`, which is the honest answer ("the operation did not succeed for everything requested").
-  The number is held so it is never assigned a different meaning later; producing a real `4` requires
-  per-target completion results.
+**4 means the settled targets disagreed**: at least one succeeded and at least one did not.
+
+```powershell
+# A and B succeeded, C failed
+wuu install -Computer A,B,C -Reason "CHG-1041"
+echo $LASTEXITCODE   # 4 - re-run C, not all three
+```
+
+Three details that decide the number, because each one is a way a script can flap:
+
+* **Unsettled targets are IGNORED, not counted as failures.** A target still running or still queued
+  has not failed; counting it would make `wuu check -All` report partial success merely for working
+  through a large estate. Outstanding work is signalled separately by **3** (or **6** with `-Async`).
+* **Every settled target failing is `1`, not `4`.** There is nothing partial about it.
+* **Nothing settled is neither.** The classifier returns no verdict and the existing code stands.
+
+The classification is `Get-WuuAggregateOutcome` over the per-target verdicts from
+`Get-WuuTargetOutcome` (`src\Wuu.State.psm1`), consumed by the command-mode classifier in
+`src\Wuu.Core.psm1`, and pinned by `tests\Test-TargetOutcomes.ps1`.
+
+> **This changed.** `4` used to be reserved-but-unproduced, because a `-Computer A,B` selection was
+> resolved by one shared answer so "A succeeded, B failed" was not observable anywhere. A mixed fleet
+> therefore reported a flat `1`. The per-target verdicts now exist, so a mixed result is reported as
+> `4`.
 
 ## Non-command mode
 

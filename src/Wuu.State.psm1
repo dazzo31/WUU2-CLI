@@ -39,7 +39,7 @@ CRITICAL CONSTRAINTS (inherited from the GUI edition - do not "simplify" away)
 2. NO PIPELINE CMDLETS IN ANY CODE THAT CAN RUN ON A CALLBACK PATH.
    Where a caller may be blocked waiting on the console renderer, use only
    language constructs (foreach/if) - never Where-Object/Select-Object. Same rule
-   as SafeUpdateListViewItemScript.
+   as UpdateWuuComputerRowScript.
 
 ROW CONTRACT (the computer object all payloads already use)
 -----------------------------------------------------------
@@ -732,6 +732,83 @@ function Set-WuuPendingOperation {
     return @{ Set = $true; Op = $Op; Replaced = $replaced }
 }
 
+function Get-WuuTargetOutcome {
+    <#
+    .SYNOPSIS
+    The settled outcome of ONE target, as a single word (SS10).
+    .DESCRIPTION
+    Returns 'Success', 'Failed', 'TimedOut' or 'Unknown'. This is what makes exit code 4
+    (PartialSuccess) producible: without a per-target verdict, "A worked and B failed" is not
+    observable anywhere, which is why the code was reserved-but-unused.
+
+    'Unknown' means NOT SETTLED YET - still running, still queued, or never touched. It is
+    deliberately distinct from 'Failed': a row that has not been attempted is not a failure, and
+    counting it as one would turn an ordinary in-progress run into a partial failure.
+
+    Order matters. Failure is checked BEFORE completion because a row can carry
+    `State='Complete'` from an earlier operation while its CURRENT operation errored; the error is
+    the outcome, not the stale completion. Timeout is checked before success for the same reason.
+
+    Reads the same two fields the rest of the code uses for settlement - `State` (workflow label)
+    and `UpdatesStatus` (classification) - and checks BOTH, because different paths write one or
+    the other. That pairing is the same one Test-WuuPhaseFailureBlocks uses, so gating and exit
+    classification cannot disagree about what "failed" means.
+
+    Pure, side-effect free, $null-tolerant: called in a loop over every selected target.
+    #>
+    param([Parameter(Mandatory = $false)][AllowNull()]$Row)
+
+    if ($null -eq $Row) { return 'Unknown' }
+
+    $state = ''
+    if ($Row.PSObject.Properties['State'] -and $Row.State) { $state = [string]$Row.State }
+    $updatesStatus = ''
+    if ($Row.PSObject.Properties['UpdatesStatus'] -and $Row.UpdatesStatus) { $updatesStatus = [string]$Row.UpdatesStatus }
+
+    if ($state -eq 'Error' -or $updatesStatus -eq 'Error') { return 'Failed' }
+    if ($state -eq 'Timeout' -or $updatesStatus -eq 'Timeout') { return 'TimedOut' }
+    if ($state -eq 'Complete') { return 'Success' }
+    return 'Unknown'
+}
+
+function Get-WuuAggregateOutcome {
+    <#
+    .SYNOPSIS
+    The outcome across a set of targets, for the exit-code contract (SS10).
+    .DESCRIPTION
+    Returns 'Success', 'PartialSuccess', 'OperationFailed' or 'Unknown', from the per-target
+    verdicts of Get-WuuTargetOutcome.
+
+    THE RULE: unsettled targets are ignored, and a MIX of settled successes and settled failures is
+    'PartialSuccess'. That is the only case where 4 is produced, and it is the case the brief asks
+    for:
+
+        A = Success, B = Success, C = Failed   ->  PartialSuccess
+
+    Deliberately CONSERVATIVE in the other direction: if every settled target failed the answer is
+    'OperationFailed', not partial (there is nothing partly-successful about it), and if nothing has
+    settled the answer is 'Unknown' so the caller keeps its existing code rather than inventing a
+    verdict from no evidence. An empty set is 'Unknown' for the same reason.
+
+    WHY NOT COUNT UNSETTLED AS FAILURES: a `wuu check -All` still working through a large estate
+    would otherwise report PartialSuccess merely because it had not finished. The caller has a
+    separate, measured signal for "work is still outstanding" (the bounded wait), and that decision
+    stays where it is.
+
+    Pure and side-effect free.
+    #>
+    param([Parameter(Mandatory = $false)][AllowNull()][object[]]$Rows)
+
+    if ($null -eq $Rows) { return 'Unknown' }
+    $settled = @($Rows | ForEach-Object { Get-WuuTargetOutcome -Row $_ } | Where-Object { $_ -ne 'Unknown' })
+    if ($settled.Count -eq 0) { return 'Unknown' }
+
+    $ok = @($settled | Where-Object { $_ -eq 'Success' }).Count
+    if ($ok -eq $settled.Count) { return 'Success' }
+    if ($ok -eq 0) { return 'OperationFailed' }
+    return 'PartialSuccess'
+}
+
 function Test-WuuConcurrencyAvailable {
     <#
     .SYNOPSIS
@@ -994,6 +1071,10 @@ Export-ModuleMember -Function @(
     # the reporting of a replacement, while the policy itself must live in one place; and because
     # the payloads inline the -OnlyIfEmpty half, which tests assert against this function.
     'Set-WuuPendingOperation'
+    # SS10: per-target and aggregate outcomes. Exported because the exit-code decision lives in
+    # Wuu.Core (command mode) and the classification must be one rule, not two.
+    'Get-WuuTargetOutcome'
+    'Get-WuuAggregateOutcome'
     # SS4: the global concurrency cap. Exported because it is consulted at the SUBMISSION POINT
     # (Wuu.WindowsUpdate) and in the scheduler tick, and both must agree on what the cap means.
     'Test-WuuConcurrencyAvailable'

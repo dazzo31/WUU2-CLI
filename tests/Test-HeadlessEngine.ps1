@@ -8,7 +8,7 @@ presentation-free by asserting, in a fresh process:
   2. Importing the real module set via the real path (Import-WuuModules) does NOT load
      PresentationFramework/PresentationCore/WindowsBase. If any payload-facing module
      reached for WPF at import time, this fails.
-  3. The real injected worker helper scriptblocks - SafeUpdateListViewItemScript,
+  3. The real injected worker helper scriptblocks - UpdateWuuComputerRowScript,
      SetComputerStateScript, SetComputerTimeoutScript - extracted straight out of
      New-ComputerRunspace's source - execute inside a REAL isolated runspace and mutate
      the store, with no WPF loaded.
@@ -123,7 +123,7 @@ for ($ti = 0; $ti -lt $allTokens.Count; $ti++) {
     $helpers[$name] = $lit
 }
 
-foreach ($name in 'SafeUpdateListViewItemScript', 'SetComputerStateScript', 'SetComputerTimeoutScript') {
+foreach ($name in 'UpdateWuuComputerRowScript', 'SetComputerStateScript', 'SetComputerTimeoutScript') {
     if (-not $helpers.ContainsKey($name)) { Fail "$name not extracted from source" }
 }
 if (-not $fail) { Pass "extracted real injected helpers from source via tokenizer ($($helpers.Count) total)" }
@@ -157,7 +157,7 @@ foreach ($kv in $helpers.GetEnumerator()) {
 }
 
 $script = @'
-& $SafeUpdateListViewItemScript -ComputerName 'SRV01' -Properties @{ Status = 'Testing WMI connectivity...' }
+& $UpdateWuuComputerRowScript -ComputerName 'SRV01' -Properties @{ Status = 'Testing WMI connectivity...' }
 & $SetComputerStateScript -Computer $Computer -State 'Downloading' -StatusDetail '(3 updates)'
 & $SetComputerTimeoutScript -Computer $Computer -Phase 'Update Search' -TimeoutSec 30 -Detail 'search hung'
 'helpers-completed'

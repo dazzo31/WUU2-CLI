@@ -98,7 +98,7 @@ Eight documented codes, so a pipeline can gate on the specific outcome rather th
 | `1` | operation failed (one or more targets) |
 | `2` | usage error — check the verb and its arguments |
 | `3` | timeout — the wait elapsed with work still outstanding |
-| `4` | partial success *(reserved; see below)* |
+| `4` | partial success — some settled targets succeeded and some did not |
 | `5` | audit failure — the chain failed to verify, or a fail-closed audit write failed |
 | `6` | queued — `-Async` was requested and the work was **accepted**, not completed |
 | `7` | refused — declined before running (most often a missing `-Reason`) |

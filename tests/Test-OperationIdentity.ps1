@@ -121,7 +121,7 @@ Assert-Equal $rowA.OperationId $before '3. the predicate does not mutate the row
 #                                   terminal status only when ownership is proven, so it refuses an
 #                                   unattributed write too - unlike the lenient writer rule.
 $sites = @(
-    @{ Name = 'writer refusal (Wuu.Core SafeUpdateListViewItem)'; Text = $coreCode; Pattern = 'if \((\$rowOpId -ne '''' -and \$writerOpId -ne '''' -and \$rowOpId -cne \$writerOpId)\)';  Row = 'rowOpId';     Writer = 'writerOpId';  Function = 'Test-WuuStaleWrite';       Invert = $false }
+    @{ Name = 'writer refusal (Wuu.Core Update-WuuComputerRow)'; Text = $coreCode; Pattern = 'if \((\$rowOpId -ne '''' -and \$writerOpId -ne '''' -and \$rowOpId -cne \$writerOpId)\)';  Row = 'rowOpId';     Writer = 'writerOpId';  Function = 'Test-WuuStaleWrite';       Invert = $false }
 
     @{ Name = 'failed-job release (cleanup loop)';               Text = $coreCode; Pattern = 'if \((\$rowOpId -ne '''' -and \$jobOpId -ne '''' -and \$rowOpId -ceq \$jobOpId)\)';        Row = 'rowOpId';     Writer = 'jobOpId';     Function = 'Test-WuuOperationCurrent'; Invert = $false }
     @{ Name = 'completion release (cleanup loop)';               Text = $coreCode; Pattern = 'if \((\$rowOpId2 -ne '''' -and \$jobOpId2 -ne '''' -and \$rowOpId2 -ceq \$jobOpId2)\)';     Row = 'rowOpId2';    Writer = 'jobOpId2';    Function = 'Test-WuuOperationCurrent'; Invert = $false }

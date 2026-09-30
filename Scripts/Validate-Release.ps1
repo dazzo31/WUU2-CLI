@@ -1565,13 +1565,13 @@ if ($guardedReleases -lt 3) {
 }
 
 # The writer choke point - both copies - must refuse a proven-stale write.
-$writerCore = Get-WuuTextWithoutComments -Text (Get-WuuFunctionBody $coreRawA 'SafeUpdateListViewItem')
+$writerCore = Get-WuuTextWithoutComments -Text (Get-WuuFunctionBody $coreRawA 'Update-WuuComputerRow')
 if ($writerCore -notmatch '-cne \$writerOpId') {
     Fail 'the module-scope row writer has no staleness guard - a superseded payload would restamp the current operation (SS3)'
 } else {
     Pass 'the module-scope row writer refuses a proven-stale write (SS3)'
 }
-$injectedWriter = Get-WuuTextWithoutComments -Text ([regex]::Match($wupdRawA, "SetVariable\('SafeUpdateListViewItemScript'[\s\S]{0,3000}").Value)
+$injectedWriter = Get-WuuTextWithoutComments -Text ([regex]::Match($wupdRawA, "SetVariable\('UpdateWuuComputerRowScript'[\s\S]{0,3000}").Value)
 if ($injectedWriter -notmatch '-cne \$writerOpId') {
     Fail 'the runspace-injected row writer has no staleness guard - the copy the PAYLOAD actually uses is unprotected (SS3)'
 } elseif ($injectedWriter -notmatch 'WuuOperationId') {
@@ -1745,6 +1745,122 @@ if ($payloadInCode -lt 2) {
     Fail "only $payloadReads payload guard(s) READ the existing request - a guard that does not read the slot cannot detect a collision, and could be satisfied by a constant (SS7)"
 } else {
     Pass "both payload follow-ups read the existing request and queue only when it is empty ($payloadInCode/2, $payloadReads/2) (SS7)"
+}
+
+# (ak) PER-TARGET OUTCOMES AND PARTIAL SUCCESS (brief SS10). Exit code 4 was RESERVED BUT NEVER
+#      PRODUCED, and the reason was structural: a `-Computer A,B` selection resolved through one shared
+#      answer, so "A succeeded and B failed" was unobservable and a mixed fleet reported a flat 1.
+#
+#      A gate cannot prove the classification is right; tests\Test-TargetOutcomes.ps1 drives the truth
+#      table. What this gate asserts is the WIRING and the two ordering properties that are invisible
+#      in review and fatal in use: the partial branch must be consulted BEFORE the generic failure
+#      (otherwise 4 is dead code), and the code must no longer be documented as unproduced.
+$stateRawK = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+$coreRawK = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+$cmdRawK = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Command.psm1') -Raw
+
+foreach ($fn in @('Get-WuuTargetOutcome', 'Get-WuuAggregateOutcome')) {
+    if ($stateRawK -notmatch ("function\s+{0}\s*\{{" -f [regex]::Escape($fn))) {
+        Fail "$fn is missing - exit code 4 has no per-target source and cannot be produced (SS10)"
+    }
+    if ($stateRawK -notmatch ("'" + [regex]::Escape($fn) + "'")) {
+        Fail "$fn is not exported - the classifier in Wuu.Core could not reach it (SS10)"
+    }
+}
+if (-not $failed) { Pass 'per-target and aggregate outcome functions exist and are exported (SS10)' }
+
+# Unsettled targets must be IGNORED. If the aggregate treated a still-running row as failed, every
+# in-progress estate run would report partial success.
+$aggBodyK = Get-WuuFunctionBody $stateRawK 'Get-WuuAggregateOutcome'
+if ($aggBodyK -notmatch "-ne 'Unknown'") {
+    Fail 'the aggregate does not EXCLUDE unsettled targets - a still-running estate op would report partial success (SS10)'
+} elseif ($aggBodyK -notmatch 'ok -eq 0') {
+    Fail 'the aggregate has no "every settled target failed" case - that would be reported as partial, which is strictly less informative (SS10)'
+} else {
+    Pass 'the aggregate ignores unsettled targets and does not call an all-failed run partial (SS10)'
+}
+# Failure must be checked BEFORE completion, or a stale Complete on a row that just errored wins.
+#
+# The ORDER alone is not the invariant: a tautology experiment that kept `return 'Failed'` in place but
+# replaced its CONDITION with an impossible test (`$state -eq 'ZZZ'`) passed an order-only check while
+# five of the suite's assertions failed. So the condition itself is asserted, not merely its position.
+$oneBodyK = Get-WuuFunctionBody $stateRawK 'Get-WuuTargetOutcome'
+$failAtK = $oneBodyK.IndexOf("return 'Failed'")
+$okAtK = $oneBodyK.IndexOf("return 'Success'")
+if ($oneBodyK -notmatch "if \(\`$state -eq 'Error' -or \`$updatesStatus -eq 'Error'\) \{ return 'Failed' \}") {
+    Fail 'Get-WuuTargetOutcome no longer derives Failed from State OR UpdatesStatus - a row whose error is written to only one of the two fields would be misclassified (SS10)'
+} elseif ($failAtK -lt 0 -or $okAtK -lt 0) {
+    Fail 'Get-WuuTargetOutcome does not classify a settled target (SS10)'
+} elseif ($failAtK -gt $okAtK) {
+    Fail 'Get-WuuTargetOutcome checks completion BEFORE failure - a row carrying a stale Complete would mask a current error (SS10)'
+} else {
+    Pass 'per-target classification derives failure from both fields and checks it before completion (SS10)'
+}
+
+# The classifier must consult it, and the partial branch must precede the generic failure branch.
+#
+# PRESENCE AND ORDER ARE NOT ENOUGH. A tautology experiment that disabled the branch with a
+# `$false -and` prefix left both the text and its position intact, so a presence-plus-order check
+# passed while the branch was dead and exit 4 was unreachable. The exact enabled branch is asserted.
+$coreCodeK = Get-WuuTextWithoutComments -Text $coreRawK
+if ($coreCodeK -notmatch 'Get-WuuAggregateOutcome -Rows \$targetRows') {
+    Fail 'the command-mode classifier does not consult the aggregate outcome - exit 4 remains unproduced (SS10)'
+}
+if (-not $coreCodeK.Contains("} elseif (`$aggregate -eq 'PartialSuccess') {")) {
+    Fail 'the PartialSuccess branch is missing or DISABLED (a `$false -and` prefix keeps the text and its position while making the branch dead) - exit 4 would be unreachable (SS10)'
+}
+$psAtK = $coreCodeK.IndexOf("} elseif (`$aggregate -eq 'PartialSuccess') {")
+$failBranchAtK = $coreCodeK.IndexOf('elseif (-not $result.Ok)')
+if ($failBranchAtK -ge 0 -and $psAtK -gt $failBranchAtK) {
+    Fail 'the PartialSuccess branch sits AFTER the generic failure branch - the generic failure would always win and exit 4 would be dead code (SS10)'
+} else {
+    Pass 'the classifier produces exit 4, branch enabled and checked before the generic failure (SS10)'
+}
+
+# The number must still map to 4, and the documentation must not claim it is unproduced.
+if ($cmdRawK -notmatch "'PartialSuccess' \{ 4 \}") {
+    Fail 'PartialSuccess no longer maps to exit code 4 - the documented number changed (SS10)'
+}
+if ($cmdRawK -match 'reserved; not currently produced') {
+    Fail 'the exit-code documentation still says 4 is not produced, while the classifier now returns it (SS10)'
+}
+$readmeK = Get-Content -LiteralPath (Join-Path $root 'README.md') -Raw
+if ($readmeK -match 'partial success \*\(reserved') {
+    Fail 'the README still describes code 4 as reserved (SS10)'
+} else {
+    Pass 'exit 4 maps to 4, and neither README nor source still calls it reserved (SS10)'
+}
+
+# (al) MIGRATION DEBRIS: the misleading name (brief SS14). `SafeUpdateListViewItem` described the GUI
+#      edition, where the helper wrote into a WPF ListView. In this repository it writes a computer ROW
+#      into the state store and there is no ListView at all - so the name pointed a reader at a view
+#      dependency that does not exist, and a new operation could reasonably have been routed around it
+#      on that basis. It was defined under that name TWICE (a module-scope copy and the
+#      runspace-injected copy the payloads actually use), which is how it survived a GUI-removal pass:
+#      renaming one would have left the other.
+#
+#      The gate asserts the name is GONE from shipped code and that the accurate name is what both
+#      copies now carry. Comments are excluded, so the rename's own explanation does not satisfy it.
+$debrisFiles = @('src\Wuu.Core.psm1', 'src\Wuu.WindowsUpdate.psm1', 'src\Wuu.State.psm1')
+$debrisHits = @()
+foreach ($df in $debrisFiles) {
+    $dCode = Get-WuuTextWithoutComments -Text (Get-Content -LiteralPath (Join-Path $root $df) -Raw)
+    if ($dCode -match 'SafeUpdateListViewItem') { $debrisHits += $df }
+}
+if ($debrisHits.Count) {
+    Fail ('the misleading GUI-era name survives in shipped code: ' + ($debrisHits -join ', ') + ' - it describes a WPF ListView this edition does not have')
+} else {
+    Pass 'the GUI-era name `SafeUpdateListViewItem` is gone from shipped code (SS14)'
+}
+# Both copies must exist under the accurate name, or the payload and the main session would differ.
+$coreDebris = Get-WuuTextWithoutComments -Text (Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw)
+$wupdDebris = Get-WuuTextWithoutComments -Text (Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw)
+if ($coreDebris -notmatch 'function Update-WuuComputerRow') {
+    Fail 'the module-scope row writer is not named Update-WuuComputerRow (SS14)'
+} elseif ($wupdDebris -notmatch "SetVariable\('UpdateWuuComputerRowScript'") {
+    Fail 'the runspace-injected row writer is not named UpdateWuuComputerRowScript (SS14)'
+} else {
+    Pass 'both row-writer copies carry the accurate name (SS14)'
 }
 
 if ($failed) { Write-Host "`nValidation FAILED" -ForegroundColor Red; exit 1 }
