@@ -98,9 +98,14 @@ top-level validator still runs every check and still emits the same verdict list
 
 | Check | Result |
 | --- | --- |
-| Release gate | pass — 171 verdicts, 0 FAIL, **identical across runs** |
-| Test suites | 43 run, 42 pass, 1 skip, 0 fail — **1,190 assertions** |
+| Release gate | pass — 170 verdicts, 0 FAIL, **identical across runs**; the version guard resolves against this tag |
+| Test suites | 43 run, 42 pass, 1 skip, 0 fail — **1,192 assertions** |
 | Mutation proofs | P3 close-out 5/5 caught; pool-cap 4/4 caught; sources restored byte-identically |
+
+**Both totals above are from the TAGGED tree, not from a pre-tag run.** That distinction matters here: the
+SS18 version guard only evaluates once a tag exists, so an off-tag run reports a SKIP where the released
+tree reports a PASS. (This release also fixed a test that asserted that SKIP — see the note under
+"Known limitations".)
 
 ---
 
@@ -115,3 +120,14 @@ top-level validator still runs every check and still emits the same verdict list
   because guessing at a race that cannot yet be observed is worse than gathering evidence.
 - **The audit anchor is local.** A privileged administrator can still delete an entire audit-day file. An
   external anchor is the proper fix and is not in this release.
+
+### One more test fix, found by releasing
+
+`Test-PoolDiagnostics` asserted that the gate report contains at least one `SKIP`. The gate's only skip is
+the version guard, which fires **only when HEAD is not on a tag** — so the suite passed on every
+development run and failed the moment the release was tagged. It asserted the opposite of what it meant.
+
+It now checks the property that actually holds in both states: every verdict carries one of the five
+kinds, so "not evaluated" is never read as "evaluated clean", and the SKIP kind is reachable either as a
+count or — on a tag — because the version guard legitimately passes instead.
+
