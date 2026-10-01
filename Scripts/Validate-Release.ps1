@@ -2521,26 +2521,37 @@ if ($innerCallSitesAV.Count -eq 0) {
 
 # DRIVE THE RULE. A predicate that always returns one answer would satisfy every check above.
 #
-# The assertions below are deliberately NOT pinned to an exact remainder. The function truncates toward
-# zero and the deadline is set a few milliseconds before it is read, so a 6-second budget reliably yields
-# 5 - and asserting "exactly 6" failed for a cap that was working perfectly. What matters is the SHAPE:
-# capped to at most the budget, never below the floor, and never applied at all without a deadline.
+# The assertions below pin EXACT remainders, which was impossible before the clock was fixed. The
+# function truncates toward zero, so a deadline set a few milliseconds before it is read turned a
+# 6-second budget into a 5-second answer, and asserting "exactly 6" failed for a cap that was working
+# perfectly. With -Now pinned to the deadline's own base the remainder is exact (20.0 -> 20, not
+# 19.99... -> 19), so the assertion can be exact AND the verdict is the same on every run.
 if (Get-Command Get-WuuEffectiveInnerTimeout -ErrorAction SilentlyContinue) {
     try {
         $budgetRowAV = New-WuuComputerRow -Computer 'GATE-BUDGET-PROBE'
         $noDeadlineAV = Get-WuuEffectiveInnerTimeout -InnerTimeoutSeconds 30 -Row $budgetRowAV
 
-        $budgetRowAV.TimeoutExpiresAt = (Get-Date).AddSeconds(600)
-        $looseAV = Get-WuuEffectiveInnerTimeout -InnerTimeoutSeconds 30 -Row $budgetRowAV
+        # ONE FIXED INSTANT for every probe. Without it the remainder depends on the sub-millisecond
+        # moment each call samples the clock: AddSeconds(20) followed by a call a few ms later gives
+        # 19.99... -> floor 19, but a call landing in the same millisecond gives exactly 20. So the
+        # VERDICT TEXT changed between runs ("caps the 30s probe to 19s" or "to 20s") and no two runs
+        # produced the same report - which is what made this gate impossible to diff or compare in CI.
+        # Passing the deadline's own base as -Now makes the remainder exact and the verdict
+        # reproducible WITHOUT weakening the check: the real function is still driven, on a real row,
+        # with a real deadline, and the floor/cap/uncapped shapes are still asserted.
+        $probeNowAV = Get-Date
+
+        $budgetRowAV.TimeoutExpiresAt = $probeNowAV.AddSeconds(600)
+        $looseAV = Get-WuuEffectiveInnerTimeout -InnerTimeoutSeconds 30 -Row $budgetRowAV -Now $probeNowAV
 
         # A distinctly tiny budget: the floor is the only thing that can produce the answer.
-        $budgetRowAV.TimeoutExpiresAt = (Get-Date).AddSeconds(1)
-        $floorAV = Get-WuuEffectiveInnerTimeout -InnerTimeoutSeconds 30 -Row $budgetRowAV
+        $budgetRowAV.TimeoutExpiresAt = $probeNowAV.AddSeconds(1)
+        $floorAV = Get-WuuEffectiveInnerTimeout -InnerTimeoutSeconds 30 -Row $budgetRowAV -Now $probeNowAV
 
         # A tight but non-trivial budget: the cap must bind, and land at or just under the budget.
-        $budgetRowAV.TimeoutExpiresAt = (Get-Date).AddSeconds(20)
-        $tightAV = Get-WuuEffectiveInnerTimeout -InnerTimeoutSeconds 30 -Row $budgetRowAV
-        $budgetLeftAV = [int](($budgetRowAV.TimeoutExpiresAt - (Get-Date)).TotalSeconds)
+        $budgetRowAV.TimeoutExpiresAt = $probeNowAV.AddSeconds(20)
+        $tightAV = Get-WuuEffectiveInnerTimeout -InnerTimeoutSeconds 30 -Row $budgetRowAV -Now $probeNowAV
+        $budgetLeftAV = [int](($budgetRowAV.TimeoutExpiresAt - $probeNowAV).TotalSeconds)
 
         # Indexed access: the function returns a HASHTABLE, and .PSObject.Properties does not surface
         # hashtable keys (the same trap that already produced one false finding in this gate).
@@ -2552,12 +2563,13 @@ if (Get-Command Get-WuuEffectiveInnerTimeout -ErrorAction SilentlyContinue) {
             Fail "a 1-second remaining budget did not produce the 5-second floor (got $($floorAV['Seconds'])s, capped=$($floorAV['Capped'])) - an expiring probe would be handed a timeout too small to be answered, or a negative one, which the API rejects (P3)"
         } elseif (-not $tightAV['Capped']) {
             Fail "a 20-second remaining budget did not cap a 30-second probe (got $($tightAV['Seconds'])s) - the cap is inert (P3)"
-        } elseif ($tightAV['Seconds'] -lt 5 -or $tightAV['Seconds'] -gt 30) {
-            Fail "the capped timeout ($($tightAV['Seconds'])s) is outside the possible range (floor 5, ceiling 30) - the rule is miscomputed (P3)"
-        } elseif ($tightAV['Seconds'] -ge 30) {
-            Fail "a 20-second remaining budget did not reduce the 30-second probe (got $($tightAV['Seconds'])s) (P3)"
+        } elseif ($tightAV['Seconds'] -ne 20) {
+            # EXACT, because the clock is pinned: 20 seconds left must cap the 30-second probe to 20.
+            # $budgetLeftAV is reported too: when this fails, "the budget read 20 but the cap gave 19"
+            # and "the budget read 19" are different diagnoses, and the message must tell them apart.
+            Fail "a 20-second remaining budget capped the 30-second probe to $($tightAV['Seconds'])s, not 20s (budget read $($budgetLeftAV)s) - the cap is not using the remaining budget (P3)"
         } else {
-            Pass "the remaining-budget rule is live: no deadline leaves 30s uncapped, 600s left keeps 30s, 1s left floors to 5s, and 20s left caps the 30s probe to $($tightAV['Seconds'])s (budget read $($budgetLeftAV)s) (P3)"
+            Pass "the remaining-budget rule is live: no deadline leaves 30s uncapped, 600s left keeps 30s, 1s left floors to 5s, and 20s left caps the 30s probe to $($tightAV['Seconds'])s (P3)"
         }
     } catch {
         Fail "the remaining-budget rule threw when driven instead of returning a verdict: $($_.Exception.Message) (P3)"
