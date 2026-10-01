@@ -112,17 +112,22 @@ sections 2a and 2b.
 
 | Check | Result |
 | --- | --- |
-| Release gate | **169 verdicts — PASS 167, FAIL 0, WARN 0, SKIP 1, NOT_IMPLEMENTED 1** |
+| Release gate | **169 verdicts — PASS 168, FAIL 0, WARN 0, SKIP 0, NOT_IMPLEMENTED 1** |
 | Behavioural suites | 43 run, 42 pass, 1 skip, **0 FAIL** |
 | Assertions | **1175 pass, 0 fail** (was 1110) |
 | Tautology proofs | **13/13** mutations caught by *both* the gate and the suite |
 
+There is **no gate `SKIP`**, which is worth noting because it is easy to publish the wrong number here: the
+version guard declines to compare the embedded literal against a tag *while no tag for the release exists*,
+so a run made before tagging reports `SKIP`, and the same run made after tagging reports `PASS`. These
+totals are from the tagged tree.
+
+The single `NOT_IMPLEMENTED` is the §8.4 wording gap described above. The suite `SKIP` is
+`Test-RemoteTask.ps1`, which requires elevation.
+
 The four mutations proved for this release: revert the guard to the loose rule; drop `Timeout` from the
 terminal declaration; reintroduce a second copy of the terminal set; and reorder the declaration so
 `Complete` precedes `Error`.
-
-The `SKIP` is the version guard, which declines to compare between release tags. The single
-`NOT_IMPLEMENTED` is the §8.4 wording gap described above.
 
 ---
 
