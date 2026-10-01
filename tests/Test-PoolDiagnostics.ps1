@@ -116,7 +116,24 @@ if (Test-Path -LiteralPath $jsonPath) {
 
     # THE KIND DISTINCTION MUST BE REAL. A skipped check must not be counted as a pass - that is the
     # whole reason the kind exists.
-    Assert-True ([int]$report.Totals.SKIP -ge 1) "the report records at least one SKIP, so the kind is reachable ($($report.Totals.SKIP))"
+    #
+    # BUT THE COUNT IS ENVIRONMENT-DEPENDENT, so it cannot be asserted directly. The only SKIP in the
+    # gate is the SS18 version guard, and it fires only when HEAD is NOT on a release tag - so
+    # "SKIP >= 1" FAILED on exactly the tree this matters most for: a tagged release candidate.
+    # (Observed: this suite passed on every off-tag run and failed the moment the release was tagged.)
+    #
+    # The property that actually matters is that a SKIP is DISTINGUISHABLE, and that holds in both
+    # states: off-tag there is at least one, and on-tag every verdict carries an explicit kind so a
+    # consumer can tell "not evaluated" from "evaluated clean". Asserting that instead of a count keeps
+    # the check meaningful on a tag without weakening it off one.
+    $gateRan = @($verdicts).Count
+    $unclassified = @($verdicts | Where-Object { $_.Status -notin @('PASS', 'FAIL', 'WARN', 'SKIP', 'NOT_IMPLEMENTED') }).Count
+    Assert-True ($unclassified -eq 0) "every verdict carries one of the five kinds, so a SKIP is distinguishable from a PASS ($unclassified unclassified)"
+    Assert-True ($gateRan -gt 100) "the kind totals are over a full verdict list ($gateRan)"
+    # And the kind must be REACHABLE: either a SKIP is present, or the gate is on a tag where the only
+    # skipping check legitimately passes instead.
+    $onTag = ((git describe --exact-match --tags HEAD 2>$null) -ne $null)
+    Assert-True (([int]$report.Totals.SKIP -ge 1) -or $onTag) "the SKIP kind is reachable (SKIP=$($report.Totals.SKIP); on a tag the version guard passes instead)"
     Assert-Equal ([int]$report.Totals.FAIL) 0 'a passing gate reports zero failures'
     Assert-Equal $report.Passed $true 'the report agrees that the gate passed'
 
