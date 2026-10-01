@@ -255,76 +255,10 @@ $auditCode = Get-WuuCodeWithoutComments -Path $auditPath
 # (a)-(l) CONSOLE CONTRACT - extracted to Scripts\Test-Contracts.ps1 (instructions SS39).
 . (Join-Path $PSScriptRoot 'Test-Contracts.ps1')
 
-# (m) Spec 7: an offline computer must not be probed. Probing a host that is not there is a
-#     guaranteed bounded-timeout per probe, so pre-flight cost would scale with the number of
-#     machines that are down - the opposite of what an operator needs at 02:00.
-$sessCode2 = Get-WuuCodeWithoutComments -Path (Join-Path $root 'src\Wuu.Session.psm1')
-if ($sessCode2 -notmatch 'skipped \(offline\)') {
-    Fail 'pre-flight does not skip credential/service probes for offline computers (spec 7)'
-} else { Pass 'pre-flight skips expensive probes for offline computers (spec 7)' }
+# (m)-(r) GUIDED CONSOLE CONTRACT (continued) - extracted to Scripts\Test-Contracts.ps1, which is
+#      dot-sourced above. These cover offline handling, the plan lifecycle, guided audit targets,
+#      reason consumption and the GUI-control-member ban.
 
-# (n) "Cannot tell" must never be reported as "offline". Deriving the offline count as
-#     (total - reachable) unconditionally told the operator every machine was down whenever no
-#     ping probe was supplied - a false alarm, which is how a report trains people to ignore it.
-#     Raw text again, for the '$' reason above.
-$sessRaw2 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Session.psm1') -Raw
-if ($sessRaw2 -notmatch 'if \(\$PingProbe\)') {
-    Fail 'pre-flight derives the offline count without checking a ping probe ran - "unknown" would report as "offline"'
-} else { Pass 'pre-flight only reports offline when reachability was actually probed' }
-
-# (o) Spec 12: the plan shown before a mutating operation must state the lifecycle explicitly
-#     (spec 10). 'deploy' collapsing to a single step would mean the operator authorises an
-#     install they were never told would also reboot machines.
-if ($navRaw -notmatch "'Restart where required'") {
-    Fail "the deployment workflow does not include an explicit restart step (spec 11)"
-} else { Pass 'the deployment lifecycle is stated explicitly, including the reboot step (spec 11)' }
-
-# (p) The guided audit record must carry the confirmed TARGETS. Without them an interactive change
-#     is strictly less informative than a scripted one (`wuu install -Computer SRV01`), so the
-#     trail could not answer "which hosts did this person change?" for human-authorised changes.
-$coreRaw3 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
-if ($coreRaw3 -notmatch 'Invoke-WuuAuditedAction -Session \$auditSession -Action \$ActionName -Reason \$Reason -Body \$Body -Targets \$Targets') {
-    Fail 'the interactive audit hook does not forward targets - guided audit records would be targetless'
-} else { Pass 'the interactive audit hook forwards the confirmed targets' }
-
-# (q) A mutating guided action must CONSUME its reason. Leaving it on the context means the second
-#     step of a deployment silently reuses the first step's reason, so the audit trail would show
-#     the same justification for actions the operator justified separately.
-if ($navRaw -notmatch "NotePropertyName Reason -NotePropertyValue ''") {
-    Fail 'the guided workflow never clears the change reason - later mutations would inherit it'
-} else { Pass 'the guided workflow consumes each change reason (no reason is silently reused)' }
-
-# (r) NO SHIPPED SOURCE MAY READ A GUI CONTROL MEMBER.
-#
-#     This is the highest-value gate in this file. Three P0 defects and one total scheduler failure
-#     all had the same shape: live code reading `$uiHash.<Control>` in an edition where `$uiHash` is
-#     an EMPTY hashtable. Nothing threw, because Wuu.Core has no Set-StrictMode - a missing hashtable
-#     key is $null, and `@($null)` is an empty list. Concretely:
-#
-#       * AutoDownload/AutoInstall gates: `if ($null -and ...)`      -> never fired
-#       * AutoReboot gate:                `-not $null`               -> always returned early
-#       * Start-PendingUpdateCheck:       `@($null)` -> no items     -> the QUEUE WAS DEAD
-#       * Test-PhaseCompletion:           `@($null)` -> count 0      -> every phase reported complete
-#       * $eventAuditWSUSUpdates:         `@($null)` -> no rows      -> silent no-op
-#
-#     Two tests passed throughout because they HAND-BUILT the missing GUI objects, so they supplied
-#     the dependency they were meant to be exercising. That is why this is checked in the validator
-#     against shipped source, not left to a test suite.
-#
-#     Comments are stripped with the tokenizer: the modules' own history notes quote these members
-#     deliberately when explaining the migration, and a '#.*$' regex would also eat '#' inside
-#     strings and subexpressions (the false-positive class documented at gate 2).
-$guiMemberHits = @()
-foreach ($f in $files) {
-    if ($f.Name -eq 'Validate-Release.ps1') { continue }
-    $code2 = Get-WuuCodeWithoutComments -Path $f.FullName
-    if ($code2 -match '\$uiHash\.\w*(List[Vv]iew|CheckBox|TextBox|Menu|GridView)') {
-        $guiMemberHits += $f.Name
-    }
-}
-if ($guiMemberHits.Count) {
-    Fail ('shipped source reads a GUI control member - in this edition $uiHash is empty, so the read is silently $null and the behaviour is dead: ' + (($guiMemberHits | Select-Object -Unique) -join ', '))
-} else { Pass 'no shipped source reads a GUI control member (no silent-$null dead behaviour)' }
 
 # (s) The scheduler and phase gating must read the STATE STORE, not a display collection. Checked
 #     separately from (r) so a regression that swapped Listview for some other non-store collection
