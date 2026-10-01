@@ -130,10 +130,26 @@ if (Test-Path -LiteralPath $jsonPath) {
     $unclassified = @($verdicts | Where-Object { $_.Status -notin @('PASS', 'FAIL', 'WARN', 'SKIP', 'NOT_IMPLEMENTED') }).Count
     Assert-True ($unclassified -eq 0) "every verdict carries one of the five kinds, so a SKIP is distinguishable from a PASS ($unclassified unclassified)"
     Assert-True ($gateRan -gt 100) "the kind totals are over a full verdict list ($gateRan)"
-    # And the kind must be REACHABLE: either a SKIP is present, or the gate is on a tag where the only
-    # skipping check legitimately passes instead.
-    $onTag = ((git describe --exact-match --tags HEAD 2>$null) -ne $null)
-    Assert-True (([int]$report.Totals.SKIP -ge 1) -or $onTag) "the SKIP kind is reachable (SKIP=$($report.Totals.SKIP); on a tag the version guard passes instead)"
+    # And the kind must be REACHABLE. Two earlier attempts got this wrong, in instructive ways:
+    #   1. asserting "SKIP >= 1" FAILED on a tagged tree, because the gate's only skip (the SS18 version
+    #      guard) legitimately passes once a tag exists - so the check was inverted against the release
+    #      it was meant to protect;
+    #   2. asking git whether HEAD is tagged made the suite THROW off-tag - git writes to stderr and
+    #      returns non-zero there, and under $ErrorActionPreference='Stop' that surfaces as a terminating
+    #      error (observed as "InvokeMethodOnNull" on the next statement).
+    #
+    # Reachability is a property of the GATE, not of this checkout, so it is asserted against the gate's
+    # own source: a Skip call site must exist. That is true on a tag and off one, needs no git, and
+    # cannot be satisfied by the report alone. (Gate block (as) asserts the same thing from the other
+    # side, by counting invocations in the whole verdict corpus.)
+    $gateSource = [System.IO.File]::ReadAllText((Join-Path $root 'Scripts\Validate-Release.ps1')) +
+        (@(Get-ChildItem -Path (Join-Path $root 'Scripts') -Filter 'Test-*.ps1' -File) |
+            ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join "`n"
+    $skipSites = ([regex]::Matches($gateSource, '(?m)^\s*Skip\s')).Count
+    Assert-True ($skipSites -ge 1) "the SKIP kind has a call site in the gate, so it is reachable whatever tree is checked out ($skipSites)"
+    # The kind must also be USED, not merely defined: every kind total is checked against the list above.
+    $nonPassKinds = @('FAIL', 'WARN', 'SKIP', 'NOT_IMPLEMENTED') | Where-Object { [int]$report.Totals.$_ -gt 0 }
+    Assert-True ($nonPassKinds.Count -ge 1) "the report distinguishes at least one non-PASS kind ($($nonPassKinds -join ', '))"
     Assert-Equal ([int]$report.Totals.FAIL) 0 'a passing gate reports zero failures'
     Assert-Equal $report.Passed $true 'the report agrees that the gate passed'
 

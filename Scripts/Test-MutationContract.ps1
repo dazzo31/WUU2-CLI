@@ -6,7 +6,11 @@
 #   (ao) atomic slot reservation, with a rollback when the reservation fails after the claim
 #   (ap) refusal semantics - a refusal is not an error, and nothing is written when refused
 #   (aq) silent catches - an empty catch must be deliberate and allowlisted
-#   (ar) the single log appender - four copies of the retry loop became one
+#
+# (ar), the single log appender, is NOT here: it followed (aq) in the report but belonged to a later
+# contiguous run, so it stayed in the gate and is extracted separately. (This header claimed it for one
+# commit after the extraction, which made the file describe something it did not contain - the SS40
+# failure mode, corrected here.)
 #
 # DOT-SOURCED FRAGMENT - not a standalone script. Validate-Release.ps1 dot-sources it into its own
 # scope, which is what gives this file $root, the verdict helpers, and the shared harness helpers
