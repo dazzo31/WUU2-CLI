@@ -7,10 +7,7 @@
 #   (ap) refusal semantics - a refusal is not an error, and nothing is written when refused
 #   (aq) silent catches - an empty catch must be deliberate and allowlisted
 #
-# (ar), the single log appender, is NOT here: it followed (aq) in the report but belonged to a later
-# contiguous run, so it stayed in the gate and is extracted separately. (This header claimed it for one
-# commit after the extraction, which made the file describe something it did not contain - the SS40
-# failure mode, corrected here.)
+#   (ar) the single log appender - four copies of the retry loop became one. It followed (aq) in the
 #
 # DOT-SOURCED FRAGMENT - not a standalone script. Validate-Release.ps1 dot-sources it into its own
 # scope, which is what gives this file $root, the verdict helpers, and the shared harness helpers
@@ -390,4 +387,117 @@ if (-not (Test-Path -LiteralPath $catchAuditPath)) {
             Pass 'the detector finds the multi-line form it is judging, and the statement it guards (P2)'
         }
     }
+}
+
+# (ar) ONE LOG APPENDER (reviewer P2: "reduce duplicated worker scriptblocks"). The fault-tolerant
+#      lock-and-retry append was written FOUR times - Wuu.Logging's Write-WuuLogEntry, Wuu.Core's cleanup
+#      runspace, Wuu.WindowsUpdate's per-computer runspace, and inline inside WriteDebugLogScript - each
+#      with a comment telling the reader to keep them in step. Two copies of a retry loop is exactly the
+#      arrangement that drifts, and the drift would be silent (a payload that logs in one runspace and
+#      not another). They are now one factory, so agreement is structural.
+$distinctiveRetry = 'Start-Sleep -Milliseconds (100 * $attempt)'
+$retryOutsideFactory = @()
+foreach ($rf in Get-ChildItem (Join-Path $root 'src\*.psm1') | Sort-Object Name) {
+    $rfLines = [System.IO.File]::ReadAllLines($rf.FullName)
+    $inFactory = $false
+    for ($ri = 0; $ri -lt $rfLines.Count; $ri++) {
+        # The factory's DEFINITION line does not start at column 0 in every module, so it is matched
+        # without the anchor. Only the TERMINATOR is anchored: an earlier version cleared the flag on the
+        # call site `$newRunspace.SessionStateProxy.SetVariable('WriteLogFileScript', (Get-WuuWorker...))`,
+        # whose line starts with `$` rather than `function`, so the factory's own loop was then counted
+        # as being OUTSIDE the factory.
+        if ($rfLines[$ri] -match 'Get-WuuWorkerLogAppender\s*\{') { $inFactory = $true }
+        if ($ri -gt 0 -and $rfLines[$ri] -match '^function\s+' -and $rfLines[$ri] -notmatch 'Get-WuuWorkerLogAppender') { $inFactory = $false }
+        if ($rfLines[$ri].Contains($distinctiveRetry) -and -not $inFactory) {
+            $retryOutsideFactory += "$($rf.Name):L$($ri+1)"
+        }
+    }
+}
+
+if ($retryOutsideFactory.Count -gt 0) {
+    Fail ("$($retryOutsideFactory.Count) module(s) still carry their own copy of the log retry loop: " + ($retryOutsideFactory -join ', ') + ' (P2)')
+} else {
+    # The factory must exist, be exported from Wuu.LOGGING (logging owns logging), and be USED at every
+    # former copy site. Export location matters: Write-WuuLogEntry delegates to it, and three suites
+    # import Wuu.Logging on its own - placing it in Wuu.Scheduler made logging depend on the scheduler
+    # and broke those imports.
+    $loggingRawAR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Logging.psm1') -Raw
+    $coreRawAR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+    $wupdRawAR = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+    if ($loggingRawAR -notmatch 'function Get-WuuWorkerLogAppender') {
+        Fail 'the log appender factory does not live in Wuu.Logging - logging would have to depend on another module to log (P2)'
+    } elseif ($loggingRawAR -notmatch "'Get-WuuWorkerLogAppender'") {
+        Fail 'the log appender factory is not exported from Wuu.Logging (P2)'
+    } elseif ($coreRawAR -notmatch '\(Get-WuuWorkerLogAppender\)' -or $wupdRawAR -notmatch '\(Get-WuuWorkerLogAppender\)') {
+        Fail 'a worker runspace does not use the shared log appender (P2)'
+    } elseif ($wupdRawAR -notmatch '&\s+\$WriteLogFileScript\s+-LogEntry') {
+        Fail 'WriteDebugLogScript does not delegate to the injected appender - it kept its own retry loop (P2)'
+    } else {
+        Pass 'one log appender exists in Wuu.Logging and is used by every former copy site (P2)'
+    }
+}
+
+# Wuu.Scheduler must exist and be registered, or the injected helper set has no home - and a module that
+# is not imported is a module whose helpers silently fail to inject.
+if (-not (Test-Path -LiteralPath (Join-Path $root 'src\Wuu.Scheduler.psm1'))) {
+    Fail 'src\Wuu.Scheduler.psm1 is missing - the worker helper surface has no single home (P2)'
+} elseif ($coreRawAR -notmatch "'Wuu\.Scheduler'") {
+    Fail 'Wuu.Scheduler is not in the import list - nothing would wire the worker helper set (P2)'
+} else {
+    Pass 'Wuu.Scheduler exists and is imported (P2)'
+}
+
+function Write-WuuGateJsonReport([string]$Path) {
+    <#
+    .SYNOPSIS
+    Writes the verdicts to a JSON file (P4). Called before EVERY exit path.
+    .DESCRIPTION
+    WHY A FUNCTION AND NOT INLINE. The gate has two exit points (the normal one and the failure one),
+    and a report written on only one of them would be missing exactly when it is most useful - a
+    failing run. One function, called from both, removes that possibility.
+    #>
+    # .ToArray(), NOT @(...). On PowerShell 5.1 `@($list)` over a
+    # System.Collections.Generic.List[object] raises "Argument types do not match" - reproduced in
+    # isolation - and because that is a NON-TERMINATING error, the assignment silently yields $null.
+    # The report then contained ONE verdict whose fields were all null, because `$null | ForEach-Object`
+    # still iterates once. Every total read 0 while the gate itself passed. `.ToArray()` enumerates the
+    # list correctly. Any future `@()` over this list inherits the same trap.
+    $verdicts = $script:WuuGateVerdicts.ToArray()
+
+    try {
+        # Count EVERY verdict kind. A consumer that only reads Failures and Passes would treat a
+        # NOT_IMPLEMENTED as absent rather than as "no verifier exists", and an unreported gap is the
+        # failure mode this mode exists to remove.
+        $report = [ordered]@{
+            Schema        = 'wuu.gate.v1'
+            GeneratedUtc  = (Get-Date).ToUniversalTime().ToString('o')
+            Root          = $root
+            Passed        = (-not $script:failed)
+            Totals        = [ordered]@{
+                PASS            = @($verdicts | Where-Object { $_.Status -eq 'PASS' }).Count
+                FAIL            = @($verdicts | Where-Object { $_.Status -eq 'FAIL' }).Count
+                WARN            = @($verdicts | Where-Object { $_.Status -eq 'WARN' }).Count
+                SKIP            = @($verdicts | Where-Object { $_.Status -eq 'SKIP' }).Count
+                NOT_IMPLEMENTED = @($verdicts | Where-Object { $_.Status -eq 'NOT_IMPLEMENTED' }).Count
+            }
+            Verdicts      = @($verdicts | ForEach-Object { [ordered]@{ Status = $_.Status; Message = $_.Message } })
+        }
+
+        $json = $report | ConvertTo-Json -Depth 6
+        # UTF8 WITHOUT a BOM: a BOM is legal JSON in some readers and a parse error in others, and the
+        # consumers here are scripts and CI tools. (The SOURCE files need BOMs; this artifact does not.)
+        [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "  gate report written to $Path ($($verdicts.Count) verdict(s))" -ForegroundColor DarkGray
+        return $true
+    } catch {
+        # A report-write failure must not change the gate's verdict - the exit code is the contract, and
+        # this is the diagnostic. Reported loudly rather than swallowed, because a silently missing
+        # report would make CI's own gate look like a configuration error.
+        Write-Host "  WARNING: could not write the gate report to $Path : $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+if ($Json) {
+    $jsonPath = if ([System.IO.Path]::IsPathRooted($Json)) { $Json } else { Join-Path $root $Json }
 }
