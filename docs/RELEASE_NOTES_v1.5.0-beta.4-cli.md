@@ -117,14 +117,17 @@ and runs the behavioural suite **once** (it previously ran twice).
 
 | Check | Result |
 | --- | --- |
-| Release gate | 162 verdicts - PASS 162, FAIL 0, WARN 0, SKIP 1, NOT_IMPLEMENTED 1 |
+| Release gate | 164 verdicts - PASS 163, FAIL 0, WARN 0, SKIP 0, NOT_IMPLEMENTED 1 |
 | Behavioural suites | 42 run, 41 pass, 1 skip, 0 FAIL |
 | Assertions | 1110 pass, 0 fail |
-| Tautology proofs | 5/5 mutations caught by both the gate and the suite |
+| Tautology proofs | 9/9 mutations caught by both the gate and the suite |
 
-The single `SKIP` is `Test-RemoteTask.ps1`, which requires elevation. The single `NOT_IMPLEMENTED` is
-invariant 8.4: it names five terminal states and only two exist (`Complete`, `Error`). Naming the others
-is a state-machine change, so it is reported rather than claimed.
+The single `NOT_IMPLEMENTED` is invariant 8.4: it names five terminal states and only two exist
+(`Complete`, `Error`). Naming the others is a state-machine change, so it is reported rather than claimed.
+
+There is no `SKIP` here, and that is worth noting: the `SKIP` in beta.3 was the version guard declining to
+compare off a release tag. It now compares the embedded literal against the tag created for this release,
+so the check actually evaluates - and it passes.
 
 ---
 
