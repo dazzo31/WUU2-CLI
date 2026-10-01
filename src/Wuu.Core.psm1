@@ -60,11 +60,8 @@ The three things worth knowing before editing this file:
      MODULE FUNCTION IS NOT CALLABLE THERE, so any logic they need must be inlined, and state reaches them
      only via `SessionStateProxy.SetVariable` or as an argument. Some of them also define their OWN copies
      of helper functions at indent 8 (see `Invoke-CimWithTimeout`), which is why a duplicate-function
-     detector must be scope-aware. This has cost real time more than once, including during the P3 work.
-     NOTE: this paragraph deliberately does NOT spell out the payload assignment syntax. Several suites
-     slice those payload definitions out of the raw file text, and a comment containing the literal
-     assignment is picked up as the payload's opening line. (Those suites now strip comments before
-     slicing, which is the real fix; the wording here avoids the trip wire regardless.)
+     detector must be scope-aware.
+     Do not write the payload assignment syntax in comments: some suites slice payloads from source text.
 
   3. THE HISTORY IS NOT HERE. Feature changelogs, the legacy author/date and the GUI-era feature list
      that used to be this header are preserved at `docs/CHANGELOG-history.md`. The edition's identity and
@@ -78,47 +75,10 @@ reports progress back through the registry.
 
 #region Configuration
 
-# The CLI edition's version, in ONE place. $global: so Wuu.Logging (banner) and Wuu.Audit
-# (wuuVersion on every audit record) can both read it - module-scoped variables are invisible
-# across modules. Previously the banner and the audit records each hardcoded their own string,
-# so a release could ship with the log claiming one version and the audit trail recording
-# another - a genuine compliance problem for a field an ISO 27001 review relies on.
-#
-# v1.5.0-beta.5-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
-# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.5-cli` knows the evidence
-# came from pre-release software. Do not reuse this string for a final release.
-#
-# beta.5 makes INVARIANT 8.4 real ("terminal operations stay terminal"), and the review of it found the
-# defect was NOT the one the invariant's wording implies. The invariant names five terminal states and
-# only two were written - but the fault was that THREE functions each decided independently what
-# "finished" meant, and they disagreed. Concretely:
-#
-#   * Test-WuuStateTransitionAllowed treated only Complete and Error as terminal;
-#   * Get-WuuTargetOutcome ALSO treated Timeout as settled, and counted it toward exit code 4;
-#   * Test-WuuOperationStateInvariant kept the same two-state literal, so a TIMED-OUT row still queuing a
-#     PendingOp or still holding its runspace lock was not flagged at all.
-#
-# The consequence was a silently-overwritable FAILURE: a timed-out row was a counted failure to the
-# exit-code classifier and a freely-rewritable row to the guard, so an unattributed writer could turn it
-# into 'Complete' - a counted success - with nothing recording the change.
-#
-# The fix is SINGLE-SOURCING, not new state names. One ordered declaration in Wuu.State now carries
-# membership, the outcome word and the PRECEDENCE (failure before completion, so a stale Complete cannot
-# mask a current Error), and the guard, the classifier and the checker all read it. The rule is now: an
-# unattributed write may not CHANGE a terminal row's state - including terminal to terminal, which is the
-# hole the first version of the rule left open. A retry is unaffected, because a retry is a new operation.
-#
-# Two further corrections came out of the same work, both recorded in the release notes:
-#   * a release-gate check asserted the SHAPE of the classifier (a literal line and its line offsets),
-#     which became a FALSE FINDING once the mapping was table-driven. It now DRIVES the classifier on the
-#     rows that matter instead - strictly stronger, and it cannot fail correct code;
-#   * Wuu.State.psm1 is deliberately PURE ASCII. It shipped with no UTF-8 BOM, and the gate fails a file
-#     containing non-ASCII bytes without one.
-#
-# Read the release notes before deploying: docs/RELEASE_NOTES_v1.5.0-beta.5-cli.md. The per-invariant
-# status table (what is enforced versus still target) is .github/copilot-instructions.md Appendix A,
-# terminal-state detail is docs/STATE-MACHINE.md section 2a, and the pass is recorded in
-# docs/HARDENING_COMPLETION_REPORT.md.
+# The ONE application version. $global: so Wuu.Logging (banner) and Wuu.Audit (wuuVersion on every
+# record) read the same value; the release gate checks it against the git tag at HEAD. A prerelease string
+# marks every audit record as pre-release evidence - never reuse it for a final release.
+# Release notes: docs/RELEASE_NOTES_<version>.md. Invariant status: .github/copilot-instructions.md Appendix A.
 $global:WuuVersion = 'v1.5.0-beta.5-cli'
 
 # SS18: PROVENANCE, immediately after the literal so the resolved value cannot be overwritten by it.
@@ -257,14 +217,8 @@ $global:CredentialConfig = @{ Username = ''; Domain = ''; UseCredentials = $fals
 # instead of silently reusing one that captured the previous identity.
 $global:CredentialEpoch = 0
 
-# Job throttling for scalability.
-#
-# INVARIANT: this must not exceed the worker pool size ($script:MaxPoolSize in Wuu.Workers.psm1), whose
-# default matches this value. Bounded probes are dispatched from inside the worker runspaces, so a pool
-# smaller than this cap leaves the excess operations with probes that can never start - and because the
-# cap already counts those operations as running, nothing is refused and nothing is logged. The symptom
-# is a slow host. Raise this and Wuu.Workers' pool together; Test-PoolCompatibility and the release gate
-# fail if they diverge in the unsafe direction.
+# Job throttling. Must not exceed $script:MaxPoolSize in Wuu.Workers (probes run on that pool); raise both
+# together. Test-PoolCompatibility and gate block (ax) enforce it.
 $global:MaxConcurrentJobs = 10
 # Performance thresholds for operations
 $global:PerformanceThreshold = @{ CPUPercent = 80; MemoryMB = 1024; NetworkLatencyMs = 1000 }
@@ -1367,50 +1321,22 @@ $GetUpdates = {
                 # PSCredential (never a plain string) so a password can't leak into logs/UI
                 [pscredential]$Credential = $null,
                 [string]$Operation = 'CIM operation',
-                # P3: the row this probe belongs to, so the timeout can be capped by the operation's
-                # REMAINING budget. Optional because a probe may run outside any operation (a pre-flight
-                # connectivity test), in which case there is no budget to cap against and $null is honest.
+                # The row whose operation deadline caps this probe; $null = no budget to cap against.
                 $Row = $null
             )
-            # P3: min(own timeout, remaining budget). Without this a probe whose own timeout is 10s can
-            # still run for 10s AFTER the operation's deadline has passed, holding a pool slot the cleanup
-            # loop has already abandoned - and it reports a timeout for a host that was merely slow at the
-            # wrong moment.
-            #
-            # INLINED ON PURPOSE. This function is DEFINED inside a payload scriptblock, so it executes in
-            # an isolated runspace whose InitialSessionState is CreateDefault() with no module imported -
-            # and a module function is NOT callable there. Verified on this host (tests\Probe-PayloadFunctionReach.ps1):
-            # Get-Command Get-WuuEffectiveInnerTimeout returns nothing inside such a runspace, so the call
-            # this replaced would have thrown on EVERY production probe. Only $WuuWorkerPool, $Row and the
-            # other SetVariable'd objects are reachable.
-            #
-            # The rule (min(own, remaining), with a floor, and "no deadline means do not cap") is duplicated
-            # arithmetic, so it is ASSERTED to agree with Get-WuuEffectiveInnerTimeout by
-            # tests\Test-RemainingBudget.ps1 rather than left to drift. Keep the two in step.
-            #
-            # $TimeoutSeconds -gt 0 mirrors the helper's early return: 0 means "no timeout" to the
-            # underlying API, and raising it to the floor would turn "wait indefinitely" into "wait 5
-            # seconds" exactly when the operation is overdue.
-            #
-            # The cap lands in a LOCAL ($effectiveTimeout), not back onto the $TimeoutSeconds parameter.
-            # Reassigning a parameter is a gated defect class in this project (the gate's case-insensitive
-            # collision check): a declared type is enforced on every assignment, so a later coercion can
-            # throw where a local cannot. The original version of this block reassigned the parameter and
-            # the gate rejected it.
+            # Timeout = min(own, remaining budget), floor 5s; 0 means "no timeout" and is left alone.
+            # Inlined: this runs in a payload runspace where Get-WuuEffectiveInnerTimeout is not callable.
+            # Test-RemainingBudget asserts this copy agrees with it. Kept in a local - parameters are not reassigned.
             $effectiveTimeout = $TimeoutSeconds
             if ($TimeoutSeconds -gt 0 -and $null -ne $Row) {
                 $rowExpiry = $Row.PSObject.Properties['TimeoutExpiresAt']
                 if ($rowExpiry -and $Row.TimeoutExpiresAt) {
-                    # A row whose deadline cannot be parsed is treated as HAVING one, and the cap applies:
-                    # an unreadable deadline is not evidence that there is no deadline.
+                    # An unparseable deadline still counts as a deadline: apply the floor.
                     $rowExpiryDate = $null
                     try { $rowExpiryDate = [datetime]$Row.TimeoutExpiresAt } catch { $rowExpiryDate = $null }
                     if ($null -eq $rowExpiryDate) {
                         $effectiveTimeout = [math]::Max(5, $TimeoutSeconds)
                     } else {
-                        # Truncated toward zero, matching [int] on the helper's float: an int cast would
-                        # be identical for positive values and would diverge for negatives, and the two
-                        # sides of this duplicated rule are required to agree (tests\Test-RemainingBudget).
                         $remaining = [int](($rowExpiryDate - (Get-Date)).TotalSeconds)
                         if ($remaining -lt $TimeoutSeconds) { $effectiveTimeout = [math]::Max(5, $remaining) }
                     }
@@ -1471,8 +1397,7 @@ $GetUpdates = {
         [ValidateRange(1, 300)]
         [int]$TimeoutSeconds = 30,
 
-        # P3: the row this probe belongs to, so the timeout can be capped by the operation's REMAINING
-        # budget. Optional for the same reason as Invoke-CimWithTimeout's.
+        # The row whose operation deadline caps this call; $null = no budget to cap against.
         [Parameter(Mandatory=$false)]
         [AllowNull()]
         $Row = $null,
@@ -1482,20 +1407,7 @@ $GetUpdates = {
         [int]$PostActionDelay = 5
     )
 
-    # P3: min(own timeout, remaining budget), the same rule Invoke-CimWithTimeout applies. A service
-    # action holds the pool slot for its duration, so letting it outlive the operation is exactly the
-    # starvation case the pool diagnostics exist to expose.
-    #
-    # INLINED ON PURPOSE - see the longer note in Invoke-CimWithTimeout. Both functions execute inside an
-    # isolated payload runspace with no module imported, where Get-WuuEffectiveInnerTimeout is NOT
-    # callable (verified: tests\Probe-PayloadFunctionReach.ps1). The rule is shared arithmetic, asserted to
-    # agree with the Wuu.State helper by tests\Test-RemainingBudget.ps1. Keep the two in step.
-    #
-    # $TimeoutSeconds -gt 0 mirrors the helper's early return - see Invoke-CimWithTimeout.
-    #
-    # The cap lands in a LOCAL for the same reason as Invoke-CimWithTimeout: reassigning a parameter is a
-    # gated defect class here, because a declared type is enforced on every assignment and a later
-    # coercion can throw where a local cannot. The gate rejected the parameter-reassigning version.
+    # Same inlined budget cap as Invoke-CimWithTimeout (asserted by Test-RemainingBudget).
     $effectiveTimeout = $TimeoutSeconds
     if ($TimeoutSeconds -gt 0 -and $null -ne $Row) {
         $rowExpiry = $Row.PSObject.Properties['TimeoutExpiresAt']

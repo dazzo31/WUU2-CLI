@@ -381,39 +381,11 @@ function Format-WuuDuration {
 function Get-WuuOperationRemainingSeconds {
     <#
     .SYNOPSIS
-    Seconds left before a running operation's deadline (P3: remaining-budget propagation).
+    Seconds left before a running operation's deadline, so inner calls can respect the outer budget.
     .DESCRIPTION
-    WHY THIS EXISTS. The deadline was enforced only at the OUTERMOST level: the cleanup loop kills a
-    payload that overruns its budget. But a payload's inner probes each take a FIXED timeout of their
-    own (Invoke-CimWithTimeout defaults to 5s, Invoke-ServiceWithTimeout to 30s), and those numbers are
-    chosen independently of how much budget the operation has left.
-
-    The failure that produces, and it is not theoretical: an operation with a 45-minute budget reaches
-    the 44-minute mark and starts a probe with a 10-second timeout, so a probe that would have answered
-    in 15 seconds is killed for no reason other than timing - the operator sees a probe failure and
-    concludes the host is broken. Conversely an operation ONE second from expiry still starts a 30-second
-    probe, and the pool slot is held for 29 seconds AFTER the cleanup loop has already given up on the
-    operation, starving other work (see the pool diagnostics).
-
-    THE RULE THIS ENABLES: an inner call takes min(its own timeout, what is left). Both halves matter -
-    capping only at the budget keeps a call from outliving its operation, and keeping the call's own
-    timeout as the ceiling stops a generous operation from handing a probe a budget it was never designed
-    for.
-
-    Returns a hashtable, never a bare number, because the caller has to distinguish three cases that a
-    number cannot express:
-      Known        $false means NO deadline is recorded, so there is nothing to cap against - the caller
-                   must use its own timeout rather than being handed a fabricated one. This is the
-                   load-bearing distinction: returning 0 for "unknown" would make every probe fail
-                   immediately, and returning a large number would silently remove the ceiling.
-      Remaining    seconds left, or $null when not Known. NEVER clamped to 0: a negative value means the
-                   operation is ALREADY past its deadline, and collapsing that to 0 would hide the
-                   overshoot from the caller's log.
-      Op           the operation name recorded on the row, for the caller's message.
-      ExpiresAt    the deadline itself.
-
-    Pure, side-effect free, $null-tolerant: called from payload scriptblocks, which have no exception
-    handling around them and must never be broken by a diagnostic.
+    Returns @{ Known; Remaining; Op; ExpiresAt }. Known=$false means no deadline is recorded: the caller
+    must keep its own timeout (never treat unknown as 0). Remaining is not clamped; negative = overdue.
+    Called from payload scriptblocks, so it must never throw.
     #>
     [CmdletBinding()]
     param(
@@ -443,25 +415,11 @@ function Get-WuuOperationRemainingSeconds {
 function Get-WuuEffectiveInnerTimeout {
     <#
     .SYNOPSIS
-    An inner call's timeout, capped by what is left of the operation's budget (P3).
+    An inner call's timeout: min(own timeout, remaining budget), floored at FloorSeconds.
     .DESCRIPTION
-    THE RULE, in one place: min(TheInnerTimeout, remaining budget). Both halves are load-bearing:
-      * cap at the remaining budget, so an inner call cannot outlive the operation that owns it, holding
-        a pool slot and reporting a failure after the cleanup loop has already given up;
-      * keep the inner call's own timeout as the ceiling, so a generous operation does not hand a probe a
-        far larger timeout than it was designed for - the probe's own number encodes an expectation about
-        how long that call SHOULD take, and overriding it upward would defeat it.
-    A floor is applied so a probe that is genuinely about to expire still gets a usable slice rather than
-    1 second: a 1-second CIM call reports "timed out" for a host that was merely slow, which is a false
-    negative that costs an operator a real investigation.
-
-    Returns @{ Seconds; Capped; Reason } - the reason carries into the caller's log, because "the probe
-    timed out after 4s instead of 30s" is only explicable if the log says the operation was about to
-    expire.
-
-    When no deadline is recorded (Known = $false) the inner timeout is returned UNCHANGED and Capped is
-    $false: there is no budget to cap against, and inventing one would silently change the behaviour of
-    every operation submitted outside the normal path.
+    Returns @{ Seconds; Capped; Reason }. No recorded deadline leaves the inner timeout unchanged. The
+    floor stops an expiring probe getting a timeout too short to answer. Inlined copies exist in the
+    payload helpers (no module function is callable there); Test-RemainingBudget asserts they agree.
     #>
     [CmdletBinding()]
     param(
@@ -687,76 +645,20 @@ function Get-WuuStateStatusText {
     return $base
 }
 
-# THE TERMINAL STATES, DEFINED ONCE (invariant 8.4).
-#
-# WHY THIS TABLE EXISTS. Two functions independently decided what "finished" meant, and they disagreed -
-# which is the whole of the 8.4 defect:
-#
-#   Test-WuuStateTransitionAllowed  treated only Complete and Error as terminal
-#   Get-WuuTargetOutcome            ALSO treated Timeout as settled, and counted it toward the exit code
-#
-# The consequence was a silently-overwritable FAILURE. A row whose operation timed out is settled as a
-# failure by the classifier (it produces exit code 4 in a mixed fleet), but the guard would let an
-# unattributed writer move that same row to 'Complete' with no new operation - turning a counted failure
-# into a success, with nothing recording that it happened. Proved by driving both functions on one row,
-# and asserted by tests\Test-TerminalStates.ps1 so they cannot drift apart again.
-#
-# ONE ORDERED TABLE, DELIBERATELY. It carries three things that must not be stated separately:
-#   * Membership - which states are terminal. The guard and the classifier read THIS, not a copy.
-#   * Outcome    - the word a terminal state maps to ('Complete'->Success, 'Error'->Failed,
-#                  'Timeout'->TimedOut). Declared beside membership so a state cannot be terminal with no
-#                  outcome, which is precisely the original defect.
-#   * PRECEDENCE - the ORDER below is the precedence, and it is load-bearing. A row can carry
-#                  `State='Complete'` from an earlier operation while its CURRENT operation errored; the
-#                  error is the outcome, not the stale completion. So 'Error' is judged before 'Timeout',
-#                  which is judged before 'Complete'. A plain hashtable would have lost this, so the order
-#                  is part of the declaration rather than an accident of how it is iterated.
+# THE terminal states (invariant 8.4), read by the transition guard, the outcome classifier and the checker.
+# Do not keep a second list anywhere. ORDER IS PRECEDENCE: a stale Complete must not mask a current Error.
+# Timeout is terminal yet retryable - a retry is a new operation. RebootRequired is transient, not terminal.
+# Cancelled/Refused are deliberately not states; see docs/STATE-MACHINE.md section 2a. Keep this file ASCII.
 $script:WuuTerminalStates = @(
     @{ State = 'Error';    Outcome = 'Failed' }
     @{ State = 'Timeout';  Outcome = 'TimedOut' }
     @{ State = 'Complete'; Outcome = 'Success' }
 )
 
-# WHY 'Timeout' IS TERMINAL EVEN THOUGH IT IS RECOVERABLE. Those are different questions. The state is
-# recoverable in the sense that a RETRY is the right response - but a retry is a NEW OPERATION with a new
-# OperationId, and the guard permits any terminal state to be left by an attributed operation. So marking
-# it terminal does not block retries; it blocks an UNATTRIBUTED writer from rewriting a settled outcome,
-# which is exactly the protection 8.4 asks for.
-#
-# WHY 'RebootRequired' IS NOT. It is a TRANSIENT state: `State='RebootRequired'` is followed by
-# 'Rebooting' and then 'Complete', so treating it as terminal would make the operation's own completion
-# illegal.
-#
-# THE NAMES IN THE INVARIANT, MAPPED. The project instructions, section 8.4, name Complete, Failed,
-# TimedOut, Cancelled and Refused. The shipped vocabulary (Set-ComputerState's ValidateSet, which is the
-# one authoritative list of canonical states) is different, and the mapping is deliberate rather than an
-# omission - see docs/STATE-MACHINE.md for the full table:
-#
-# NOTE: this file is deliberately PURE ASCII. It shipped with no UTF-8 BOM, and the release gate fails a
-# file that contains non-ASCII bytes without one. Spelling matters less than the invariant, so the section
-# reference is written out rather than using a typographic symbol.
-#
-#   Complete   -> Complete   (implemented)
-#   Failed     -> Error      (implemented; 'Error' is the terminal failure state)
-#   TimedOut   -> Timeout    (implemented, and until this change it was NOT protected)
-#   Cancelled  -> (none)     no producer exists - there is no operator-facing cancel of a RUNNING
-#                            operation. The one 'cancelled' in the codebase is a declined UAC prompt,
-#                            and a pre-flight denial is recorded as a REFUSAL rather than a state.
-#   Refused    -> (no state) a refusal is a PRE-FLIGHT outcome recorded on the row as
-#                            RefusedCount/RefusedReason/RefusedAt. Intentionally not a State: the
-#                            operation never started, so the row has no terminal workflow position.
-
 function Get-WuuTerminalStates {
     <#
     .SYNOPSIS
-    The states a row may not leave without a NEW attributed operation (invariant 8.4), in precedence order.
-    .DESCRIPTION
-    Returns the state NAMES, in precedence order, as a fresh array - so a caller cannot mutate the
-    definition and cannot reorder it by accident. Read by Test-WuuStateTransitionAllowed,
-    Get-WuuTargetOutcome, Test-WuuTerminalStateInvariant and the release gate; that is the point of it
-    existing rather than the array being written inline in each of them.
-
-    Pure and side-effect free.
+    The terminal state names, in precedence order (invariant 8.4). Returns a fresh array.
     #>
     [CmdletBinding()]
     param()
@@ -766,22 +668,13 @@ function Get-WuuTerminalStates {
 function Get-WuuTerminalOutcomeMap {
     <#
     .SYNOPSIS
-    The terminal state -> outcome-word mapping, in precedence order (invariant 8.4).
-    .DESCRIPTION
-    Returns a fresh ORDERED dictionary. Ordered, not a hashtable, because the precedence is load-bearing
-    (Error before Timeout before Complete) and an unordered container would silently discard it on some
-    hosts - the failure would be an intermittently wrong outcome word, which is close to undiagnosable.
-
-    Pure and side-effect free.
+    Terminal state -> outcome word, as an ORDERED dictionary so the precedence survives.
     #>
     [CmdletBinding()]
     param()
     $map = [ordered]@{}
     foreach ($entry in $script:WuuTerminalStates) {
-        # A malformed entry is SKIPPED rather than mapped. `[string]$entry.State` on an entry with no State
-        # field yields '', and an empty-string KEY would then match any row whose UpdatesStatus is empty -
-        # returning an outcome for a row the declaration says nothing about. Skipping keeps the map honest;
-        # Test-WuuTerminalStateInvariant is what reports the malformed declaration itself.
+        # Skip malformed entries: an empty key would match every row with an empty UpdatesStatus.
         $stateName = [string]$entry.State
         $outcomeName = [string]$entry.Outcome
         if ([string]::IsNullOrEmpty($stateName) -or [string]::IsNullOrEmpty($outcomeName)) { continue }
@@ -795,19 +688,9 @@ function Test-WuuTerminalStateInvariant {
     .SYNOPSIS
     Whether the terminal declaration is internally consistent (invariant 8.4).
     .DESCRIPTION
-    THE CHECK THAT WOULD HAVE CAUGHT THE ORIGINAL DEFECT, which was not a missing state but a state that
-    was terminal in one place and not in another. It asserts, against the declaration itself:
-
-      1. the set is non-empty - an empty set makes every transition legal and the guard inert;
-      2. every entry names a State and an Outcome;
-      3. no state appears twice, because a duplicate makes the precedence ambiguous;
-      4. every state the outcome classifier can PRODUCE is in the set - 'Failed'/'TimedOut'/'Success' must
-         map back to a terminal state, so the classifier cannot settle a row the guard considers open;
-      5. the precedence has 'Complete' last, so a stale completion cannot mask a current failure.
-
-    Returns @{ Ok; Violations } - a list rather than a bare boolean, because the value is in knowing WHICH
-    property broke. Returns violations rather than throwing: it is called from a release gate, which must
-    report rather than die.
+    Non-empty; every entry has State and Outcome; no duplicates; every outcome Get-WuuTargetOutcome can
+    return maps to a terminal state; Complete is last. Returns @{ Ok; Violations } and never throws,
+    because the release gate calls it.
     #>
     [CmdletBinding()]
     param()
@@ -852,19 +735,9 @@ function Test-WuuTerminalStateInvariant {
 function Test-WuuTerminalState {
     <#
     .SYNOPSIS
-    Whether a state (or a row's state) is terminal (invariant 8.4).
+    Whether a state, or a row's state, is terminal (invariant 8.4).
     .DESCRIPTION
-    The ONE place the question is answered. Returns a hashtable rather than a bare boolean so a caller can
-    report WHY - and so the answer carries the set it was judged against, which makes a disagreement
-    between two callers visible in the message rather than only in the behaviour.
-
-      Terminal [bool]   whether the state is in the terminal set
-      State    [string] the state judged
-      Set      [array]  the terminal set it was judged against
-
-    Accepts either a state name or a row, so a caller never has to remember the property name. $null and
-    an unknown state are NOT terminal: an unrecognised label is not evidence of settlement, and treating
-    it as such would lock a row nobody can explain.
+    Returns @{ Terminal; State; Set }. $null and unknown states are not terminal.
     #>
     [CmdletBinding()]
     param(
@@ -881,8 +754,7 @@ function Test-WuuTerminalState {
         $judged = $State
     }
 
-    # -contains is case-insensitive on strings, which matches how every other state comparison in this
-    # codebase behaves (PowerShell's -eq is case-insensitive), so 'complete' is judged terminal too.
+    # -contains is case-insensitive, matching every other state comparison here.
     return @{
         Terminal = ($judged -ne '' -and ($set -contains $judged))
         State    = $judged
@@ -892,31 +764,11 @@ function Test-WuuTerminalState {
 
 function Test-WuuStateTransitionAllowed {
     <#
-    .SYNOPSIS Whether a display State change is legal for a row (SS16 phase semantics).
+    .SYNOPSIS Whether a display State change is legal for a row (invariant 8.4).
     .DESCRIPTION
-    THE RULE, stated once: a row that has SETTLED is terminal. Nothing may move it out of a settled state
-    except an explicit RESUBMISSION, which the caller expresses by starting a new operation - and a new
-    operation stamps a NEW OperationId, so the transition is then attributed and permitted.
-
-    THE SET IS SINGLE-SOURCED (invariant 8.4). It used to be a literal `@('Complete','Error')` written
-    here, while Get-WuuTargetOutcome independently treated 'Timeout' as settled - so a timed-out row was
-    a counted FAILURE to the exit-code classifier and a freely-rewritable row to this guard. An
-    unattributed writer could turn that failure into a success. Both now read
-    $script:WuuTerminalStates through Test-WuuTerminalState, and tests\Test-TerminalStates.ps1 drives
-    both on one row so they cannot disagree again.
-
-    This is what stops the classes of defect the review named as undefined semantics:
-      * a late or superseded writer dragging a finished row back to 'Downloading' (it is refused on
-        identity before the state rule is even consulted - see Update-WuuOperationState)
-      * a CANCELLED or TIMED-OUT operation being mistaken for a completed one: neither can reach
-        'Complete' without a new attributed operation, so a settled failure cannot be rewritten into a
-        success by a stray writer
-      * a RETRY re-entering the workflow legitimately, because the retry is a new operation whose
-        'Queued' transition is attributed rather than anonymous
-
-    Returns a hashtable so the caller can report WHY, never a bare boolean:
-      Allowed [bool]   whether the change may proceed
-      Reason  [string] '' when allowed, else the refusal reason
+    A terminal row may not change state without an attributed operation; a retry is a new operation and
+    is allowed. Identity (staleness) is checked earlier, in Update-WuuOperationState.
+    Returns @{ Allowed; Reason }.
     #>
     [CmdletBinding()]
     param(
@@ -930,33 +782,9 @@ function Test-WuuStateTransitionAllowed {
 
     $fromState = [string]$Row.State
 
-    # Any CHANGE away from a terminal state requires a named operation to attribute it to.
-    #
-    # THE COMPARISON IS `fromState -ne ToState`, NOT "the target is non-terminal", and that distinction is
-    # the difference between this rule working and appearing to work. The first version only refused a move
-    # from a terminal state to a NON-terminal one, which left the dangerous case open: `Timeout` ->
-    # `Complete` is terminal-to-terminal, so it was permitted without any operation. That is worse than an
-    # ordinary illegal transition, because the outcome classifier already counts a timed-out row as a
-    # settled FAILURE (it is what produces exit code 4 in a mixed fleet) - so the write silently converted
-    # a counted failure into a counted success, with nothing recording that it happened. Driving the two
-    # functions on one row is what exposed it; tests\Test-TerminalStates.ps1 now asserts it.
-    #
-    # WHY REQUIRING ATTRIBUTION HERE IS SAFE: every production call site of Update-WuuOperationState passes
-    # an operation id (checked across src/ - the submission point passes -OperationIdNew, the row-writers
-    # and the cleanup loop pass -OperationId, and the out-of-band detach passes the id it holds). An
-    # unattributed write can therefore only be a caller that has no operation - which is exactly the writer
-    # that must not be deciding a settled row's outcome.
-    #
-    # WRITING THE SAME STATE AGAIN IS STILL ALLOWED with no operation: it is not a transition, it is
-    # bookkeeping (a re-render, a re-touch), and refusing it would break callers that refresh a row's
-    # status text without changing where it is in the workflow.
-    #
-    # NOTE what is deliberately NOT checked here: that the operation id MATCHES the one already on
-    # the row. It cannot match - a resubmission is by definition a NEW operation, so the row still
-    # carries the OLD id and a match test would make every resubmission illegal (caught by
-    # tests\Test-WuuOperationState.ps1, which asserted the resubmission and failed). Staleness is
-    # already handled, and handled better, by the identity guard in Update-WuuOperationState: a
-    # writer presenting a SUPERSEDED id is refused there before this rule is consulted at all.
+    # Refuse ANY unattributed change away from a terminal state, including terminal -> terminal
+    # (Timeout -> Complete would turn a counted failure into a success). Same-state rewrites are bookkeeping.
+    # The id is not matched against the row's: a resubmission is by definition a new id.
     $fromTerminal = Test-WuuTerminalState -State $fromState
     if ($fromTerminal.Terminal -and ($fromState -ne [string]$ToState)) {
         if ([string]::IsNullOrEmpty($OperationId)) {
@@ -1095,9 +923,7 @@ function Update-WuuOperationState {
 
     # --- 4. APPLY ---------------------------------------------------------------------------
     # A Phase IS a timeout, so it implies the Timeout display state when the caller did not name
-    # one. Resolved into LOCALS, never by reassigning $State / $TimeoutSec: those are parameters, and
-    # reassigning a parameter is both a documented hazard in this codebase and a gate failure (the
-    # gate caught an earlier version of this function that did `$State = 'Timeout'`).
+    # one. Resolved into LOCALS: parameters are never reassigned (a gated hazard in this codebase).
     $effState = $State
     $effTimeout = $TimeoutSec
     if ($Phase -and -not $effState) { $effState = 'Timeout' }
@@ -1173,8 +999,7 @@ function Update-WuuOperationState {
         # invariant checker reports, and the deadline is being cleared right here. Callers that want
         # the operation's OUTCOME pass -State (as every former copy did: 'Error' for a failed row).
         # Only the unreplaced Timeout display is resolved, to 'Queued' - the state a row with no
-        # operation is in, matching a freshly loaded row. An earlier version left this dangling and
-        # the suite's cleared-row invariant check caught it.
+        # operation is in, matching a freshly loaded row.
         if (-not $effState -and $Row.PSObject.Properties['State'] -and ([string]$Row.State -eq 'Timeout')) {
             & $set 'State' 'Queued'
             & $set 'Status' (Get-WuuStateStatusText -State 'Queued')
@@ -1242,11 +1067,6 @@ function Test-WuuOperationStateInvariant {
     $pendingOp = [string](& $get 'PendingOp')
     $tag = if ($name) { " [$name]" } else { '' }
 
-    # SINGLE-SOURCED (invariant 8.4), and this copy MATTERED: it used to be a literal
-    # @('Complete','Error'), so a TIMED-OUT row that still queued a PendingOp or still held the runspace
-    # lock was not flagged at all - Timeout was terminal to the outcome classifier but not to this
-    # checker, exactly the same divergence as the transition guard's. Third copy found by the suite that
-    # asserts no function keeps its own literal.
     $settled = @(Get-WuuTerminalStates)
 
     if ($opState -eq 'Running' -and [string]::IsNullOrEmpty($opId)) {
@@ -1735,17 +1555,8 @@ function Get-WuuTargetOutcome {
     $updatesStatus = ''
     if ($Row.PSObject.Properties['UpdatesStatus'] -and $Row.UpdatesStatus) { $updatesStatus = [string]$Row.UpdatesStatus }
 
-    # The outcome word comes from the SAME ordered table the terminal set is declared in, rather than from
-    # a chain of -eq tests. A chain looks like it restates the terminal set while actually being a second,
-    # independent statement of it - which is exactly how this function and Test-WuuStateTransitionAllowed
-    # came to disagree about 'Timeout'.
-    #
-    # THE ORDER IS THE ORIGINAL PRECEDENCE, preserved exactly: each state is judged across BOTH fields
-    # before the next state is considered, so 'Error' (field either way) beats 'Timeout' beats 'Complete'.
-    # A row can carry `State='Complete'` from an earlier operation while its CURRENT operation errored,
-    # and the error is the outcome, not the stale completion. Judging all of one FIELD first would have
-    # let a stale `State='Complete'` beat a current `UpdatesStatus='Error'` - so the loop is
-    # state-major deliberately, and the note above is why.
+    # State-major on purpose: each terminal state is judged across BOTH fields before the next, so a
+    # current UpdatesStatus='Error' beats a stale State='Complete'.
     $outcomeMap = Get-WuuTerminalOutcomeMap
     foreach ($terminalState in @($outcomeMap.Keys)) {
         if ($updatesStatus -eq $terminalState -or $state -eq $terminalState) {
@@ -1808,18 +1619,8 @@ function Test-WuuConcurrencyAvailable {
     the number of computers currently working - the two readings coincide by construction, not by
     assumption. It is NOT a per-computer bound - that is Test-WuuComputerBusy.
 
-    IT IS RELATED TO THE WORKER POOL, and an earlier version of this description said otherwise ("NOT a
-    bound on the worker pool"). That was wrong in a way worth keeping written down, because the two
-    modules contradicted each other in prose and the defect lived in the gap.
-
-    The admitted operations are the only SOURCE of bounded probes: a job holds at most one pool slot at
-    a time, because its probes are sequential. So a pool smaller than this cap guarantees that
-    (cap - pool) admitted operations have probes that can never start - and since this cap already counts
-    them as running, the shortfall produces no refusal and no error, only a probe that queued and looks
-    like a slow host. The invariant POOL >= CAP is therefore load-bearing, and it is asserted by
-    Test-PoolCompatibility and by the release gate. This function still does not READ the pool: it must
-    stay free of cross-module coupling to remain usable from a worker runspace. The relationship is
-    checked where both values are visible.
+    The worker pool must be at least this cap (probes run on it); that is checked by
+    Test-PoolCompatibility, not here, so this function stays free of cross-module coupling.
 
     FAIL-CLOSED ON A MISSING JOB LIST, and REFUSE AT A NON-POSITIVE CAP. The second of those is
     deliberate consistency, not an oversight: the scheduler has always tested `$jobs.Count -ge
@@ -2180,9 +1981,7 @@ Export-ModuleMember -Function @(
     # Wuu.Core (command mode) and the classification must be one rule, not two.
     'Get-WuuTargetOutcome'
     'Get-WuuAggregateOutcome'
-    # SS4/8.4: the terminal-state declaration. Exported because the SAME set has to be read by the
-    # transition guard, by the outcome classifier above, by the release gate and by a test - and the
-    # 8.4 defect was precisely two of those holding their own copy.
+    # 8.4: the single terminal-state declaration, read by the guard, the classifier, the gate and tests.
     'Get-WuuTerminalStates'
     'Get-WuuTerminalOutcomeMap'
     'Test-WuuTerminalState'
