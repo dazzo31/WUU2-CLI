@@ -2627,15 +2627,69 @@ if (Get-Command Test-WuuWorkerPoolStarved -ErrorAction SilentlyContinue) {
     }
 }
 
-# NOT_IMPLEMENTED: an honest record of a property that has no verifier. The reviewer asked for the
-# verdict kind explicitly, and this is a real gap rather than a placeholder: the pool's capacity is
-# configured by hand against $MaxConcurrentJobs (see the comment above $MaxPoolSize), and NOTHING
-# checks the two are compatible. A deployment that raises $MaxConcurrentJobs above the pool size
-# starves the pool - every worker contends for the same slots - and no existing check would notice.
-if ($workersCode -notmatch 'MaxPoolSize\s*.*MaxConcurrentJobs|MaxConcurrentJobs\s*.*MaxPoolSize') {
-    Not-Implemented 'no check asserts that the worker pool size is compatible with $MaxConcurrentJobs - raising the job cap above the pool size would starve every worker, and nothing detects it (P3)'
+# (ax) THE POOL-VERSUS-CAP INVARIANT (P3 close-out). This block replaces a NOT_IMPLEMENTED verdict that
+#      recorded a REAL defect rather than a missing verifier: the concurrency cap was 10 and the worker
+#      pool was 8, so two admitted operations had probes that could never start. Because the cap already
+#      counted those operations as running, the shortfall produced no refusal, no error and no log - it
+#      presented as a slow host, and an operator would have investigated the host.
+#
+#      The two modules also contradicted each other in prose, which is how the gap survived: the pool's
+#      comment said capacity "must comfortably exceed" the cap while setting a value BELOW it, and
+#      Test-WuuConcurrencyAvailable's description said the pool was unrelated ("NOT a bound on the worker
+#      pool"). The relationship is now stated once in the pool's configuration comment and asserted here.
+#
+#      The check compares the two CONFIGURED values and then DRIVES Test-PoolCompatibility, so neither a
+#      reverted number nor an inverted comparison can pass.
+$workersRawAX = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Workers.psm1'))
+$poolMatchAX = [regex]::Match($workersRawAX, '\[int\]\$script:MaxPoolSize\s*=\s*(\d+)')
+$capMatchAX = [regex]::Match($coreRaw, '\$global:MaxConcurrentJobs\s*=\s*(\d+)')
+
+if (-not $poolMatchAX.Success) {
+    Fail 'could not read $script:MaxPoolSize from Wuu.Workers - the pool-versus-cap invariant cannot be verified (P3)'
+} elseif (-not $capMatchAX.Success) {
+    Fail 'could not read $global:MaxConcurrentJobs from Wuu.Core - the pool-versus-cap invariant cannot be verified (P3)'
 } else {
-    Pass 'the worker pool size is asserted against $MaxConcurrentJobs (P3)'
+    $poolSizeAX = [int]$poolMatchAX.Groups[1].Value
+    $capSizeAX = [int]$capMatchAX.Groups[1].Value
+
+    if ($capSizeAX -le 0) {
+        Fail "the concurrency cap is $capSizeAX, which refuses every operation - no work would ever start (P3)"
+    } elseif ($poolSizeAX -lt $capSizeAX) {
+        # The unsafe direction. Spelled out with the consequence, because "8 < 10" does not explain why
+        # it matters and the next person to see this needs the symptom, not the arithmetic.
+        Fail "the worker pool ($poolSizeAX) is SMALLER than the concurrency cap ($capSizeAX): $($capSizeAX - $poolSizeAX) admitted operation(s) would have probes that can never start, counted as running with no refusal and no error - they present as SLOW HOSTS, so the operator investigates the wrong thing. Raise MaxPoolSize in Wuu.Workers (or lower the cap) (P3)"
+    } else {
+        if ($poolSizeAX -gt $capSizeAX) {
+            # Not a defect - a job's probes are sequential, so it holds one slot at a time. Reported so
+            # the unused capacity is visible rather than silently tolerated.
+            Warn "the worker pool ($poolSizeAX) is larger than the concurrency cap ($capSizeAX) - the extra $($poolSizeAX - $capSizeAX) slot(s) are unused because a job's probes are sequential, so capacity above the cap buys nothing (P3)"
+        }
+        Pass "the pool ($poolSizeAX) can run every operation the concurrency cap ($capSizeAX) admits, so no admitted operation is left with probes that can never start (P3)"
+
+        # DRIVE the predicate against the LIVE configured cap. The numeric comparison above would still
+        # pass if the predicate itself were inverted or always-true, so the verdict function is exercised
+        # on its real inputs - and on the unsafe input it must reject.
+        if (Get-Command Test-PoolCompatibility -ErrorAction SilentlyContinue) {
+            try {
+                $liveAX = Test-PoolCompatibility -MaxConcurrentJobs $capSizeAX
+                $unsafeAX = Test-PoolCompatibility -MaxConcurrentJobs ($poolSizeAX + 1)
+                $zeroAX = Test-PoolCompatibility
+                if (-not $liveAX.Compatible) {
+                    Fail "Test-PoolCompatibility rejects the live configuration (cap $capSizeAX, pool $poolSizeAX) which the values show is compatible - the predicate and the configuration disagree (P3)"
+                } elseif ($unsafeAX.Compatible) {
+                    Fail 'Test-PoolCompatibility reports a cap LARGER than the pool as compatible - the check is inert and would pass the defect it exists to catch (P3)'
+                } elseif ($zeroAX.Compatible) {
+                    Fail 'Test-PoolCompatibility reports an unknown cap (0) as compatible - an unjudgeable configuration must not read as safe (P3)'
+                } else {
+                    Pass 'Test-PoolCompatibility accepts the live configuration and rejects both an oversized cap and an unknown one (P3)'
+                }
+            } catch {
+                Fail "Test-PoolCompatibility threw instead of returning a verdict: $($_.Exception.Message) (P3)"
+            }
+        } else {
+            Fail 'Test-PoolCompatibility is not exported from Wuu.Workers, so the invariant has no verifier the gate can drive (P3)'
+        }
+    }
 }
 
 # (au) CI MUST USE THE MACHINE-READABLE MODES, and obtain the summary from the run that produced the
@@ -2999,6 +3053,49 @@ if ((Get-Command New-WuuAuditAnchor -ErrorAction SilentlyContinue) -and (Get-Com
     }
 } else {
     Fail 'the audit anchoring functions could not be resolved, so nothing was driven (P3)'
+}
+
+# (ay) NOT_IMPLEMENTED: INVARIANT 8.4 IS STILL PARTIAL, and this verdict says so instead of pretending
+#      otherwise. It exists because the check in block (as) requires every verdict kind to have a call
+#      site, and closing the pool-versus-cap gap above removed the last NOT_IMPLEMENTED - which was
+#      correct behaviour for that check to notice. Reclassifying the pool check as advisory to keep the
+#      kind "alive" would have been dishonest; finding the property that genuinely lacks a verifier is
+#      the honest fix.
+#
+#      Invariant 8.4 (`.github/copilot-instructions.md` §8.4) targets FIVE terminal states: Complete,
+#      Failed, TimedOut, Cancelled and Refused. What actually exists is two of them:
+#
+#        Complete   used as a State value (3 sites)
+#        Error      used as a State value, and terminal in the transition guard (7 sites)
+#        Failed     never used as a State value
+#        TimedOut   never used as a State value (there is a 'Timeout' state, which is recoverable)
+#        Cancelled  never used as a State value
+#        Refused    never used as a State value
+#
+#      A transition guard DOES now exist - Test-WuuStateTransitionAllowed, added under P1 - but it
+#      protects the two states that exist, not the five the invariant names. So a refused operation has
+#      no terminal state to be terminal IN; the refusal is recorded on the row (RefusedCount/Reason/At)
+#      rather than as a State. That is a deliberate design so far, not an oversight, but it means the
+#      invariant cannot be verified as written.
+#
+#      This is reported rather than fixed here: naming four new states is a STATE-MACHINE change, not a
+#      release-gate change, and claiming them without implementing them is exactly what §1 of the
+#      instructions forbids. See docs/STATE-MACHINE.md.
+$stateRawAY = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+$terminalStatesAY = @()
+foreach ($terminalName in @('Complete', 'Failed', 'TimedOut', 'Cancelled', 'Refused')) {
+    # A state value, i.e. an assignment of a quoted literal - not a mention in prose.
+    if ($stateRawAY -match ("State\s*=\s*'$terminalName'")) { $terminalStatesAY += $terminalName }
+}
+$missingTerminalsAY = @(@('Complete', 'Failed', 'TimedOut', 'Cancelled', 'Refused') | Where-Object { $_ -notin $terminalStatesAY })
+
+if ($missingTerminalsAY.Count -eq 0) {
+    Pass 'every terminal state named by invariant 8.4 exists as a State value (P1/SS4)'
+} elseif ($missingTerminalsAY.Count -eq 1 -and $missingTerminalsAY[0] -eq 'Failed') {
+    # 'Error' carries the Failed meaning today. If that is settled, this becomes a documentation fix.
+    Not-Implemented "invariant 8.4 names 'Failed' as a terminal state but the code uses 'Error' - the invariant needs rewording or the state needs adding, and nothing verifies which (P1/SS4)"
+} else {
+    Not-Implemented "invariant 8.4 names $($missingTerminalsAY.Count) terminal states that are never written as State values ($($missingTerminalsAY -join ', ')) - a transition guard exists but protects only the states that exist, so 'terminal operations stay terminal' cannot be verified as written. Naming them is a STATE-MACHINE change, not a gate change (P1/SS4)"
 }
 
 # --- JSON REPORT (P4), written LAST --------------------------------------------------------------

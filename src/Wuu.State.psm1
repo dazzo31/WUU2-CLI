@@ -1559,8 +1559,20 @@ function Test-WuuConcurrencyAvailable {
     WHAT THE CAP COUNTS: in-flight operations across the WHOLE estate, i.e. the number of entries in
     `$jobs`. Because invariant 8.1 permits at most one operation per computer, `jobs.Count` is also
     the number of computers currently working - the two readings coincide by construction, not by
-    assumption. It is NOT a per-computer bound (that is Test-WuuComputerBusy) and NOT a bound on the
-    worker pool (Wuu.Workers sizes its own pool separately).
+    assumption. It is NOT a per-computer bound - that is Test-WuuComputerBusy.
+
+    IT IS RELATED TO THE WORKER POOL, and an earlier version of this description said otherwise ("NOT a
+    bound on the worker pool"). That was wrong in a way worth keeping written down, because the two
+    modules contradicted each other in prose and the defect lived in the gap.
+
+    The admitted operations are the only SOURCE of bounded probes: a job holds at most one pool slot at
+    a time, because its probes are sequential. So a pool smaller than this cap guarantees that
+    (cap - pool) admitted operations have probes that can never start - and since this cap already counts
+    them as running, the shortfall produces no refusal and no error, only a probe that queued and looks
+    like a slow host. The invariant POOL >= CAP is therefore load-bearing, and it is asserted by
+    Test-PoolCompatibility and by the release gate. This function still does not READ the pool: it must
+    stay free of cross-module coupling to remain usable from a worker runspace. The relationship is
+    checked where both values are visible.
 
     FAIL-CLOSED ON A MISSING JOB LIST, and REFUSE AT A NON-POSITIVE CAP. The second of those is
     deliberate consistency, not an oversight: the scheduler has always tested `$jobs.Count -ge

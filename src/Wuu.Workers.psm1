@@ -29,14 +29,31 @@ This pool is for bounded remote WMI/CIM/service/ping/network operations only.
 #>
 
 # --- Pool configuration -----------------------------------------------------
-# MAX_POOL_SIZE bounds concurrency of bounded probes. These run INSIDE
-# per-computer worker runspaces (up to $MaxConcurrentJobs), so pool capacity
-# must comfortably exceed it to avoid starving workers; 8 was chosen to
-# throttle per-machine child-process count while staying cheap in-memory.
-# $MaxConcurrentJobs default is 10; if a deployment raises it, raise this too.
+# THE INVARIANT: POOL SIZE >= $MaxConcurrentJobs.
+#
+# Bounded probes (WMI/CIM/service/ping) are dispatched from INSIDE the per-computer worker runspaces,
+# and at most $MaxConcurrentJobs of those run at once. If the pool is smaller, the excess probes
+# cannot start: $MaxConcurrentJobs already counts them as RUNNING, so the shortfall is invisible -
+# there is no refusal to record and no error to log, only a probe that sits queued and presents as a
+# SLOW HOST. That failure mode is the reason this is an invariant rather than a tuning note.
+#
+# THE PREVIOUS VALUES VIOLATED IT. The cap was 10 and the pool 8, so two admitted operations could
+# never probe. (This comment used to assert the opposite requirement - that the pool must EXCEED the
+# cap - which the numbers below it did not satisfy. Two modules disagreed in writing about whether
+# the relationship existed at all; it is now stated once, here, and asserted by the suite and the
+# release gate.)
+#
+# Equality is sufficient because a job's probes are SEQUENTIAL: one job occupies at most one pool slot
+# at a time, so a pool of exactly $MaxConcurrentJobs runs every admitted job's next probe without any
+# job waiting. Making the pool larger buys nothing - it only raises the per-machine child-process
+# ceiling. Making it SMALLER queues probes it has already been told to run.
+#
+# Raise BOTH together, or neither. Test-PoolCompatibility and the release gate both fail if the pool
+# is smaller than the cap.
+#
 # The pool is created LAZILY on first use (Get-WuuWorkerPool) so import cost
 # stays zero until the first bounded probe actually runs.
-[int]$script:MaxPoolSize = 8
+[int]$script:MaxPoolSize = 10
 [int]$script:MinPoolSize = 2
 
 # --- Pool state (module scope) ----------------------------------------------
@@ -194,6 +211,55 @@ function Test-WuuWorkerPoolStarved {
         Capacity  = $capacity
         Threshold = $threshold
         Reason    = if ($starved) { "$abandoned of $capacity pool slots are held by abandoned wrappers (threshold $threshold)" } else { '' }
+    }
+}
+
+function Test-PoolCompatibility {
+    <#
+    .SYNOPSIS
+    Whether the worker pool can actually run the operations the concurrency cap admits (P3 close-out).
+    .DESCRIPTION
+    THE INVARIANT: pool size >= $MaxConcurrentJobs.
+
+    WHY THE DIRECTION IS EXACTLY THIS ONE. Bounded probes are dispatched from inside the per-computer
+    worker runspaces, and at most $MaxConcurrentJobs run at once. A SMALLER pool means (cap - pool)
+    operations are admitted and counted as RUNNING while their probes can never start. Nothing is
+    refused, nothing is logged, and no error is raised - the probe simply queues behind work it was
+    admitted ahead of, and the operator sees a slow host and investigates the host.
+
+    A LARGER pool is not a defect, only unused capacity: a job's probes are sequential, so it occupies
+    at most one slot at a time and a pool of exactly the cap already runs every job's next probe. It is
+    reported as Unnecessary rather than Compatible so it is visible without failing a release.
+
+    THIS EXISTED AS A REAL DEFECT, not a hypothetical one: the cap was 10 and the pool 8. The pool's own
+    comment asserted it "must comfortably exceed" the cap while setting a value below it, and
+    Test-WuuConcurrencyAvailable's description said the pool was unrelated. Both statements are now
+    replaced by this single check.
+
+    Takes the cap as a parameter rather than reading $global:MaxConcurrentJobs, because this module must
+    not couple to Wuu.Core: it is called both with the live configured value and, from the gate, with
+    the value parsed out of the source. Returns a verdict, never throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)][int]$MaxConcurrentJobs = 0
+    )
+
+    $capacity = [int]$script:MaxPoolSize
+    $compatible = ($MaxConcurrentJobs -gt 0) -and ($capacity -ge $MaxConcurrentJobs)
+
+    return @{
+        Compatible        = $compatible
+        PoolSize          = $capacity
+        MaxConcurrentJobs = $MaxConcurrentJobs
+        Unnecessary       = ($MaxConcurrentJobs -gt 0) -and ($capacity -gt $MaxConcurrentJobs)
+        Reason            = if ($MaxConcurrentJobs -le 0) {
+            'no concurrency cap was supplied, so compatibility cannot be judged'
+        } elseif ($compatible) {
+            "the pool ($capacity) can run every operation the cap ($MaxConcurrentJobs) admits"
+        } else {
+            "the pool is SMALLER than the concurrency cap by $($MaxConcurrentJobs - $capacity): $($MaxConcurrentJobs - $capacity) admitted operation(s) would have probes that can never start, counted as running with no refusal and no error - they present as slow hosts"
+        }
     }
 }
 
@@ -395,5 +461,8 @@ Export-ModuleMember -Function @(
     # rather than exposed variables.
     'Get-WuuWorkerPoolCapacity',
     'Get-WuuWorkerPoolDiagnostics',
-    'Test-WuuWorkerPoolStarved'
+    'Test-WuuWorkerPoolStarved',
+    # P3 close-out: the pool-versus-cap invariant. Exported because the value it must be compared against
+    # ($global:MaxConcurrentJobs) lives in another module, and session-state isolation hides that.
+    'Test-PoolCompatibility'
 )

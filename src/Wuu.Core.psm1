@@ -68,7 +68,7 @@ The three things worth knowing before editing this file:
 
   3. THE HISTORY IS NOT HERE. Feature changelogs, the legacy author/date and the GUI-era feature list
      that used to be this header are preserved at `docs/CHANGELOG-history.md`. The edition's identity and
-     version are in `docs/RELEASE_NOTES_v1.5.0-beta.3-cli.md`. See `docs/CODE_COMMENT_POLICY.md` for what
+     version are in `docs/RELEASE_NOTES_v1.5.0-beta.4-cli.md`. See `docs/CODE_COMMENT_POLICY.md` for what
      stays inline and why.
 
 Microsoft restricts remote download/install of Windows Updates, so those steps run the patch scripts
@@ -84,26 +84,37 @@ reports progress back through the registry.
 # so a release could ship with the log claiming one version and the audit trail recording
 # another - a genuine compliance problem for a field an ISO 27001 review relies on.
 #
-# v1.5.0-beta.3-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
-# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.3-cli` knows the evidence
+# v1.5.0-beta.4-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
+# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.4-cli` knows the evidence
 # came from pre-release software. Do not reuse this string for a final release.
 #
-# beta.3 is the SEQUENTIAL HARDENING build. Same commands and same engine as beta.2; the change is
-# that the concurrency and identity guarantees the brief asked for are now ENFORCED rather than
-# described. Concretely:
+# beta.4 is the RESPONSE-TO-REVIEW build: the 18 findings of an external code review, addressed in
+# priority order (P0 correctness, P1 state-ownership, P2 structure, P3 observability, P4 tooling).
+# Same commands and same engine as beta.3; what changes is that several invariants which were
+# DESCRIBED are now ENFORCED, and three defects were found and fixed while doing it. Concretely:
 #
-#   * the global concurrency cap is applied at the SUBMISSION POINT, not only in the scheduler tick
-#     (it did not apply to the handlers that call the submission point directly, which is all of them);
-#   * every operation has an identity, and a superseded worker cannot restamp the operation that
-#     replaced it (previously the invariant was "unreachable" rather than "rejected");
-#   * a queued request that is displaced by a newer one is REPORTED, so work cannot disappear silently;
-#   * exit code 4 (PartialSuccess) is produced - it was reserved and unreachable before.
+#   * ONE state-transition layer owns every row mutation and validates operation identity, so a
+#     superseded worker cannot restamp the operation that replaced it (the invariant was previously
+#     true of only two of six writers);
+#   * the concurrency-slot reservation is ATOMIC - the cap was checked at the top of the submission
+#     path and consumed ~140 lines later, so a cap of 10 could start 12;
+#   * a REFUSED operation is recorded and diagnosed; previously a permanently-refused computer left
+#     its phase gate blocked for ever and NOTHING said why (a refusal is not an error - retrying is
+#     correct - so it is reported as a stall, not a failure);
+#   * an operation's remaining budget now CAPS its inner probes, so a probe cannot outlive the
+#     operation that owns it (a 1-second-from-expiry operation used to start a 30-second probe);
+#   * the audit chain head can be ANCHORED outside the log it describes, which is the only thing that
+#     detects a rewritten-but-internally-consistent chain;
+#   * THE WORKER POOL WAS SMALLER THAN THE CONCURRENCY CAP (10 admitted, 8 could probe). Two admitted
+#     operations therefore had probes that could never start - silently, because the cap already
+#     counted them as running, so it presented as a slow host. Now aligned and asserted.
 #
-# Two of the four are BEHAVIOUR changes, so read the release notes before deploying:
-# docs/RELEASE_NOTES_v1.5.0-beta.3-cli.md. The per-invariant status table (what is enforced versus
+# THE LAST ONE is the one to read about if you operate this at scale: it is the class of defect that
+# produces a WRONG DIAGNOSIS rather than an error. Read the release notes before deploying:
+# docs/RELEASE_NOTES_v1.5.0-beta.4-cli.md. The per-invariant status table (what is enforced versus
 # still target) is in .github/copilot-instructions.md §8, and the pass is recorded in
 # docs/HARDENING_COMPLETION_REPORT.md.
-$global:WuuVersion = 'v1.5.0-beta.3-cli'
+$global:WuuVersion = 'v1.5.0-beta.4-cli'
 
 # SS18: PROVENANCE, immediately after the literal so the resolved value cannot be overwritten by it.
 #
@@ -241,7 +252,14 @@ $global:CredentialConfig = @{ Username = ''; Domain = ''; UseCredentials = $fals
 # instead of silently reusing one that captured the previous identity.
 $global:CredentialEpoch = 0
 
-# Job throttling for scalability
+# Job throttling for scalability.
+#
+# INVARIANT: this must not exceed the worker pool size ($script:MaxPoolSize in Wuu.Workers.psm1), whose
+# default matches this value. Bounded probes are dispatched from inside the worker runspaces, so a pool
+# smaller than this cap leaves the excess operations with probes that can never start - and because the
+# cap already counts those operations as running, nothing is refused and nothing is logged. The symptom
+# is a slow host. Raise this and Wuu.Workers' pool together; Test-PoolCompatibility and the release gate
+# fail if they diverge in the unsafe direction.
 $global:MaxConcurrentJobs = 10
 # Performance thresholds for operations
 $global:PerformanceThreshold = @{ CPUPercent = 80; MemoryMB = 1024; NetworkLatencyMs = 1000 }
