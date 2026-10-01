@@ -50,6 +50,69 @@ application policy.
 
 ---
 
+## 2a. Terminal states (CURRENT, ENFORCED) — invariant 8.4
+
+Section 2 above is the TARGET vocabulary. What is **enforced today** is narrower, and the difference
+matters because two functions used to define "finished" differently — see §2b. The single declaration is
+`$script:WuuTerminalStates` in `src/Wuu.State.psm1`, read by the transition guard, by the outcome
+classifier and by the invariant checker. Its ORDER is load-bearing: failure is judged before completion,
+so a stale `Complete` cannot mask a current `Error`.
+
+| Terminal state | Outcome word | Why |
+| --- | --- | --- |
+| `Error` | `Failed` | judged **first**, so it wins over a stale `Complete` on the same row |
+| `Timeout` | `TimedOut` | recoverable, but not freely **rewritable** — see below |
+| `Complete` | `Success` | judged **last**, deliberately |
+
+Not terminal: `RebootRequired` (transient — `RebootRequired` → `Rebooting` → `Complete`), and every
+in-flight state.
+
+### Why `Timeout` is terminal even though it is recoverable
+
+These are different questions, and conflating them produced the 8.4 defect:
+
+* **Recoverable** means a retry is the right response. A retry is a **new operation** with a new
+  `OperationId`, and the guard permits a terminal state to be left by an attributed operation. Retries
+  are therefore unaffected.
+* **Terminal** means an **unattributed** writer may not change the state. That is what stops a settled
+  outcome being rewritten by a writer that cannot name the operation it belongs to.
+
+### The rule, exactly
+
+An unattributed write (`-OperationId` empty) is refused when the row is terminal **and the target state
+differs** — including terminal → terminal. Writing the *same* state again is bookkeeping, not a
+transition, and is permitted. `Timeout` → `Complete` was the specific hole: it is terminal → terminal, and
+because the classifier already counted a timed-out row as a settled failure, permitting it let a counted
+failure become a counted success with nothing recording the change.
+
+### Section 8.4 names states that do not exist — deliberately
+
+`Failed`, `TimedOut` and `Complete` exist under the names in the table above. The other two are
+**intentionally not states**, and the release gate reports this (one `NOT_IMPLEMENTED` verdict) so it is
+not mistaken for enforcement:
+
+| §8.4 name | Status |
+| --- | --- |
+| `Cancelled` | **no producer.** There is no operator-facing cancel of a **running** operation. The one "cancelled" in the codebase is a declined UAC prompt, and a pre-flight denial is recorded as a *refusal*. Adding the state would create something nothing can reach. |
+| `Refused` | **not a state, by design.** A refusal is a *pre-flight* outcome: the operation never started, so the row has no terminal workflow position. It is recorded as `RefusedCount` / `RefusedReason` / `RefusedAt`. A `State='Refused'` would duplicate that record and introduce a second source of truth. |
+
+**Action:** §8.4's wording should be updated to name the states that exist. That is a documentation change
+to `.github/copilot-instructions.md`, deliberately not made as part of a behavioural fix.
+
+### 2b. What the defect was
+
+`Test-WuuStateTransitionAllowed` treated only `Complete` and `Error` as terminal, while
+`Get-WuuTargetOutcome` **also** treated `Timeout` as settled and counted it toward exit code 4. A third
+copy of the same literal sat in `Test-WuuOperationStateInvariant`, where it meant a timed-out row still
+queuing a `PendingOp` or still holding the runspace lock was not flagged at all.
+
+So a timed-out row was a **counted failure to the exit-code classifier** and a **freely-rewritable row to
+the guard**. The fix is single-sourcing — not new state names. `tests/Test-TerminalStates.ps1` drives both
+functions across the whole canonical vocabulary, and gate block (ay) asserts that no second copy survives,
+so the two cannot diverge again.
+
+---
+
 # 3. State diagram (TARGET)
 
 ```text

@@ -1837,20 +1837,40 @@ if ($aggBodyK -notmatch "-ne 'Unknown'") {
 }
 # Failure must be checked BEFORE completion, or a stale Complete on a row that just errored wins.
 #
-# The ORDER alone is not the invariant: a tautology experiment that kept `return 'Failed'` in place but
-# replaced its CONDITION with an impossible test (`$state -eq 'ZZZ'`) passed an order-only check while
-# five of the suite's assertions failed. So the condition itself is asserted, not merely its position.
+# DRIVEN, NOT MATCHED, and that is a correction rather than a preference. This check used to require two
+# things by TEXT: the literal line
+#     if ($state -eq 'Error' -or $updatesStatus -eq 'Error') { return 'Failed' }
+# and the relative IndexOf of `return 'Failed'` versus `return 'Success'`. Both asserted the SHAPE of the
+# code, and both became false findings the moment the mapping was made table-driven and single-sourced
+# with the terminal set (block (ay)): the literals are gone, so a CORRECT tree failed. A gate that fails
+# correct code trains people to ignore it.
+#
+# The two properties those text checks were trying to protect are still protected, and better:
+#   * "failure is derived from State OR UpdatesStatus" -> driven below, on rows where the error is
+#     written to only ONE of the two fields;
+#   * "failure is judged before completion" -> driven below via a row that carries a STALE Complete
+#     alongside a current Error. The ORDER is additionally enforced structurally by
+#     Test-WuuTerminalStateInvariant, which requires 'Complete' to be declared LAST in the terminal table
+#     (asserted in block (ay)) - so ordering is now a property of the declaration rather than of line
+#     offsets inside one function.
 $oneBodyK = Get-WuuFunctionBody $stateRawK 'Get-WuuTargetOutcome'
-$failAtK = $oneBodyK.IndexOf("return 'Failed'")
-$okAtK = $oneBodyK.IndexOf("return 'Success'")
-if ($oneBodyK -notmatch "if \(\`$state -eq 'Error' -or \`$updatesStatus -eq 'Error'\) \{ return 'Failed' \}") {
-    Fail 'Get-WuuTargetOutcome no longer derives Failed from State OR UpdatesStatus - a row whose error is written to only one of the two fields would be misclassified (SS10)'
-} elseif ($failAtK -lt 0 -or $okAtK -lt 0) {
-    Fail 'Get-WuuTargetOutcome does not classify a settled target (SS10)'
-} elseif ($failAtK -gt $okAtK) {
-    Fail 'Get-WuuTargetOutcome checks completion BEFORE failure - a row carrying a stale Complete would mask a current error (SS10)'
+if ([string]::IsNullOrWhiteSpace($oneBodyK)) {
+    Fail 'Get-WuuFunctionBody could not extract Get-WuuTargetOutcome, so the classifier is unverified (SS10)'
 } else {
-    Pass 'per-target classification derives failure from both fields and checks it before completion (SS10)'
+    $errorInStateK = New-WuuComputerRow -Computer 'GATE-SS10-A'; $errorInStateK.State = 'Error'
+    $errorInStatusK = New-WuuComputerRow -Computer 'GATE-SS10-B'; $errorInStatusK.UpdatesStatus = 'Error'
+    $staleCompleteK = New-WuuComputerRow -Computer 'GATE-SS10-C'
+    $staleCompleteK.State = 'Complete'; $staleCompleteK.UpdatesStatus = 'Error'
+    $outStateK = Get-WuuTargetOutcome -Row $errorInStateK
+    $outStatusK = Get-WuuTargetOutcome -Row $errorInStatusK
+    $outStaleK = Get-WuuTargetOutcome -Row $staleCompleteK
+    if ($outStateK -ne 'Failed' -or $outStatusK -ne 'Failed') {
+        Fail "Get-WuuTargetOutcome no longer derives Failed from State OR UpdatesStatus (State-only='$outStateK', UpdatesStatus-only='$outStatusK') - a row whose error is written to only one of the two fields would be misclassified (SS10)"
+    } elseif ($outStaleK -ne 'Failed') {
+        Fail "a stale Complete masks a current Error (got '$outStaleK') - failure must be judged before completion, or the completion wins (SS10)"
+    } else {
+        Pass 'per-target classification derives failure from both fields and judges it before completion (driven against the shipped function, SS10)'
+    }
 }
 
 # The classifier must consult it, and the partial branch must precede the generic failure branch.
@@ -3055,47 +3075,179 @@ if ((Get-Command New-WuuAuditAnchor -ErrorAction SilentlyContinue) -and (Get-Com
     Fail 'the audit anchoring functions could not be resolved, so nothing was driven (P3)'
 }
 
-# (ay) NOT_IMPLEMENTED: INVARIANT 8.4 IS STILL PARTIAL, and this verdict says so instead of pretending
-#      otherwise. It exists because the check in block (as) requires every verdict kind to have a call
-#      site, and closing the pool-versus-cap gap above removed the last NOT_IMPLEMENTED - which was
-#      correct behaviour for that check to notice. Reclassifying the pool check as advisory to keep the
-#      kind "alive" would have been dishonest; finding the property that genuinely lacks a verifier is
-#      the honest fix.
+# (ay) INVARIANT 8.4: TERMINAL OPERATIONS STAY TERMINAL. This block used to carry a NOT_IMPLEMENTED
+#      verdict, and the reason it existed turned out NOT to be the one the invariant's wording implies.
 #
-#      Invariant 8.4 (`.github/copilot-instructions.md` §8.4) targets FIVE terminal states: Complete,
-#      Failed, TimedOut, Cancelled and Refused. What actually exists is two of them:
+#      The invariant names five terminal states (Complete, Failed, TimedOut, Cancelled, Refused) and only
+#      two were written. But the DEFECT was not the missing names - it was that two functions each decided
+#      independently what "finished" meant and DISAGREED:
 #
-#        Complete   used as a State value (3 sites)
-#        Error      used as a State value, and terminal in the transition guard (7 sites)
-#        Failed     never used as a State value
-#        TimedOut   never used as a State value (there is a 'Timeout' state, which is recoverable)
-#        Cancelled  never used as a State value
-#        Refused    never used as a State value
+#        Test-WuuStateTransitionAllowed  treated only Complete and Error as terminal
+#        Get-WuuTargetOutcome            ALSO treated Timeout as settled, and counted it toward exit code 4
 #
-#      A transition guard DOES now exist - Test-WuuStateTransitionAllowed, added under P1 - but it
-#      protects the two states that exist, not the five the invariant names. So a refused operation has
-#      no terminal state to be terminal IN; the refusal is recorded on the row (RefusedCount/Reason/At)
-#      rather than as a State. That is a deliberate design so far, not an oversight, but it means the
-#      invariant cannot be verified as written.
+#      So a timed-out row was a COUNTED FAILURE to the exit-code classifier and a freely-rewritable row to
+#      the guard - and because the first rule only refused terminal -> NON-terminal, even `Timeout` ->
+#      `Complete` was permitted. An unattributed writer could convert a counted failure into a counted
+#      success with nothing recording it. A third copy of the same literal sat in
+#      Test-WuuOperationStateInvariant, where it meant a timed-out row still queuing a PendingOp or still
+#      holding the runspace lock was not flagged at all.
 #
-#      This is reported rather than fixed here: naming four new states is a STATE-MACHINE change, not a
-#      release-gate change, and claiming them without implementing them is exactly what §1 of the
-#      instructions forbids. See docs/STATE-MACHINE.md.
+#      The fix is single-sourcing, not new state names. This block asserts the single source, asserts no
+#      surviving copy, and then DRIVES both functions across the whole canonical vocabulary - because a
+#      check that only reads the declaration would pass while the two consumers still disagreed.
 $stateRawAY = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
-$terminalStatesAY = @()
-foreach ($terminalName in @('Complete', 'Failed', 'TimedOut', 'Cancelled', 'Refused')) {
-    # A state value, i.e. an assignment of a quoted literal - not a mention in prose.
-    if ($stateRawAY -match ("State\s*=\s*'$terminalName'")) { $terminalStatesAY += $terminalName }
-}
-$missingTerminalsAY = @(@('Complete', 'Failed', 'TimedOut', 'Cancelled', 'Refused') | Where-Object { $_ -notin $terminalStatesAY })
 
-if ($missingTerminalsAY.Count -eq 0) {
-    Pass 'every terminal state named by invariant 8.4 exists as a State value (P1/SS4)'
-} elseif ($missingTerminalsAY.Count -eq 1 -and $missingTerminalsAY[0] -eq 'Failed') {
-    # 'Error' carries the Failed meaning today. If that is settled, this becomes a documentation fix.
-    Not-Implemented "invariant 8.4 names 'Failed' as a terminal state but the code uses 'Error' - the invariant needs rewording or the state needs adding, and nothing verifies which (P1/SS4)"
+# 1. The declaration is singular and exported.
+if ($stateRawAY -notmatch '\$script:WuuTerminalStates\s*=\s*@\(') {
+    Fail 'there is no single terminal-state declaration in Wuu.State - the 8.4 defect was two functions each holding their own copy (P1/SS4)'
 } else {
-    Not-Implemented "invariant 8.4 names $($missingTerminalsAY.Count) terminal states that are never written as State values ($($missingTerminalsAY -join ', ')) - a transition guard exists but protects only the states that exist, so 'terminal operations stay terminal' cannot be verified as written. Naming them is a STATE-MACHINE change, not a gate change (P1/SS4)"
+    foreach ($fnAY in 'Get-WuuTerminalStates', 'Test-WuuTerminalState', 'Get-WuuTerminalOutcomeMap', 'Test-WuuTerminalStateInvariant') {
+        if ($stateRawAY -notmatch "function\s+$fnAY\b") { Fail "$fnAY is missing - the terminal declaration has no reader/inspector (P1/SS4)" }
+    }
+}
+
+# 2. NO SURVIVING COPY. A literal terminal list anywhere else IS the defect returning, so it is searched
+#    for in COMMENT-STRIPPED source (the prose legitimately names the states, and prose cannot fail a
+#    build - which is how the copies survived in the first place).
+$stateCodeAY = Get-WuuTextWithoutComments -Text $stateRawAY
+$inlineSetAY = ([regex]::Matches($stateCodeAY, "@\(\s*'Complete'\s*,\s*'Error'")).Count
+if ($inlineSetAY -gt 0) {
+    Fail "$inlineSetAY function(s) still keep their own @('Complete','Error') literal - a second copy of the terminal set is exactly the 8.4 defect (P1/SS4)"
+} else {
+    Pass 'the terminal set has no surviving copy - the guard, the outcome classifier and the invariant checker all read one declaration (P1/SS4)'
+}
+
+# 3. DRIVE IT. The single-source assertions above would pass while both consumers still disagreed, so the
+#    agreement is exercised across every canonical state.
+if ((Get-Command Get-WuuTerminalStates -ErrorAction SilentlyContinue) -and (Get-Command Get-WuuTargetOutcome -ErrorAction SilentlyContinue) -and (Get-Command Test-WuuTerminalState -ErrorAction SilentlyContinue)) {
+    try {
+        $terminalSetAY = @(Get-WuuTerminalStates)
+        if ($terminalSetAY.Count -eq 0) {
+            Fail 'the terminal set is EMPTY - every transition would be legal and the guard would be inert (P1/SS4)'
+        } else {
+            # The vocabulary comes from the product's own ValidateSet, not from a list written here, so
+            # adding a state to Set-ComputerState extends this check automatically.
+            $vocabMatchAY = [regex]::Match($coreRaw, "ValidateSet\('Queued'[^)]*\)")
+            if (-not $vocabMatchAY.Success) {
+                Fail 'could not read the canonical state vocabulary from Set-ComputerState - the agreement check cannot be driven (P1/SS4)'
+            } else {
+                $vocabularyAY = @($vocabMatchAY.Value -replace "ValidateSet\(", '' -replace "\)$", '' -replace "'", '' -split ',')
+                $disagreeAY = New-Object System.Collections.ArrayList
+                $settledAY = 0
+                foreach ($sAY in $vocabularyAY) {
+                    $probeAY = New-WuuComputerRow -Computer 'GATE-8.4'
+                    $probeAY.State = $sAY
+                    $probeAY.UpdatesStatus = $sAY
+                    $outcomeAY = Get-WuuTargetOutcome -Row $probeAY
+                    if ($outcomeAY -eq 'Unknown') { continue }
+                    $settledAY++
+                    if (-not (Test-WuuTerminalState -State $sAY).Terminal) {
+                        $null = $disagreeAY.Add("$sAY (classifier says '$outcomeAY', guard says not terminal)")
+                    }
+                }
+
+                # THE OTHER DIRECTION, and it is not redundant: agreement has to hold BOTH ways.
+                #
+                # (i) A declared terminal state that is NOT IN THE CANONICAL VOCABULARY can never be
+                # written by Set-ComputerState, so the entry describes a condition that cannot occur while
+                # the state it was supposed to cover is left unprotected. This is the fault a real mistake
+                # produces - and it was found by the tautology proof: renaming 'Timeout' to 'TimedOut' in
+                # the declaration made the forward check silently SKIP the row (it stopped classifying as
+                # settled, so the loop `continue`d) and only an unrelated coverage count noticed, reporting
+                # the symptom rather than the fault.
+                #
+                # (ii) A declared terminal state the classifier does not settle means its settlement is
+                # invisible to the exit code, so the outcome word is unreachable.
+                $offVocabAY = New-Object System.Collections.ArrayList
+                $unsettledTerminalsAY = New-Object System.Collections.ArrayList
+                foreach ($declaredAY in @(Get-WuuTerminalStates)) {
+                    if ($vocabularyAY -notcontains $declaredAY) { $null = $offVocabAY.Add($declaredAY) }
+                    $probe2AY = New-WuuComputerRow -Computer 'GATE-8.4-REV'
+                    $probe2AY.State = $declaredAY
+                    $probe2AY.UpdatesStatus = $declaredAY
+                    if ((Get-WuuTargetOutcome -Row $probe2AY) -eq 'Unknown') {
+                        $null = $unsettledTerminalsAY.Add($declaredAY)
+                    }
+                }
+
+                if ($disagreeAY.Count -gt 0) {
+                    Fail "$($disagreeAY.Count) state(s) are SETTLED to the outcome classifier but OPEN to the transition guard, so a counted outcome can be rewritten with no operation: $($disagreeAY -join '; ') (P1/SS4)"
+                } elseif ($offVocabAY.Count -gt 0) {
+                    Fail "the terminal declaration names state(s) that are not in the canonical vocabulary ($($offVocabAY -join ', ')) - Set-ComputerState cannot write them, so those entries protect nothing while the states they replaced are unprotected (P1/SS4)"
+                } elseif ($unsettledTerminalsAY.Count -gt 0) {
+                    Fail "$($unsettledTerminalsAY.Count) state(s) are declared TERMINAL but the outcome classifier does not settle them ($($unsettledTerminalsAY -join ', ')) - the declaration names a state whose settlement is invisible to the exit code, so the outcome word is unreachable (P1/SS4)"
+                } elseif ($settledAY -lt 3) {
+                    # Without settled states the loop proves nothing, so a vacuous pass is refused.
+                    Fail "the agreement check exercised only $settledAY settled state(s) - it is vacuous and would pass a broken tree (P1/SS4)"
+                } else {
+                    Pass "for all $($vocabularyAY.Count) canonical states, a state the classifier SETTLES is a state the guard treats as TERMINAL and the outcome classifier is driven ($settledAY settled) (P1/SS4)"
+                }
+            }
+
+            # The declaration must be internally consistent, judged by the product's own checker.
+            if (Get-Command Test-WuuTerminalStateInvariant -ErrorAction SilentlyContinue) {
+                $invAY = Test-WuuTerminalStateInvariant
+                if (-not $invAY.Ok) {
+                    Fail "the terminal declaration is internally inconsistent: $(@($invAY.Violations) -join '; ') (P1/SS4)"
+                } else {
+                    Pass 'the terminal declaration is internally consistent (non-empty, unique, and every outcome the classifier can produce maps back to a terminal state) (P1/SS4)'
+                }
+            } else {
+                Fail 'Test-WuuTerminalStateInvariant is not exported, so the declaration has no integrity check (P1/SS4)'
+            }
+
+            # THE BEHAVIOUR, not just the declaration: a settled outcome must not be rewritable without a
+            # new operation, INCLUDING terminal -> terminal, which is the case the loose rule missed.
+            $timedOutAY = New-WuuComputerRow -Computer 'GATE-8.4-REWRITE'
+            $timedOutAY.State = 'Timeout'
+            $timedOutAY.UpdatesStatus = 'Timeout'
+            $launderAY = Update-WuuOperationState -Row $timedOutAY -OperationId $null -State 'Complete'
+            if ($launderAY.Applied) {
+                Fail 'a TIMED-OUT row was moved to Complete with NO operation - a counted failure can be laundered into a counted success (P1/SS4)'
+            } elseif ($timedOutAY.State -ne 'Timeout') {
+                Fail "the funnel refused the write but the row changed anyway (State='$($timedOutAY.State)') - a refusal must write NOTHING (P1/SS4)"
+            } else {
+                Pass 'a timed-out row cannot be rewritten to Complete without a new operation, and a refusal leaves the row untouched (P1/SS4)'
+            }
+            # ...and a RETRY must remain legal, or the rule would have broken the operator's only recovery.
+            $retryAY = Test-WuuStateTransitionAllowed -Row $timedOutAY -ToState 'Queued' -OperationId 'op-gate-retry'
+            if (-not $retryAY.Allowed) {
+                Fail "a RETRY of a settled row was refused ($($retryAY.Reason)) - terminal must protect the outcome, not block the recovery path (P1/SS4)"
+            } else {
+                Pass 'a settled row can still be retried by a new attributed operation (P1/SS4)'
+            }
+        }
+    } catch {
+        Fail "the terminal-state checks threw instead of returning verdicts: $($_.Exception.Message) (P1/SS4)"
+    }
+} else {
+    Fail 'the terminal-state functions could not be resolved, so invariant 8.4 was never driven (P1/SS4)'
+}
+
+# (az) NOT_IMPLEMENTED: THE INVARIANT'S WORDING STILL NAMES STATES THAT DO NOT EXIST. The behaviour is now
+#      enforced (block (ay)), so this is a DOCUMENTATION gap rather than a behavioural one - and it is
+#      reported rather than silently dropped, because a reader of §8.4 would otherwise expect a
+#      'Cancelled' or 'Refused' state and find neither.
+#
+#      §8.4 names five terminal states. Three exist under different-or-same names; two have no state at
+#      all, deliberately:
+#
+#        Failed     -> 'Error'   exists (a naming difference, not a gap)
+#        TimedOut   -> 'Timeout' exists
+#        Cancelled  -> (none)    no producer: there is no operator-facing cancel of a RUNNING operation.
+#                                The one 'cancelled' in the codebase is a declined UAC prompt.
+#        Refused    -> (no state) a refusal is a PRE-FLIGHT outcome recorded on the row as
+#                                RefusedCount/RefusedReason/RefusedAt - intentionally not a State, because
+#                                the operation never started and so the row has no terminal workflow
+#                                position.
+#
+#      Adding a 'Cancelled' state would create an unreachable state; adding a 'Refused' state would
+#      duplicate the refusal record with a second source of truth. Both are worse than the wording being
+#      out of date, so the honest action is to report it and let §8.4 be reworded.
+if ((@(Get-WuuTerminalStates) -contains 'Cancelled') -or ($stateRawAY -match "State\s*=\s*'Cancelled'")) {
+    Pass 'invariant 8.4: a Cancelled state exists (the wording matches the code) (P1/SS4)'
+} else {
+    Not-Implemented "invariant 8.4 names 'Cancelled' among its terminal states, but nothing writes it and no operator-facing cancel of a running operation exists - the invariant needs rewording, not an unreachable state (P1/SS4)"
 }
 
 # --- JSON REPORT (P4), written LAST --------------------------------------------------------------

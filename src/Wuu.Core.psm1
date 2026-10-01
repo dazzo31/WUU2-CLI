@@ -68,7 +68,7 @@ The three things worth knowing before editing this file:
 
   3. THE HISTORY IS NOT HERE. Feature changelogs, the legacy author/date and the GUI-era feature list
      that used to be this header are preserved at `docs/CHANGELOG-history.md`. The edition's identity and
-     version are in `docs/RELEASE_NOTES_v1.5.0-beta.4-cli.md`. See `docs/CODE_COMMENT_POLICY.md` for what
+     version are in `docs/RELEASE_NOTES_v1.5.0-beta.5-cli.md`. See `docs/CODE_COMMENT_POLICY.md` for what
      stays inline and why.
 
 Microsoft restricts remote download/install of Windows Updates, so those steps run the patch scripts
@@ -84,37 +84,42 @@ reports progress back through the registry.
 # so a release could ship with the log claiming one version and the audit trail recording
 # another - a genuine compliance problem for a field an ISO 27001 review relies on.
 #
-# v1.5.0-beta.4-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
-# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.4-cli` knows the evidence
+# v1.5.0-beta.5-cli is a PRERELEASE. The version is recorded on every audit record, so a beta
+# trail is self-identifying: an auditor reading `wuuVersion: v1.5.0-beta.5-cli` knows the evidence
 # came from pre-release software. Do not reuse this string for a final release.
 #
-# beta.4 is the RESPONSE-TO-REVIEW build: the 18 findings of an external code review, addressed in
-# priority order (P0 correctness, P1 state-ownership, P2 structure, P3 observability, P4 tooling).
-# Same commands and same engine as beta.3; what changes is that several invariants which were
-# DESCRIBED are now ENFORCED, and three defects were found and fixed while doing it. Concretely:
+# beta.5 makes INVARIANT 8.4 real ("terminal operations stay terminal"), and the review of it found the
+# defect was NOT the one the invariant's wording implies. The invariant names five terminal states and
+# only two were written - but the fault was that THREE functions each decided independently what
+# "finished" meant, and they disagreed. Concretely:
 #
-#   * ONE state-transition layer owns every row mutation and validates operation identity, so a
-#     superseded worker cannot restamp the operation that replaced it (the invariant was previously
-#     true of only two of six writers);
-#   * the concurrency-slot reservation is ATOMIC - the cap was checked at the top of the submission
-#     path and consumed ~140 lines later, so a cap of 10 could start 12;
-#   * a REFUSED operation is recorded and diagnosed; previously a permanently-refused computer left
-#     its phase gate blocked for ever and NOTHING said why (a refusal is not an error - retrying is
-#     correct - so it is reported as a stall, not a failure);
-#   * an operation's remaining budget now CAPS its inner probes, so a probe cannot outlive the
-#     operation that owns it (a 1-second-from-expiry operation used to start a 30-second probe);
-#   * the audit chain head can be ANCHORED outside the log it describes, which is the only thing that
-#     detects a rewritten-but-internally-consistent chain;
-#   * THE WORKER POOL WAS SMALLER THAN THE CONCURRENCY CAP (10 admitted, 8 could probe). Two admitted
-#     operations therefore had probes that could never start - silently, because the cap already
-#     counted them as running, so it presented as a slow host. Now aligned and asserted.
+#   * Test-WuuStateTransitionAllowed treated only Complete and Error as terminal;
+#   * Get-WuuTargetOutcome ALSO treated Timeout as settled, and counted it toward exit code 4;
+#   * Test-WuuOperationStateInvariant kept the same two-state literal, so a TIMED-OUT row still queuing a
+#     PendingOp or still holding its runspace lock was not flagged at all.
 #
-# THE LAST ONE is the one to read about if you operate this at scale: it is the class of defect that
-# produces a WRONG DIAGNOSIS rather than an error. Read the release notes before deploying:
-# docs/RELEASE_NOTES_v1.5.0-beta.4-cli.md. The per-invariant status table (what is enforced versus
-# still target) is in .github/copilot-instructions.md §8, and the pass is recorded in
+# The consequence was a silently-overwritable FAILURE: a timed-out row was a counted failure to the
+# exit-code classifier and a freely-rewritable row to the guard, so an unattributed writer could turn it
+# into 'Complete' - a counted success - with nothing recording the change.
+#
+# The fix is SINGLE-SOURCING, not new state names. One ordered declaration in Wuu.State now carries
+# membership, the outcome word and the PRECEDENCE (failure before completion, so a stale Complete cannot
+# mask a current Error), and the guard, the classifier and the checker all read it. The rule is now: an
+# unattributed write may not CHANGE a terminal row's state - including terminal to terminal, which is the
+# hole the first version of the rule left open. A retry is unaffected, because a retry is a new operation.
+#
+# Two further corrections came out of the same work, both recorded in the release notes:
+#   * a release-gate check asserted the SHAPE of the classifier (a literal line and its line offsets),
+#     which became a FALSE FINDING once the mapping was table-driven. It now DRIVES the classifier on the
+#     rows that matter instead - strictly stronger, and it cannot fail correct code;
+#   * Wuu.State.psm1 is deliberately PURE ASCII. It shipped with no UTF-8 BOM, and the gate fails a file
+#     containing non-ASCII bytes without one.
+#
+# Read the release notes before deploying: docs/RELEASE_NOTES_v1.5.0-beta.5-cli.md. The per-invariant
+# status table (what is enforced versus still target) is in .github/copilot-instructions.md and its
+# detail in docs/STATE-MACHINE.md section 2a, and the pass is recorded in
 # docs/HARDENING_COMPLETION_REPORT.md.
-$global:WuuVersion = 'v1.5.0-beta.4-cli'
+$global:WuuVersion = 'v1.5.0-beta.5-cli'
 
 # SS18: PROVENANCE, immediately after the literal so the resolved value cannot be overwritten by it.
 #
