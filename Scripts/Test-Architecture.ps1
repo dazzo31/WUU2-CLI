@@ -47,22 +47,6 @@ foreach ($setting in @('AutoDownload', 'AutoInstall', 'AutoReboot')) {
 }
 if (-not $failed) { Pass 'all three automatic behaviours are gated on $stateStore.Settings' }
 
-# (u) ONE OPERATION PER COMPUTER (brief SS3). Two properties, because either alone can be defeated:
-#     the submission path must consult the gate, AND the gate must exist and be exported. A gate that
-#     is never called is decoration; a call to a missing function is a runtime failure.
-#
-#     Function bodies are extracted by finding the next top-level "function " to EOF, NOT by a fixed
-#     character window. A 3000-char window silently truncated Start-UpdateCheckJob (6143 chars after
-#     the comments were added) and reported a FALSE FAILURE - the same trap as the token-stripped
-#     `\n\}` pattern earlier. Slicing to the next function has no size assumption.
-function Get-WuuFunctionBody([string]$Text, [string]$Name) {
-    $i = $Text.IndexOf("function $Name")
-    if ($i -lt 0) { return '' }
-    $next = $Text.IndexOf("`nfunction ", $i + 10)
-    if ($next -lt 0) { return $Text.Substring($i) }
-    return $Text.Substring($i, $next - $i)
-}
-
 $supBody = Get-WuuFunctionBody $wupdRaw 'Start-UpdateCheckJob'
 if (-not $supBody) { Fail 'could not locate Start-UpdateCheckJob' }
 else {

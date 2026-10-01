@@ -26,9 +26,17 @@ foreach ($p in $patterns) {
     if (-not $ok) { Write-Host ("      pattern: {0}" -f ($p.Pattern -replace "`r?`n", '\n')) -ForegroundColor DarkGray }
 }
 
-# The detection needles must appear in the gate, or "the gate failed with this message" could never be
-# satisfied by the mutation under test.
-$gate = [System.IO.File]::ReadAllText((Join-Path $root 'Scripts\Validate-Release.ps1'))
+# The detection needles must appear in a file the gate actually RUNS, or "the gate failed with this
+# message" could never be satisfied by the mutation under test.
+#
+# THE CORPUS IS THE GATE PLUS ITS FRAGMENTS. Validate-Release.ps1 was decomposed (instructions SS39)
+# into Scripts\Test-*.ps1 dot-sourced fragments, and these needles moved with their blocks - so
+# searching only the gate now reports "needle missing" for a message that is present and live. Reading
+# the CONCATENATION is what keeps this a check on the emitted text rather than on the file layout.
+$gateFiles = @((Join-Path $root 'Scripts\Validate-Release.ps1')) +
+    @(Get-ChildItem -Path (Join-Path $root 'Scripts') -Filter 'Test-*.ps1' -File | ForEach-Object { $_.FullName })
+$gate = ($gateFiles | ForEach-Object { [System.IO.File]::ReadAllText($_) }) -join "`n"
+Write-Host ("  (needle corpus: {0} file(s) = the gate + its fragments)" -f $gateFiles.Count) -ForegroundColor DarkGray
 Write-Host ''
 Write-Host '  detection needles in the gate:'
 foreach ($n in 'omit -Row', 'no recorded deadline had its inner timeout changed', 'does not PASS it to the pool', 'CALLS a module function', 'offers no separation') {
