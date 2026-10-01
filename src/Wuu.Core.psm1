@@ -136,12 +136,6 @@ if ($global:EnableDebugLogging) {
 
 #region Error Handling
 
-#region Error Suggestions Mapping
-
-# Error suggestions mapping
-
-#endregion Error Suggestions Mapping
-
 #region Environment Validation
 
 #region Administrator Privilege Check
@@ -448,34 +442,6 @@ Write-DebugLog "Console presentation mode (no XAML/WPF)" -Level 'INFO'
 #endregion Presentation layer (console)
 
 #region Helper Functions
-
-#region Credential Management
-
-# DPAPI encryption helpers for secure credential storage
-
-
-# Enhanced credential handling function with security improvements
-
-# Helper function: Execute CIM command with timeout (prevents hangs)
-
-# Helper function: Execute service command with timeout (prevents hangs)
-
-# Helper function: Run a remote COM operation in a background job with a hard timeout (prevents UI hangs)
-
-#endregion Credential Management
-
-#region Dialog Functions
-
-# Function to show GUI password prompt dialog
-
-# Function to show custom WPF credential dialog (replaces Get-Credential)
-# This function fixes password input lag by using a fast WPF dialog instead of the slow Windows credential dialog
-
-# Function to show credential configuration dialog
-
-# Performance monitoring function with enhanced credential handling
-
-#endregion Dialog Functions
 
 #region Monitoring and Performance
 
@@ -2732,12 +2698,6 @@ $eventAddAD = { #Add computers from Active Directory (console edition)
 }
 
 #endregion
-#region Manual Computer Entry
-#endregion
-
-#region File Import
-#endregion
-
 #region Update Operations
 
 #region System Management
@@ -2754,14 +2714,6 @@ $eventRemoveOfflineComputer = {
     }
     if ($deferred) { Write-Host ("  {0} computer(s) were busy - connectivity test skipped for them." -f $deferred) -ForegroundColor Yellow }
 }
-#endregion
-
-#region Clipboard Operations
-# Copy selected computer information to clipboard
-
-# Copy only status/error messages to clipboard
-
-# Paste computer names from clipboard
 #endregion
 
 
