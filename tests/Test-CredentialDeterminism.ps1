@@ -226,16 +226,28 @@ if ($resolvedAtSubmission) {
 # ($DownloadUpdates/$InstallUpdates), not a window starting at a call site - my first attempt sliced
 # from a call site through to the next payload and flagged the call-site guard it had captured.
 #
-# COMMENTS ARE STRIPPED FIRST. The code explains this change by quoting the guard it removed, so
-# matching raw text flags the explanation - the FOURTH time in this hardening work that a check
-# matched the comment describing the code it checks. It is now the default: strip, then match.
+# COMMENTS ARE STRIPPED FIRST - and "first" means before the SLICE, not before the match.
+#
+# This is the FIFTH occurrence of the same class, and the first one where the strip was in the right
+# place and the ORDER was wrong. The previous fix stripped the extracted region, which is correct for
+# a match, but the extraction itself ran over the RAW file - so a comment that quoted the payload
+# syntax was itself picked up as the payload's opening line. That is exactly what happened when
+# Wuu.Core's module header was rewritten to explain where the payload scriptblocks live and how they
+# execute: the header's prose was sliced as if it were `$DownloadUpdates`, and the test reported the
+# payloads branching on $UseCustomCredentials.
+#
+# A rule that has to be remembered in two places gets applied in one, so the strip is now the single
+# entry point: nothing below matches raw text.
 function Get-CodeNoComments([string]$Text) {
     if (-not $Text) { return '' }
     $noBlocks = [regex]::Replace($Text, '(?s)<#.*?#>', '')
     return (($noBlocks -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
 }
-$dlPayload = Get-CodeNoComments ([regex]::Match($coreRaw, '\$DownloadUpdates = \{([\s\S]*?)\n\$GetUpdates = \{').Groups[1].Value)
-$inPayload = Get-CodeNoComments ([regex]::Match($coreRaw, '\$InstallUpdates = \{([\s\S]*?)\n\$RemoveOfflineComputer = \{').Groups[1].Value)
+# Slice the COMMENT-STRIPPED source. Slicing raw text lets any comment containing the payload syntax
+# become the payload.
+$coreCode = Get-CodeNoComments $coreRaw
+$dlPayload = [regex]::Match($coreCode, '\$DownloadUpdates = \{([\s\S]*?)\n\$GetUpdates = \{').Groups[1].Value
+$inPayload = [regex]::Match($coreCode, '\$InstallUpdates = \{([\s\S]*?)\n\$RemoveOfflineComputer = \{').Groups[1].Value
 if ($dlPayload -and $inPayload) {
     $dlBranch = [bool]($dlPayload -match 'UseCustomCredentials')
     $inBranch = [bool]($inPayload -match 'UseCustomCredentials')

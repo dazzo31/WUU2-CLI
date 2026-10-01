@@ -165,8 +165,16 @@ if ($coreRaw -match 'CREDENTIAL MODE DIFFERS') {
 # --- 5. the propagation matrix --------------------------------------------------------
 # Which credential reaches each remote call. The gate is `$UseCustomCredentials -and <not local>`
 # at the download and install sites, and the resolver tries custom-then-default itself.
-$supBody = [regex]::Match($coreRaw, '\$DownloadUpdates = \{[\s\S]*?\n\}').Value
-if (-not $supBody) { $supBody = $coreRaw }
+#
+# SLICE THE COMMENT-STRIPPED SOURCE, not the raw file. Several checks below slice a payload or a
+# function body by regex, and a comment quoting the syntax it is slicing is then captured as the
+# opening line of the slice. That is not hypothetical: rewriting Wuu.Core's module header to explain
+# where the payloads live made the sibling suite report the payloads branching on
+# $UseCustomCredentials when they do not. Stripping first makes this suite immune to prose generally,
+# rather than to the one phrasing that happened to trip it.
+$coreCode = (([regex]::Replace($coreRaw, '(?s)<#.*?#>', '') -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+$supBody = [regex]::Match($coreCode, '\$DownloadUpdates = \{[\s\S]*?\n\}').Value
+if (-not $supBody) { $supBody = $coreCode }
 
 # (a) BOTH task paths that change a remote machine must resolve credentials, or the change runs as the
 #     wrong principal - or fails with access denied at the worst moment (mid-install).

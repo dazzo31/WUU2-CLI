@@ -40,58 +40,40 @@ function Start-WuuApplication {
 
 <#
 .SYNOPSIS
-This script provides a GUI for remotely managing Windows Updates.
+The WUU2 CLI engine: startup, command dispatch, submission, and the background job-cleanup loop.
 
 .DESCRIPTION
-This script provides a GUI for remotely managing Windows Updates. You can check for, download, and install updates remotely. There is also an option to automatically reboot the computer after installing updates if required.
+Headless console engine for remotely managing Windows Updates. It is derived from a legacy GUI edition
+but contains none of it: no WPF, no XAML, no ui references. The release gate asserts that, so a comment
+claiming otherwise is a defect rather than a harmless relic.
 
-.EXAMPLE
-.\WUU.ps1
+The three things worth knowing before editing this file:
 
-This example open the Windows Update Utility.
+  1. THIS FILE IS THE "GOD MODULE" (~4200 lines) and is not yet decomposed. Startup, the 12 `$event*`
+     closures, the `$consoleActions` adapters and the job-cleanup runspace all live here, alongside the
+     `$global:*` configuration, which is deliberately inside `Start-WuuApplication` rather than at module
+     scope. Read `docs/ARCHITECTURE.md` before a structural change.
 
-.NOTES
-Author: Tyler Siegrist
-Date: 12/14/2016
+  2. ITS PAYLOAD SCRIPTBLOCKS RUN IN ISOLATED RUNSPACES. The download and get-updates payloads
+     (`$DownloadUpdates`, `$GetUpdates`) and the job-cleanup body are not merely closures: they are
+     executed in a runspace whose InitialSessionState is `CreateDefault()` with no module imported. A
+     MODULE FUNCTION IS NOT CALLABLE THERE, so any logic they need must be inlined, and state reaches them
+     only via `SessionStateProxy.SetVariable` or as an argument. Some of them also define their OWN copies
+     of helper functions at indent 8 (see `Invoke-CimWithTimeout`), which is why a duplicate-function
+     detector must be scope-aware. This has cost real time more than once, including during the P3 work.
+     NOTE: this paragraph deliberately does NOT spell out the payload assignment syntax. Several suites
+     slice those payload definitions out of the raw file text, and a comment containing the literal
+     assignment is picked up as the payload's opening line. (Those suites now strip comments before
+     slicing, which is the real fix; the wording here avoids the trip wire regardless.)
 
-This script needs to be run as an administrator with the credentials of an administrator on the remote computers.
+  3. THE HISTORY IS NOT HERE. Feature changelogs, the legacy author/date and the GUI-era feature list
+     that used to be this header are preserved at `docs/CHANGELOG-history.md`. The edition's identity and
+     version are in `docs/RELEASE_NOTES_v1.5.0-beta.3-cli.md`. See `docs/CODE_COMMENT_POLICY.md` for what
+     stays inline and why.
 
-Microsoft restricts remote download/install of Windows Updates, so those steps run the patch scripts locally on the remote machine as SYSTEM through a temporary scheduled task (managed over WMI/DCOM), which reports progress back through the registry.
-
-.CHANGELOG
-Enhanced Version - 2025-07-08
-- Added enhanced error handling with retry logic and connectivity validation
-- Improved error messages with specific suggestions for common issues (RPC, WMI, access denied)
-- Added performance monitoring (CPU usage, memory, network latency) with threshold warnings
-- Implemented automated recovery for common issues (RPC service restart, Remote Registry service)
-- Added dependency checking (RPC, WMI, Windows Update service) before operations
-- Implemented job throttling for scalability (max concurrent operations configurable)
-- Added grey background coloring for errored entries in the UI
-- Enhanced status messages to include "Reboot required" when applicable
-- Added three automation levels:
-  * Auto Reboot: Automatically reboots after installation if required
-  * Auto Install: Automatically installs updates once downloaded
-  * Full Automation: Complete workflow (download â†’ install â†’ reboot â†’ re-check)
-- Added tooltips to UI elements for better user guidance
-- Improved error handling with auto-recovery attempts and detailed suggestions
-- Enhanced connectivity validation with multiple retry attempts
-- Added performance thresholds to prevent operations on overloaded systems
-- Implemented comprehensive logging of system performance metrics
-- Fixed PowerShell Core 7.x compatibility issues:
-  * Replaced Get-Service -ComputerName with Invoke-Command for remote service management
-  * Replaced Get-WmiObject with Get-CimInstance for WMI operations
-  * Added local vs remote computer detection for proper cmdlet usage
-- Added debug logging toggle variable ($EnableDebugLogging) set to $false by default
-  * Reduces console output and log file generation for cleaner operation
-  * Can be enabled by setting $global:EnableDebugLogging = $true at the top of the script
-- Fixed PSScriptAnalyzer warning by removing unused $dependencies variable
-- Added configurable credential management for remote WMI/CIM queries
-  * Custom credential configuration dialog for username, domain, and password
-  * Securely stores credentials with encrypted computer list configurations
-  * Falls back to prompting for alternate credentials if configured credentials fail
-  * Caches working credentials per computer to avoid repeated prompts
-  * Right-click context menu option to configure custom credentials
-  * Greatly improves connectivity to domain computers with authentication requirements
+Microsoft restricts remote download/install of Windows Updates, so those steps run the patch scripts
+locally on the remote machine as SYSTEM through a temporary scheduled task (managed over WMI/DCOM), which
+reports progress back through the registry.
 #>
 
 #region Configuration
