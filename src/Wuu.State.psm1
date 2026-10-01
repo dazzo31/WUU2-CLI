@@ -1004,6 +1004,13 @@ function Update-WuuOperationState {
             & $set 'State' 'Queued'
             & $set 'Status' (Get-WuuStateStatusText -State 'Queued')
         }
+
+        # A queued follow-up means the row is NOT finished: that request is its next operation. A
+        # settled display would let the outcome/phase accounting count the row as done before it runs.
+        if ($Row.PSObject.Properties['PendingOp'] -and $Row.PendingOp) {
+            & $set 'State' 'Queued'
+            & $set 'Status' (Get-WuuStateStatusText -State 'Queued')
+        }
     }
 
     if ($Heartbeat) {
@@ -1036,7 +1043,7 @@ function Test-WuuOperationStateInvariant {
                                              its first cleanup pass.
       4. Timeout state without a deadline  - a Timeout display with no deadline means nothing will
                                              ever settle the row: it hangs in yellow forever.
-      5. Settled plus PendingOp            - a follow-up queued on a finished row never runs.
+      5. Settled plus PendingOp            - a settled row is finished, yet still advertises queued work.
       6. Settled plus Running              - a finished operation must not hold the runspace lock.
       7. TimeoutSource without deadline    - half-cleared timeout state.
       8. Heartbeat count without a timestamp - counts nothing, tells a human nothing.
@@ -1082,7 +1089,7 @@ function Test-WuuOperationStateInvariant {
         $violations.Add("$tag State='Timeout' with no deadline - nothing can settle this row")
     }
     if ($settled -contains $state -and $pendingOp) {
-        $violations.Add("$tag settled row ('$state') still queues PendingOp '$pendingOp' - the follow-up cannot run")
+        $violations.Add("$tag settled row ('$state') still queues PendingOp '$pendingOp' - the row is reported finished while its next operation is still queued")
     }
     if ($settled -contains $state -and $opState -eq 'Running') {
         $violations.Add("$tag settled row ('$state') still holds the runspace lock (OpState='Running')")
@@ -1414,6 +1421,13 @@ function Set-WuuPendingOperation {
     if ($null -eq $Row) { return $noChange }
     if ([string]::IsNullOrWhiteSpace($Op)) { return $noChange }
     if ($null -eq $Row.PSObject.Properties['PendingOp']) { return $noChange }
+
+    # A queued follow-up presupposes an operation to follow, so a SETTLED row cannot take one: the
+    # request would be a promise about a finished row, and its display state is what the outcome and
+    # phase accounting read. Refused with a reason, so the caller can say why nothing was queued.
+    if ($Row.PSObject.Properties['State'] -and (@(Get-WuuTerminalStates) -contains [string]$Row.State)) {
+        return @{ Set = $false; Op = $null; Replaced = $null; Reason = "the row has settled ('$($Row.State)') - there is no operation for a follow-up to follow" }
+    }
 
     $existing = ''
     if ($Row.PendingOp) { $existing = [string]$Row.PendingOp }

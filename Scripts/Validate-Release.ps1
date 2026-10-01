@@ -1803,6 +1803,49 @@ if ($payloadInCode -lt 2) {
     Pass "both payload follow-ups read the existing request and queue only when it is empty ($payloadInCode/2, $payloadReads/2) (SS7)"
 }
 
+# A SETTLED row must not accept a queued follow-up. That state was REACHABLE through the funnel's own
+# cleanup path - ClearOperation retires the operation (OpState='Idle') while the PendingOp slot
+# survives - and it is the 8.4 contradiction in the pending layer: the row is counted as finished
+# while its next operation is still queued. Asserted in two halves, because either alone is
+# satisfiable without the behaviour: the setter must REFUSE (with a reason, not silently), and the
+# funnel must RESOLVE the state when a follow-up is already queued. Then DRIVEN, because a source
+# shape cannot show that the refusal actually happens.
+if ($pendingBodyJ -notmatch 'Get-WuuTerminalStates' -or $pendingBodyJ -notmatch 'Reason =') {
+    Fail 'Set-WuuPendingOperation does not refuse a SETTLED row with a reason - a queued follow-up on a finished row leaves the row reported finished while its next operation is queued, and a silent no-op reproduces the defect class SS7 exists to remove (SS7/8.4)'
+} elseif ((Get-WuuFunctionBody $stateRawJ 'Update-WuuOperationState') -notmatch "(?s)PendingOp[\s\S]{0,400}?'Queued'") {
+    # Anchored to PendingOp so the check names the FOLLOW-UP branch. The function already writes
+    # 'Queued' when it resolves an unreplaced Timeout display, so a bare 'Queued' match would pass
+    # with this rule deleted.
+    Fail 'Update-WuuOperationState does not resolve a row that still holds a queued follow-up to a non-settled display - a settled row with a surviving queue is the 8.4 contradiction (P1/8.4)'
+} elseif (-not (Get-Command Set-WuuPendingOperation -ErrorAction SilentlyContinue)) {
+    Fail 'Set-WuuPendingOperation is not resolvable - the settled-row refusal cannot be driven (SS7)'
+} else {
+    try {
+        $settledProbeJ = New-WuuComputerRow -Computer 'GATE-SETTLED-PENDING'
+        $settledProbeJ.State = 'Error'
+        $settledResultJ = Set-WuuPendingOperation -Row $settledProbeJ -Op 'Download'
+        $liveSettledJ = New-WuuComputerRow -Computer 'GATE-SETTLE-LIVE'
+        $liveSettledJ.OpState = 'Running'
+        $liveSettledJ.OperationId = 'gate-op'
+        $null = Set-WuuPendingOperation -Row $liveSettledJ -Op 'Download'
+        $null = Update-WuuOperationState -Row $liveSettledJ -OperationId 'gate-op' -State 'Complete' -ClearOperation
+        $liveViolationsJ = @(Test-WuuOperationStateInvariant -Row $liveSettledJ)
+        if ($settledResultJ.Set) {
+            Fail 'a SETTLED row accepted a queued follow-up - the row is reported finished while its next operation is still queued (SS7/8.4)'
+        } elseif (-not $settledResultJ.Reason) {
+            Fail 'the settled-row refusal carries no reason - the caller cannot say why nothing was queued, which is a silent no-op (SS7)'
+        } elseif ($liveViolationsJ.Count -ne 0) {
+            Fail ('settling a row that holds a queued follow-up leaves the row inconsistent: ' + ($liveViolationsJ -join '; ') + ' (P1/8.4)')
+        } elseif ($liveSettledJ.PendingOp -ne 'Download' -or -not $liveSettledJ.Pending) {
+            Fail 'the queued follow-up did not survive settlement - the request the operator made was lost (SS7)'
+        } else {
+            Pass 'a settled row refuses a queued follow-up with a reason, and settling a row that holds one leaves no contradiction (SS7/8.4)'
+        }
+    } catch {
+        Fail "driving the settled-row pending rule threw instead of reporting: $($_.Exception.Message)"
+    }
+}
+
 # (ak) PER-TARGET OUTCOMES AND PARTIAL SUCCESS (brief SS10). Exit code 4 was RESERVED BUT NEVER
 #      PRODUCED, and the reason was structural: a `-Computer A,B` selection resolved through one shared
 #      answer, so "A succeeded and B failed" was unobservable and a mixed fleet reported a flat 1.

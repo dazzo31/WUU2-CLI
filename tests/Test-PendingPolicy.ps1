@@ -194,6 +194,50 @@ $schedCode = Get-CodeNoComments (Get-Content (Join-Path $root 'src\Wuu.WindowsUp
 Assert-True ($schedCode -match '\$item\.PendingOp = \$null') '7. the scheduler clears the slot when it consumes it (otherwise a stale request would displace the next one)'
 
 # ---------------------------------------------------------------------------------------
+# 8. A SETTLED row cannot take a queued follow-up (the 8.4 contradiction).
+# ---------------------------------------------------------------------------------------
+# A queued follow-up presupposes an operation to follow. Writing one onto a row that has already
+# settled produced a row reported FINISHED while its next operation was still queued - and that
+# state was reachable through the funnel's own cleanup path, because ClearOperation retires the
+# operation (OpState='Idle') while the slot survives. Settlement is a transition, so the funnel
+# must decide it: settlement wins and the follow-up is refused WITH A REASON, so the caller can
+# say why nothing was queued instead of reporting a queue that will never be honoured.
+foreach ($terminal in @(Get-WuuTerminalStates)) {
+    $settled = New-WuuComputerRow -Computer ('SETTLED-' + $terminal)
+    $settled.State = $terminal
+    # A Timeout display is only consistent with a deadline; the refusal must not depend on that.
+    if ($terminal -eq 'Timeout') { $settled.TimeoutExpiresAt = (Get-Date).AddMinutes(5) }
+    $refused = Set-WuuPendingOperation -Row $settled -Op 'Download'
+    Assert-Equal $refused.Set $false ("8. a settled '$terminal' row refuses a queued follow-up")
+    Assert-True ([bool]$refused.Reason) ("8. the refusal for '$terminal' carries a reason (a silent no-op is the defect class)")
+    Assert-Equal "$($settled.PendingOp)" '' ("8. no PendingOp is written on a settled '$terminal' row")
+}
+
+# SETTLEMENT THROUGH THE FUNNEL, which is the reachable path: queue while busy, then settle.
+$funnel = New-WuuComputerRow -Computer 'SETTLE-FUNNEL'
+$funnel.OpState = 'Running'
+$funnel.OperationId = 'op-settle'
+$null = Set-WuuPendingOperation -Row $funnel -Op 'Download'
+$null = Update-WuuOperationState -Row $funnel -OperationId 'op-settle' -State 'Complete' -ClearOperation
+$liveViolations = @(Test-WuuOperationStateInvariant -Row $funnel)
+Assert-Equal $liveViolations.Count 0 '8. settling a row that holds a queued follow-up leaves no invariant violation'
+Assert-Equal $funnel.State 'Queued' '8. the row is not left reported finished while its follow-up is queued'
+Assert-Equal $funnel.PendingOp 'Download' '8. the queued follow-up survives settlement (it must still run)'
+Assert-Equal $funnel.Pending $true '8. Pending survives, so the scheduler will still drain it'
+
+# And it really does drain: the scheduler only considers rows with Pending set, and the row it
+# would start is the queued op - so "the follow-up cannot run" was never the actual hazard.
+Assert-True ($schedCode -match '\$op = \$item\.PendingOp') '8. the scheduler starts the queued op, so it drains'
+
+# Tautology check: the guard must be ABLE to fail. Force the settled row past the refusal and the
+# very state the check exists to forbid must reappear.
+$taut = New-WuuComputerRow -Computer 'TAUTOLOGY'
+$taut.State = 'Error'
+$taut.PendingOp = 'Download'
+$tautViolations = @(Test-WuuOperationStateInvariant -Row $taut)
+Assert-True ($tautViolations.Count -gt 0) '8. the invariant CAN fail: a settled row forced to hold a queued op is still detected'
+
+# ---------------------------------------------------------------------------------------
 Write-Host ''
 if ($failures.Count) {
     Write-Host ("RESULT: {0} assertion(s) FAILED" -f $failures.Count) -ForegroundColor Red
