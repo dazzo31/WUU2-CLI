@@ -7,7 +7,7 @@
 >
 > **Part B is not implemented in full.** Where the two differ, Part A is what the code does. The
 > authoritative per-invariant status is the table in
-> [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8.
+> [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) Appendix A.
 >
 > Do not describe a Part B mechanism as current behaviour.
 
@@ -102,7 +102,7 @@ Notes that matter when writing code:
 # Part B — Target architecture
 
 Everything below is the intended design. It is **not** all implemented; the status table in
-`.github/copilot-instructions.md` §8 names which parts are, and the gaps.
+`.github/copilot-instructions.md` Appendix A names which parts are, and the gaps.
 
 ## B1. Purpose
 
@@ -207,7 +207,7 @@ Do not create `CLI → engine` as a shortcut.
 
 > **Current reality:** existing `$event*` closures are still live and are still dispatched. The rule is
 > about **new** work: do not copy the old structure, and do not restore GUI-era behaviour. See
-> `.github/copilot-instructions.md` §4.
+> `.github/copilot-instructions.md` §1 and §41.
 
 ### B6. Scheduler
 
@@ -272,8 +272,8 @@ to before applying its result.
 **Current: implemented (Phase 2).** `New-WuuOperationId` creates the identity; it is stamped on the
 row, carried on the job entry, and injected into the worker runspace. Two rules enforce it —
 `Test-WuuOperationCurrent` (release only proven ownership) and `Test-WuuStaleWrite` (refuse only
-proven staleness) — mirrored in six sites. See
-[`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8.3.
+proven staleness) — mirrored in six sites. See the description of `Test-WuuStaleWrite` in
+`src/Wuu.State.psm1`.
 
 **Still TARGET:** the operation **record** in §B7. Identity exists; the object it would live on does
 not, and per-computer row fields remain the only granularity.
@@ -284,7 +284,7 @@ Resolution happens **before** remote execution; the operation receives a fixed c
 worker must not reinterpret the request. An explicitly supplied credential must never silently become
 the default.
 
-**Current: implemented.** See `.github/copilot-instructions.md` §8.8.
+**Current: implemented.** See `.github/copilot-instructions.md` Appendix A (invariant 8.8).
 
 ### B12. Audit
 

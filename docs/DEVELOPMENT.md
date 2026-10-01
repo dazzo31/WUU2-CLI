@@ -9,11 +9,12 @@
 > * **CURRENT** — the workflow, commands and constraints that are true today.
 > * **TARGET** — the invariants and behaviour the project is working toward.
 >
-> **Phases 1-5 are done**, and only **Phase 6** (terminal-state protection) remains - blocked on the
-> operation **record**, which identity alone does not provide. The invariants the completed phases
-> introduced (**8.2**, **8.3**, **8.6**, **8.7**) are ENFORCED; read the status table in
-> [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8 before assuming any
-> invariant is real, and note that **8.4** is still TARGET.
+> **Phases 1-6 are done.** Phase 6 (terminal-state protection, invariant 8.4) shipped in
+> `v1.5.0-beta.5-cli` without an operation record, by single-sourcing the terminal set (see
+> `docs/STATE-MACHINE.md` section 2a). The invariants the phases introduced (**8.2**, **8.3**, **8.4**,
+> **8.6**, **8.7**) are ENFORCED; read the status table in
+> [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) Appendix A before assuming any
+> invariant is real.
 >
 > Phase 1 (credential determinism) and Phase 2 (operation identity and stale-worker rejection) are
 > **done and ENFORCED** — invariants 8.2 and 8.3 moved from TARGET to ENFORCED when Phase 2 landed.

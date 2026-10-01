@@ -3224,30 +3224,32 @@ if ((Get-Command Get-WuuTerminalStates -ErrorAction SilentlyContinue) -and (Get-
     Fail 'the terminal-state functions could not be resolved, so invariant 8.4 was never driven (P1/SS4)'
 }
 
-# (az) NOT_IMPLEMENTED: THE INVARIANT'S WORDING STILL NAMES STATES THAT DO NOT EXIST. The behaviour is now
-#      enforced (block (ay)), so this is a DOCUMENTATION gap rather than a behavioural one - and it is
-#      reported rather than silently dropped, because a reader of §8.4 would otherwise expect a
-#      'Cancelled' or 'Refused' state and find neither.
-#
-#      §8.4 names five terminal states. Three exist under different-or-same names; two have no state at
-#      all, deliberately:
-#
-#        Failed     -> 'Error'   exists (a naming difference, not a gap)
-#        TimedOut   -> 'Timeout' exists
-#        Cancelled  -> (none)    no producer: there is no operator-facing cancel of a RUNNING operation.
-#                                The one 'cancelled' in the codebase is a declined UAC prompt.
-#        Refused    -> (no state) a refusal is a PRE-FLIGHT outcome recorded on the row as
-#                                RefusedCount/RefusedReason/RefusedAt - intentionally not a State, because
-#                                the operation never started and so the row has no terminal workflow
-#                                position.
-#
-#      Adding a 'Cancelled' state would create an unreachable state; adding a 'Refused' state would
-#      duplicate the refusal record with a second source of truth. Both are worse than the wording being
-#      out of date, so the honest action is to report it and let §8.4 be reworded.
-if ((@(Get-WuuTerminalStates) -contains 'Cancelled') -or ($stateRawAY -match "State\s*=\s*'Cancelled'")) {
-    Pass 'invariant 8.4: a Cancelled state exists (the wording matches the code) (P1/SS4)'
+# (az) DIRECT OPERATION-STATE WRITES OUTSIDE Wuu.State (instructions P0 #1). Zero is the target and is
+#      NOT IMPLEMENTED; the ceiling is a ratchet so the count can only fall. Lower it when it does.
+$directWriteCeilingAZ = 41
+$directWritePropsAZ = @('State', 'OpState', 'OperationId', 'PendingOp', 'TimeoutExpiresAt')
+$directWritesAZ = 0
+$directWriteDetailAZ = @()
+foreach ($modAZ in @(Get-ChildItem -Path (Join-Path $root 'src') -Filter '*.psm1' -File | Where-Object { $_.Name -ne 'Wuu.State.psm1' })) {
+    $codeAZ = Get-WuuTextWithoutComments -Text ([System.IO.File]::ReadAllText($modAZ.FullName))
+    foreach ($propAZ in $directWritePropsAZ) {
+        # (?!=) excludes -eq style comparisons written as '=='.
+        $nAZ = ([regex]::Matches($codeAZ, "\`$\w+\.$propAZ\s*=(?!=)")).Count
+        if ($nAZ -gt 0) { $directWritesAZ += $nAZ; $directWriteDetailAZ += "$($modAZ.Name).$propAZ=$nAZ" }
+    }
+}
+if ($directWritesAZ -gt $directWriteCeilingAZ) {
+    Fail "direct operation-state writes outside Wuu.State rose to $directWritesAZ (ceiling $directWriteCeilingAZ) - route new writes through Update-WuuOperationState: $($directWriteDetailAZ -join ', ') (P0)"
 } else {
-    Not-Implemented "invariant 8.4 names 'Cancelled' among its terminal states, but nothing writes it and no operator-facing cancel of a running operation exists - the invariant needs rewording, not an unreachable state (P1/SS4)"
+    Pass "no new direct operation-state writes outside Wuu.State ($directWritesAZ, ceiling $directWriteCeilingAZ) (P0)"
+    if ($directWritesAZ -lt $directWriteCeilingAZ) {
+        Warn "direct operation-state writes fell to $directWritesAZ - lower `$directWriteCeilingAZ to $directWritesAZ so the ratchet holds (P0)"
+    }
+}
+if ($directWritesAZ -gt 0) {
+    Not-Implemented "zero direct operation-state writes outside Wuu.State: $directWritesAZ remain, many inside payload runspaces where the funnel is not callable (P0)"
+} else {
+    Pass 'every operation-state write goes through Wuu.State (P0)'
 }
 
 # --- JSON REPORT (P4), written LAST --------------------------------------------------------------

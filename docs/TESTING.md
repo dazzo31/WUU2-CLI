@@ -7,7 +7,7 @@
 > **Part B** lists the tests that do **not** exist yet and are needed before the target invariants can
 > be called ENFORCED.
 >
-> The per-invariant status is in [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8.
+> The per-invariant status is in [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) Appendix A.
 > A green suite is evidence about *current* behaviour; it is not evidence that a TARGET invariant holds.
 
 ---

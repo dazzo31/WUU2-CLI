@@ -116,8 +116,8 @@ reports progress back through the registry.
 #     containing non-ASCII bytes without one.
 #
 # Read the release notes before deploying: docs/RELEASE_NOTES_v1.5.0-beta.5-cli.md. The per-invariant
-# status table (what is enforced versus still target) is in .github/copilot-instructions.md and its
-# detail in docs/STATE-MACHINE.md section 2a, and the pass is recorded in
+# status table (what is enforced versus still target) is .github/copilot-instructions.md Appendix A,
+# terminal-state detail is docs/STATE-MACHINE.md section 2a, and the pass is recorded in
 # docs/HARDENING_COMPLETION_REPORT.md.
 $global:WuuVersion = 'v1.5.0-beta.5-cli'
 

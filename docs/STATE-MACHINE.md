@@ -11,7 +11,7 @@
 > protection and the transition table above still need the record.
 >
 > The authoritative status of each invariant is in
-> [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8. The work to implement
+> [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) Appendix A. The work to implement
 > this model is Phases 4 and 6 of the hardening plan (see `docs/DEVELOPMENT.md`).
 >
 > Do not write code that assumes these states exist, and do not describe them as current behaviour.
@@ -91,13 +91,13 @@ failure become a counted success with nothing recording the change.
 **intentionally not states**, and the release gate reports this (one `NOT_IMPLEMENTED` verdict) so it is
 not mistaken for enforcement:
 
-| §8.4 name | Status |
+| Name in the former §8.4 wording | Status |
 | --- | --- |
 | `Cancelled` | **no producer.** There is no operator-facing cancel of a **running** operation. The one "cancelled" in the codebase is a declined UAC prompt, and a pre-flight denial is recorded as a *refusal*. Adding the state would create something nothing can reach. |
 | `Refused` | **not a state, by design.** A refusal is a *pre-flight* outcome: the operation never started, so the row has no terminal workflow position. It is recorded as `RefusedCount` / `RefusedReason` / `RefusedAt`. A `State='Refused'` would duplicate that record and introduce a second source of truth. |
 
-**Action:** §8.4's wording should be updated to name the states that exist. That is a documentation change
-to `.github/copilot-instructions.md`, deliberately not made as part of a behavioural fix.
+**Resolved:** `.github/copilot-instructions.md` §12 now names the terminal states that exist (`Complete`,
+`Timeout`, `Error`) and forbids inventing `Cancelled` or `Refused` as states.
 
 ### 2b. What the defect was
 
@@ -209,9 +209,8 @@ Test-WuuOperationCurrent -Row $current -OperationId $worker.OperationId   # rele
 Test-WuuStaleWrite      -Row $current -OperationId $writer.OperationId    # refuse only if provably stale
 ```
 
-These are **two rules, not one**, and deliberately so - see
-[`.github/copilot-instructions.md`](../.github/copilot-instructions.md) §8.3 for the asymmetry and
-why collapsing them breaks a side.
+These are **two rules, not one**, and deliberately so - see the description of `Test-WuuStaleWrite` in
+`src/Wuu.State.psm1` for the asymmetry and why collapsing them breaks a side.
 
 The rule is written in **six** places, because the cleanup loop and the injected row-writer run in
 isolated runspaces where no module function resolves. Gate (ah) asserts each copy exists;
