@@ -181,6 +181,27 @@ while ($sw2.Elapsed.TotalSeconds -lt 30) {
 }
 $fleetEnters = @(Get-Content $marker -ErrorAction SilentlyContinue | Where-Object { $_ -like 'enter|F*' }).Count
 Assert-True ($fleetEnters -ge 6) "every queued computer eventually ran (entered $fleetEnters of 6)"
+if ($fleetEnters -lt 6) {
+    # DIAGNOSTIC, because this assertion flaked once in 16 runs with "entered 0 of 6" while the cap
+    # assertion above PASSED - i.e. jobs existed but no payload ever wrote. That signature points at a
+    # transient worker/runspace failure rather than scheduler logic, and an unreproducible flake that
+    # cannot be named cannot be fixed without guessing. Report the state the next time it happens.
+    Write-Host '  DIAGNOSTIC: fleet jobs did not all run -' -ForegroundColor Yellow
+    Write-Host ("    jobs.Count={0}  markerLines={1}" -f $global:jobs.Count, @(Get-Content $marker -ErrorAction SilentlyContinue).Count) -ForegroundColor Yellow
+    foreach ($j in @($global:jobs)) {
+        $rs = $j.Runspace
+        $state = if ($rs) { [string]$rs.RunspaceStateInfo.State } else { '(none)' }
+        $avail = if ($rs) { [string]$rs.RunspaceAvailability } else { '(none)' }
+        # HadErrors on the PowerShell object is what distinguishes "still running" from "died".
+        $had = $null
+        try { $had = $j.PowerShell.HadErrors } catch { $had = '(unreadable)' }
+        Write-Host ("    job {0,-6} runspace={1,-12} availability={2,-8} hadErrors={3}" -f $j.Computer, $state, $avail, $had) -ForegroundColor Yellow
+    }
+    $rowsLeft = @(Get-WuuComputerRow -Store $fleetStore)
+    foreach ($r in $rowsLeft) {
+        Write-Host ("    row {0,-6} Pending={1} OpState={2} OperationId={3}" -f $r.Computer, [bool]$r.Pending, $r.OpState, $r.OperationId) -ForegroundColor Yellow
+    }
+}
 
 # Clean up.
 foreach ($j in @($global:jobs)) { try { $j.PowerShell.Stop() } catch { }; try { $j.PowerShell.Dispose() } catch { } }
