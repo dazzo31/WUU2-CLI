@@ -26,6 +26,7 @@ Set-Location $root
 
 $workersPath = Join-Path $root 'src\Wuu.Workers.psm1'
 $corePath = Join-Path $root 'src\Wuu.Core.psm1'
+$configPath = Join-Path $root 'src\Wuu.Configuration.psm1'
 $gatePath = Join-Path $root 'Scripts\Validate-Release.ps1'
 $poolSuite = Join-Path $root 'tests\Test-PoolCompatibility.ps1'
 
@@ -79,7 +80,7 @@ function Write-Text([string]$Path, [string]$Text, [bool]$HadBom) {
 $backupDir = Join-Path ([System.IO.Path]::GetTempPath()) ('wuu-pool-tautology-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $backupDir -Force
 $backup = @{}
-foreach ($p in @($workersPath, $corePath, $gatePath)) {
+foreach ($p in @($workersPath, $corePath, $configPath, $gatePath)) {
     $copy = Join-Path $backupDir (Split-Path $p -Leaf)
     Copy-Item -LiteralPath $p -Destination $copy -Force
     $backup[$p] = @{ Copy = $copy; Sha = (Get-Sha $p) }
@@ -108,8 +109,8 @@ if ($preGate.ExitCode -ne 0 -or $preSuite.ExitCode -ne 0 -or $preGate.TimedOut) 
 Write-Host '  gate and suite are both green - mutations will be attributable' -ForegroundColor Green
 
 $baseline = @{}
-foreach ($p in @($workersPath, $corePath)) { $baseline[$p] = Get-Sha $p }
-foreach ($p in @($workersPath, $corePath)) { Write-Host ("  baseline {0,-20} {1}" -f (Split-Path $p -Leaf), $baseline[$p].Substring(0, 16)) }
+foreach ($p in @($workersPath, $corePath, $configPath)) { $baseline[$p] = Get-Sha $p }
+foreach ($p in @($workersPath, $corePath, $configPath)) { Write-Host ("  baseline {0,-20} {1}" -f (Split-Path $p -Leaf), $baseline[$p].Substring(0, 16)) }
 
 # ---- THE MUTATIONS ------------------------------------------------------------------------------
 # Detection needles are EXACT phrases from the messages the gate and suite emit, never the mutation
@@ -126,7 +127,7 @@ $mutations = @(
     },
     @{
         Name = 'M2: raise the cap above the pool'
-        File = $corePath
+        File = $configPath
         From = '$global:MaxConcurrentJobs = 10'
         To   = '$global:MaxConcurrentJobs = 12'
         Needle = 'SMALLER than the concurrency cap'
@@ -224,7 +225,7 @@ foreach ($m in $mutations) {
 Write-Host ''
 Write-Host '=== FINAL HASH CHECK ===' -ForegroundColor Cyan
 $allClean = $true
-foreach ($p in @($workersPath, $corePath)) {
+foreach ($p in @($workersPath, $corePath, $configPath)) {
     $ok = ((Get-Sha $p) -eq $baseline[$p])
     if (-not $ok) { $allClean = $false }
     Write-Host ("  {0,-20} {1}" -f (Split-Path $p -Leaf), $(if ($ok) { 'unchanged' } else { 'CHANGED - restore from your backup' })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })

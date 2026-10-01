@@ -36,11 +36,14 @@ Import-WuuModules -WuuRoot $root
 $wupdRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
 $coreRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
 $stateRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+# The budget table and heartbeat moved to Wuu.Configuration.psm1 (SS8). $configRaw serves the SETTING
+# lookups; $coreRaw still serves the cleanup-loop assertions further down, which are Core's own code.
+$configRaw = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Configuration.psm1'))
 
-# The budget table lives in Start-WuuApplication's config region (it is set when the application
+# The budget table is applied at STARTUP by Initialize-WuuConfiguration (it is set when the application
 # starts, not at import). Load the SHIPPED LITERAL out of the source so this suite tests the real
 # table rather than a copy - and so the table's existence is asserted rather than assumed.
-$coreAst = [System.Management.Automation.Language.Parser]::ParseInput($coreRaw, [ref]$null, [ref]$null)
+$coreAst = [System.Management.Automation.Language.Parser]::ParseInput($configRaw, [ref]$null, [ref]$null)
 $tableAssign = $coreAst.FindAll({
     param($n)
     $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
@@ -56,7 +59,7 @@ if ($tableAssign.Count -gt 0) {
     }
 }
 # The heartbeat interval is a plain number in the same region.
-$hbMatch = [regex]::Match($coreRaw, '\$global:OperationHeartbeatSeconds\s*=\s*(\d+)')
+$hbMatch = [regex]::Match($configRaw, '\$global:OperationHeartbeatSeconds\s*=\s*(\d+)')
 if ($hbMatch.Success) { $global:OperationHeartbeatSeconds = [int]$hbMatch.Groups[1].Value }
 
 # --- 1. the budget table -------------------------------------------------------------

@@ -627,9 +627,11 @@ if (-not $failed) { Pass 'exit codes distinguish completion, timeout, queueing, 
 $coreRawT = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
 $stateRawT = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
 $wupdRawT = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+# The timeout settings moved to Wuu.Configuration.psm1 (SS8); the deadline USES stay in Core.
+$configRawT = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Configuration.psm1'))
 
 # 1. the table, and that its numbers are per-op rather than one repeated value
-$tableMatch = [regex]::Match($coreRawT, '\$global:OperationTimeoutSeconds\s*=\s*@\{([\s\S]*?)\}')
+$tableMatch = [regex]::Match($configRawT, '\$global:OperationTimeoutSeconds\s*=\s*@\{([\s\S]*?)\}')
 if (-not $tableMatch.Success) {
     Fail 'the per-op operation timeout table is missing (SS5) - a flat stop would come back'
 } else {
@@ -643,8 +645,8 @@ if (-not $tableMatch.Success) {
     }
     # The reboot chain's own waits must fit inside its budget, or the budget guarantees a false timeout.
     $autoFlow = [regex]::Match($tableBody, "'AutoFlow'\s*=\s*(\d+)")
-    $offline = [regex]::Match($coreRawT, '\$global:OfflineWaitSeconds\s*=\s*(\d+)')
-    $online = [regex]::Match($coreRawT, '\$global:OnlineWaitSeconds\s*=\s*(\d+)')
+    $offline = [regex]::Match($configRawT, '\$global:OfflineWaitSeconds\s*=\s*(\d+)')
+    $online = [regex]::Match($configRawT, '\$global:OnlineWaitSeconds\s*=\s*(\d+)')
     if ($autoFlow.Success -and $offline.Success -and $online.Success) {
         $needed = [int]$offline.Groups[1].Value + [int]$online.Groups[1].Value
         if ([int]$autoFlow.Groups[1].Value -le $needed) {
@@ -1534,16 +1536,20 @@ if ($coreDebris -notmatch 'function Update-WuuComputerRow') {
 #      start the application successfully without ever exercising either.
 $coreRawM = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
 $consoleRawM = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Console.psm1') -Raw
+# The $global:* SETTINGS moved to src\Wuu.Configuration.psm1 (SS8), so the checks about those settings
+# read THAT file. $coreRawM still serves the checks about Core's own code (the fatal prompt, the input
+# choke point below): only orchestration stayed behind, so a reader can tell which file each check owns.
+$configRawM = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Configuration.psm1'))
 
 # 1. Debug logging must default to OFF. Verbose-by-default is wrong for an unattended patch tool:
 #    large logs, I/O on every run, operational detail written by default, and diagnostic records
 #    interleaved with the audit trail.
-if ($coreRawM -notmatch '\$global:EnableDebugLogging\s*=\s*\$false') {
+if ($configRawM -notmatch '\$global:EnableDebugLogging\s*=\s*\$false') {
     Fail 'debug logging does not default to $false - verbose-by-default is wrong for an unattended patch tool (large logs, extra I/O, operational detail on disk) (SS17)'
-} elseif ($coreRawM -match '\$global:EnableDebugLogging\s*=\s*\$true') {
+} elseif ($configRawM -match '\$global:EnableDebugLogging\s*=\s*\$true') {
     # The override path legitimately assigns $true inside the WUU_DEBUG branch, so its presence is
     # only a failure if it is NOT guarded by that branch.
-    if ($coreRawM -notmatch 'WUU_DEBUG') {
+    if ($configRawM -notmatch 'WUU_DEBUG') {
         Fail 'debug logging is set to $true with no documented override - production behaviour would depend on editing source (SS17)'
     } else {
         Pass 'debug logging defaults to $false and is enabled by the WUU_DEBUG override (SS17)'
@@ -1552,7 +1558,7 @@ if ($coreRawM -notmatch '\$global:EnableDebugLogging\s*=\s*\$false') {
     Pass 'debug logging defaults to $false (SS17)'
 }
 # The override must exist, so an operator can diagnose without editing a shipped file.
-if ($coreRawM -notmatch 'WUU_DEBUG') {
+if ($configRawM -notmatch 'WUU_DEBUG') {
     Fail 'there is no way to enable debug logging without editing source - a shipped file edit is reverted by the next install and invisible in the configuration (SS17)'
 }
 
@@ -1596,7 +1602,7 @@ if ($coreRawM -notmatch 'Read-WuuAnswer -Prompt \$Prompt -Secure') {
 #    must agree, or audit records carry a version no release used. Checked by RUNNING the resolver -
 #    a text comparison here would duplicate its logic instead of exercising it.
 $embeddedVersionM = ''
-$versionMatchM = [regex]::Match($coreRawM, "\`$global:WuuVersion\s*=\s*'([^']+)'")
+$versionMatchM = [regex]::Match($configRawM, "\`$global:WuuVersion\s*=\s*'([^']+)'")
 if ($versionMatchM.Success) { $embeddedVersionM = $versionMatchM.Groups[1].Value }
 if (-not $embeddedVersionM) {
     Fail 'could not read the embedded $global:WuuVersion literal - the version is not single-sourced (SS18)'
@@ -2246,13 +2252,14 @@ if (Get-Command Test-WuuWorkerPoolStarved -ErrorAction SilentlyContinue) {
 #      The check compares the two CONFIGURED values and then DRIVES Test-PoolCompatibility, so neither a
 #      reverted number nor an inverted comparison can pass.
 $workersRawAX = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Workers.psm1'))
+$configRawAX = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Configuration.psm1'))
 $poolMatchAX = [regex]::Match($workersRawAX, '\[int\]\$script:MaxPoolSize\s*=\s*(\d+)')
-$capMatchAX = [regex]::Match($coreRaw, '\$global:MaxConcurrentJobs\s*=\s*(\d+)')
+$capMatchAX = [regex]::Match($configRawAX, '\$global:MaxConcurrentJobs\s*=\s*(\d+)')
 
 if (-not $poolMatchAX.Success) {
     Fail 'could not read $script:MaxPoolSize from Wuu.Workers - the pool-versus-cap invariant cannot be verified (P3)'
 } elseif (-not $capMatchAX.Success) {
-    Fail 'could not read $global:MaxConcurrentJobs from Wuu.Core - the pool-versus-cap invariant cannot be verified (P3)'
+    Fail 'could not read $global:MaxConcurrentJobs from Wuu.Configuration - the pool-versus-cap invariant cannot be verified (P3)'
 } else {
     $poolSizeAX = [int]$poolMatchAX.Groups[1].Value
     $capSizeAX = [int]$capMatchAX.Groups[1].Value

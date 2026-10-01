@@ -55,7 +55,9 @@ if ($coreRaw -notmatch 'Command mode: argv') {
 # (g) The released version must be single-sourced. The banner and the audit records each hardcoded
 #     their own string, so a release could ship with the log claiming one version and the audit
 #     trail (an ISO 27001 field) recording another.
-if ($coreRaw -notmatch '\$global:WuuVersion\s*=') {
+# The version literal moved to Wuu.Configuration.psm1 (SS8). Read it where it now lives.
+$configRaw = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Configuration.psm1'))
+if ($configRaw -notmatch '\$global:WuuVersion\s*=') {
     Fail 'no $global:WuuVersion constant - the version is not single-sourced'
 } elseif ($auditRaw -match "wuuVersion\s*=\s*'v") {
     Fail 'Wuu.Audit hardcodes wuuVersion instead of reading $global:WuuVersion'

@@ -54,12 +54,13 @@ Import-Module (Join-Path $root 'src\Wuu.Workers.psm1') -Force -ErrorAction Stop
 # outside, and reading the file is also what makes reverting a number fail HERE rather than only at the
 # gate - the two checks are independent, which is what a tautology proof requires.
 $poolSource = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Workers.psm1'))
-$coreSource = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Core.psm1'))
+# The cap lives in Wuu.Configuration.psm1 since SS8, so read it there.
+$capSource = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Configuration.psm1'))
 
 $poolMatch = [regex]::Match($poolSource, '\[int\]\$script:MaxPoolSize\s*=\s*(\d+)')
-$capMatch = [regex]::Match($coreSource, '\$global:MaxConcurrentJobs\s*=\s*(\d+)')
+$capMatch = [regex]::Match($capSource, '\$global:MaxConcurrentJobs\s*=\s*(\d+)')
 Assert-True $poolMatch.Success 'the pool size is readable from Wuu.Workers source'
-Assert-True $capMatch.Success 'the concurrency cap is readable from Wuu.Core source'
+Assert-True $capMatch.Success 'the concurrency cap is readable from Wuu.Configuration source'
 
 $sourcePool = if ($poolMatch.Success) { [int]$poolMatch.Groups[1].Value } else { -1 }
 $sourceCap = if ($capMatch.Success) { [int]$capMatch.Groups[1].Value } else { -1 }
