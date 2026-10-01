@@ -110,10 +110,11 @@ function Initialize-RaceCtx($store, $payload) {
 
 Initialize-RaceCtx $stateStore $slowPayload
 
-# The shipped release rule, extracted from the cleanup loop so this file cannot drift from it. The
-# loop inlines it (isolated runspace, no module functions), and Test-OperationIdentity already asserts
+# The shipped release rule, extracted from the cleanup payload so this file cannot drift from it. The
+# payload inlines it (isolated runspace, no module functions), and Test-OperationIdentity already asserts
 # the text matches Test-WuuOperationCurrent - so using the extracted text here is using the rule.
-$coreRaw = Get-Content (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+# The payload now lives in Wuu.Workers (Get-WuuJobCleanupPayload, SS8).
+$coreRaw = Get-Content (Join-Path $root 'src\Wuu.Workers.psm1') -Raw
 $coreCode = ([regex]::Replace($coreRaw, '(?s)<#.*?#>', '') -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
 
 function Get-ShippedGuardBody([string]$Var, [string]$WriterVar) {

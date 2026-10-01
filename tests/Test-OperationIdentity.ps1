@@ -44,6 +44,9 @@ Import-Module (Join-Path $root 'src\Wuu.State.psm1') -Force -ErrorAction Stop
 $stateRaw = Get-Content (Join-Path $root 'src\Wuu.State.psm1') -Raw
 $coreRaw  = Get-Content (Join-Path $root 'src\Wuu.Core.psm1') -Raw
 $wupdRaw  = Get-Content (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+# The cleanup payload moved to Wuu.Workers (Get-WuuJobCleanupPayload, SS8). Its inlined guards are read
+# from THERE - the differential this suite performs is about the text of the guards, wherever they live.
+$workersRaw = Get-Content (Join-Path $root 'src\Wuu.Workers.psm1') -Raw
 
 # Strip comments before ANY pattern match. The guards below are explained at length by the comments
 # that surround them, and this codebase has now produced a false failure four times by matching the
@@ -56,6 +59,7 @@ function Get-CodeNoComments([string]$Text) {
 $coreCode = Get-CodeNoComments $coreRaw
 $wupdCode = Get-CodeNoComments $wupdRaw
 $stateCode = Get-CodeNoComments $stateRaw
+$workersCode = Get-CodeNoComments $workersRaw
 
 # ---------------------------------------------------------------------------------------
 # 1. the row contract carries the identity
@@ -124,12 +128,12 @@ Assert-Equal $rowA.OperationId $before '3. the predicate does not mutate the row
 $sites = @(
     @{ Name = 'writer refusal (Wuu.Core Update-WuuComputerRow)'; Text = $coreCode; Pattern = 'if \((\$rowOpId -ne '''' -and \$writerOpId -ne '''' -and \$rowOpId -cne \$writerOpId)\)';  Row = 'rowOpId';     Writer = 'writerOpId';  Function = 'Test-WuuStaleWrite';       Invert = $false }
 
-    @{ Name = 'failed-job release (cleanup loop)';               Text = $coreCode; Pattern = 'if \((\$rowOpId -ne '''' -and \$jobOpId -ne '''' -and \$rowOpId -ceq \$jobOpId)\)';        Row = 'rowOpId';     Writer = 'jobOpId';     Function = 'Test-WuuOperationCurrent'; Invert = $false }
-    @{ Name = 'completion release (cleanup loop)';               Text = $coreCode; Pattern = 'if \((\$rowOpId2 -ne '''' -and \$jobOpId2 -ne '''' -and \$rowOpId2 -ceq \$jobOpId2)\)';     Row = 'rowOpId2';    Writer = 'jobOpId2';    Function = 'Test-WuuOperationCurrent'; Invert = $false }
-    @{ Name = 'timeout release (cleanup loop)';                  Text = $coreCode; Pattern = 'if \((\$toRowId -ne '''' -and \$toOpId -ne '''' -and \$toRowId -ceq \$toOpId)\)';         Row = 'toRowId';     Writer = 'toOpId';      Function = 'Test-WuuOperationCurrent'; Invert = $false }
+    @{ Name = 'failed-job release (cleanup loop)';               Text = $workersCode; Pattern = 'if \((\$rowOpId -ne '''' -and \$jobOpId -ne '''' -and \$rowOpId -ceq \$jobOpId)\)';        Row = 'rowOpId';     Writer = 'jobOpId';     Function = 'Test-WuuOperationCurrent'; Invert = $false }
+    @{ Name = 'completion release (cleanup loop)';               Text = $workersCode; Pattern = 'if \((\$rowOpId2 -ne '''' -and \$jobOpId2 -ne '''' -and \$rowOpId2 -ceq \$jobOpId2)\)';     Row = 'rowOpId2';    Writer = 'jobOpId2';    Function = 'Test-WuuOperationCurrent'; Invert = $false }
+    @{ Name = 'timeout release (cleanup loop)';                  Text = $workersCode; Pattern = 'if \((\$toRowId -ne '''' -and \$toOpId -ne '''' -and \$toRowId -ceq \$toOpId)\)';         Row = 'toRowId';     Writer = 'toOpId';      Function = 'Test-WuuOperationCurrent'; Invert = $false }
 
     @{ Name = 'writer refusal (injected worker writer)';         Text = $wupdCode; Pattern = 'if \((\$rowOpId -ne '''' -and \$writerOpId -ne '''' -and \$rowOpId -cne \$writerOpId)\)';  Row = 'rowOpId';     Writer = 'writerOpId';  Function = 'Test-WuuStaleWrite';       Invert = $false }
-    @{ Name = 'timeout status write (cleanup loop)';             Text = $coreCode; Pattern = 'if \((\$toStatusRowId -eq '''' -or \$toStatusOpId -eq '''' -or \$toStatusRowId -cne \$toStatusOpId)\)'; Row = 'toStatusRowId'; Writer = 'toStatusOpId'; Function = 'Test-WuuOperationCurrent'; Invert = $true }
+    @{ Name = 'timeout status write (cleanup loop)';             Text = $workersCode; Pattern = 'if \((\$toStatusRowId -eq '''' -or \$toStatusOpId -eq '''' -or \$toStatusRowId -cne \$toStatusOpId)\)'; Row = 'toStatusRowId'; Writer = 'toStatusOpId'; Function = 'Test-WuuOperationCurrent'; Invert = $true }
 )
 
 $table = @(
@@ -263,12 +267,13 @@ Assert-True ($submitIdx -gt 0) '8. the submission point creates an operation ide
 Assert-True ($beginIdx -gt 0) '8. the submission point begins the pipeline'
 Assert-True ($submitIdx -lt $beginIdx) '8. the identity is created BEFORE BeginInvoke (the payload may start on its own thread immediately)'
 Assert-True ($wupdCode -match 'OperationId = \$operationId') '8. the job entry carries the identity (the cleanup loop holds the job, not the row)'
-Assert-True ($coreCode -match "PSObject\.Properties\['OperationId'\]") '8. the cleanup loop reads the identity off the job entry'
+# The cleanup payload lives in Wuu.Workers now (SS8), so its identity reads are asserted THERE.
+Assert-True ($workersCode -match "PSObject\.Properties\['OperationId'\]") '8. the cleanup loop reads the identity off the job entry'
 
 # ---------------------------------------------------------------------------------------
 # 9. the timeout path detaches the runspace, so a resubmission cannot inherit a dying one
 # ---------------------------------------------------------------------------------------
-Assert-True ($coreCode -match "Properties\['Runspace'\]\) \{ \`$toRow\.Runspace = \`$null \}") '9. the timeout path clears the row runspace before releasing the lock (a resubmission cannot build against a torn-down runspace)'
+Assert-True ($workersCode -match "Properties\['Runspace'\]\) \{ \`$toRow\.Runspace = \`$null \}") '9. the timeout path clears the row runspace before releasing the lock (a resubmission cannot build against a torn-down runspace)'
 
 # ---------------------------------------------------------------------------------------
 # 10. the out-of-band removal path releases the lock, clears the deadline and retires the identity

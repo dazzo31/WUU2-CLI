@@ -35,6 +35,10 @@ Import-WuuModules -WuuRoot $root
 
 $wupdRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
 $coreRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+# The cleanup payload moved to Wuu.Workers (Get-WuuJobCleanupPayload, SS8): the differential below
+# extracts its decision snippet, so it reads THAT file. The cleanup-loop assertions further down are
+# about the payload's text too, and read $workersRaw.
+$workersRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Workers.psm1') -Raw
 $stateRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
 # The budget table and heartbeat moved to Wuu.Configuration.psm1 (SS8). $configRaw serves the SETTING
 # lookups; $coreRaw still serves the cleanup-loop assertions further down, which are Core's own code.
@@ -182,19 +186,19 @@ else { Bad "no-basis row returned Expired=$($v.Expired) Basis=$($v.Basis)" }
 # nothing - which is how a "differential" test becomes a tautology.
 $startMarker = 'ElseIf ($runspace.StartTime) {'
 $logMarker = 'Job timeout detected for'
-$si = $coreRaw.IndexOf($startMarker)
-$li = if ($si -ge 0) { $coreRaw.IndexOf($logMarker, $si) } else { -1 }
+$si = $workersRaw.IndexOf($startMarker)
+$li = if ($si -ge 0) { $workersRaw.IndexOf($logMarker, $si) } else { -1 }
 # The snippet must run to the point where the TIMEOUT ACTION begins, i.e. up to and including the
 # '}' that closes the heartbeat 'if'. Cutting mid-statement produces an UNBALANCED snippet, and an
 # unbalanced snippet throws before producing a verdict - which reported "block produced no verdict"
 # rather than a clean extraction failure while this was being written.
-$ei = if ($li -gt 0) { $coreRaw.LastIndexOf('} else {', $li) } else { -1 }
+$ei = if ($li -gt 0) { $workersRaw.LastIndexOf('} else {', $li) } else { -1 }
 if ($si -lt 0 -or $ei -le $si) {
     Bad 'could not extract the cleanup loop decision snippet (the differential check would be a no-op)'
 } else {
     # From just after 'ElseIf (...) {' through the '}' closing the heartbeat if. That is a complete
     # `if` statement on its own, so it evaluates without the else branch.
-    $snippet = $coreRaw.Substring($si + $startMarker.Length, $ei - ($si + $startMarker.Length) + 1)
+    $snippet = $workersRaw.Substring($si + $startMarker.Length, $ei - ($si + $startMarker.Length) + 1)
     if ($snippet -notmatch '\$elapsedMin') {
         Bad 'the extracted snippet does not contain the deadline computation (extraction drifted)'
     }
@@ -317,8 +321,8 @@ if ($supText -match 'Set-WuuOperationDeadline') {
     Bad 'the submission point does not record the deadline - the loop would guess the budget'
 }
 # Every place OpState returns to Idle must clear the deadline, or the next op is killed instantly.
-$idleSites = ([regex]::Matches($coreRaw, "OpState = 'Idle'")).Count
-$clearSites = ([regex]::Matches($coreRaw, "TimeoutExpiresAt'\]\) \{ \`$?\w+\.TimeoutExpiresAt = \`$null")).Count
+$idleSites = ([regex]::Matches($workersRaw, "OpState = 'Idle'")).Count
+$clearSites = ([regex]::Matches($workersRaw, "TimeoutExpiresAt'\]\) \{ \`$?\w+\.TimeoutExpiresAt = \`$null")).Count
 if ($idleSites -gt 0 -and $clearSites -ge $idleSites) {
     Ok "every OpState release also clears the deadline ($clearSites clear site(s) for $idleSites release site(s))"
 } else {

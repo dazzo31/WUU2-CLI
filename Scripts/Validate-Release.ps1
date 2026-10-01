@@ -411,10 +411,12 @@ elseif ($supBodyT -notmatch 'Set-WuuOperationDeadline') {
 } elseif (-not $failed) { Pass 'the operation deadline is recorded at submission, with the op name (SS5)' }
 
 # 4. the loop must decide on the deadline, not on a flat elapsed-time threshold
-$loopIdx = $coreRawT.IndexOf('#Routine to handle completed runspaces')
-$loopBodyT = if ($loopIdx -ge 0) { $coreRawT.Substring($loopIdx, [Math]::Min(60000, $coreRawT.Length - $loopIdx)) } else { '' }
+# The cleanup PAYLOAD moved to Wuu.Workers (Get-WuuJobCleanupPayload, SS8), so it is read from THAT file.
+$workersRawT = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Workers.psm1'))
+$loopIdx = $workersRawT.IndexOf('#Routine to handle completed runspaces')
+$loopBodyT = if ($loopIdx -ge 0) { $workersRawT.Substring($loopIdx, [Math]::Min(60000, $workersRawT.Length - $loopIdx)) } else { '' }
 if (-not $loopBodyT) {
-    Fail 'could not locate the job cleanup loop'
+    Fail 'could not locate the job cleanup loop (it should be the payload in src\Wuu.Workers.psm1)'
 } else {
     if ($loopBodyT -match 'TotalMinutes -gt 10') {
         Fail 'the flat 10-minute stop is still present - healthy long operations would be killed (SS5)'
@@ -876,8 +878,12 @@ if ($idAt -lt 0) {
 # each pass must read OperationId off BOTH the job entry and the row before mutating.
 $loopBodyA = Get-WuuTextWithoutComments -Text (Get-WuuFunctionBody $coreRawA 'Start-WuuApplication')
 if (-not $loopBodyA) { $loopBodyA = $coreRawA }
-$guardedReleases = ([regex]::Matches($coreRawA, "PSObject\.Properties\['OperationId'\]\) \{ \`$jobOpId")).Count +
-                   ([regex]::Matches($coreRawA, "PSObject\.Properties\['OperationId'\]\) \{ \`$toOpId")).Count
+# The cleanup payload moved to Wuu.Workers (Get-WuuJobCleanupPayload, SS8). Its three identity-guarded
+# release paths are read THERE; an unguarded pass would release the lock of whatever operation now owns
+# the row, which is exactly as true in its new home.
+$workersRawA = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Workers.psm1'))
+$guardedReleases = ([regex]::Matches($workersRawA, "PSObject\.Properties\['OperationId'\]\) \{ \`$jobOpId")).Count +
+                   ([regex]::Matches($workersRawA, "PSObject\.Properties\['OperationId'\]\) \{ \`$toOpId")).Count
 if ($guardedReleases -lt 3) {
     Fail "only $guardedReleases of 3 cleanup-loop release path(s) read the job identity - an unguarded pass releases the lock of whatever operation now owns the row (SS3)"
 } else {
@@ -902,7 +908,8 @@ if ($injectedWriter -notmatch '-cne \$writerOpId') {
 
 # The timeout path must DETACH the runspace before releasing the lock. Without it, a resubmission in
 # the async Stop() window inherits a torn-down runspace while the old payload still writes through it.
-if ($coreRawA -notmatch "Properties\['Runspace'\]\) \{ \`$toRow\.Runspace = \`$null \}") {
+# Read from Wuu.Workers, where the cleanup payload now lives (SS8).
+if ($workersRawA -notmatch "Properties\['Runspace'\]\) \{ \`$toRow\.Runspace = \`$null \}") {
     Fail 'the timeout path does not detach the row runspace before releasing the lock - a resubmission can build against a runspace that is still draining, and the old payload keeps writing through it (SS3)'
 } else {
     Pass 'the timeout path detaches the runspace before releasing the lock (SS3)'
