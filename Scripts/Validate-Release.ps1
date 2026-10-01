@@ -234,9 +234,12 @@ else { Pass 'every file with non-ASCII bytes carries the UTF-8 BOM' }
 $auditPath = Join-Path $root 'src\Wuu.Audit.psm1'
 $auditCode = Get-WuuCodeWithoutComments -Path $auditPath
 
-# (a)-(i)_audit_group - extracted to Scripts\Test-AuditContract.ps1 (instructions SS39). Dot-sourced in THIS scope so it shares
-#      the gate's variables and helpers, and at THIS position so the verdict order is unchanged.
+# (a)-(i) x3 AUDIT CONTRACT - extracted to Scripts\Test-AuditContract.ps1 (instructions SS39).
 . (Join-Path $PSScriptRoot 'Test-AuditContract.ps1')
+# (a)-(k) RELEASE METADATA - extracted to Scripts\Test-ReleaseMetadata.ps1 (instructions SS39).
+. (Join-Path $PSScriptRoot 'Test-ReleaseMetadata.ps1')
+# (a)-(l) CONSOLE CONTRACT - extracted to Scripts\Test-Contracts.ps1 (instructions SS39).
+. (Join-Path $PSScriptRoot 'Test-Contracts.ps1')
 
 # (m) Spec 7: an offline computer must not be probed. Probing a host that is not there is a
 #     guaranteed bounded-timeout per probe, so pre-flight cost would scale with the number of
