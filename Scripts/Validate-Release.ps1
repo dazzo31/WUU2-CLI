@@ -1318,8 +1318,14 @@ if ($fatalBodyM -notmatch 'exit \$ExitCode') {
 
 # 3. The password prompt must route through the input choke point, or a command-mode run blocks at
 #    the unlock prompt with no way to answer it.
-if ($coreRawM -notmatch 'Read-WuuAnswer -Prompt \$Prompt -Secure') {
+#    The prompt moved to Wuu.Presentation.psm1 (SS8), so it is read THERE. The check names the
+#    module rather than Core so a future move fails loudly here instead of silently passing on
+#    absent text - the failure mode a "not in the old file" check always has.
+$presRawM = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Presentation.psm1'))
+if ($presRawM -notmatch 'Read-WuuAnswer -Prompt \$Prompt -Secure') {
     Fail 'the password prompt bypasses Read-WuuAnswer - a scripted or non-interactive run could not answer the unlock prompt (SS15)'
+} elseif ($presRawM -notmatch 'function _WuuReadPassword') {
+    Fail 'the choke-point-routed password prompt is missing from Wuu.Presentation - the SS15 check above matched something else (SS15)'
 } else {
     Pass 'the password prompt routes through the input choke point (SS15)'
 }

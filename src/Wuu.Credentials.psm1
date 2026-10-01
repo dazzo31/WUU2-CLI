@@ -247,8 +247,13 @@ function Show-PasswordPrompt {
     <#
     .SYNOPSIS Console password prompt (was a WPF PasswordBox dialog).
     .DESCRIPTION Returns a SecureString, or $null if cancelled/empty - the same contract
-    the WPF version had, so callers need no change. Read-Host -AsSecureString keeps the
-    password off the screen and out of the transcript.
+    the WPF version had, so callers need no change.
+
+    ROUTED THROUGH _WuuReadPassword (Wuu.Presentation), which is the single input choke point's secure
+    path. This used to call Read-Host directly, which bypassed the choke point: in command mode
+    (wuu config save) nobody can answer a bare Read-Host, so the run hung at the prompt instead of
+    failing. The gate only checked Core for this, so the bypass here went unnoticed until the
+    choke-point prompt was extracted and the gate was re-pointed at its new home.
     #>
     param(
         [string]$Title = "Password Required",
@@ -257,12 +262,7 @@ function Show-PasswordPrompt {
     Write-Host ""
     Write-Host "  $Title" -ForegroundColor White
     if ($Message) { Write-Host "  $Message" -ForegroundColor Gray }
-    try {
-        $sec = Read-Host -Prompt "  Password" -AsSecureString
-    } catch {
-        Write-ErrorLog "Secure password prompt unavailable: $($_.Exception.Message)"
-        return $null
-    }
+    $sec = _WuuReadPassword -Prompt "  Password"
     if ($null -eq $sec -or $sec.Length -eq 0) { return $null }
     return $sec
 }
