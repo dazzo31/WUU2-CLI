@@ -22,7 +22,7 @@ function Import-WuuModules {
     # scriptable verb layer; Wuu.Audit the tamper-evident trail. Wuu.Session models the computer
     # set as a first-class object and Wuu.Navigate owns the guided interactive workflow - both sit
     # ABOVE the engine and only read/delegate to it.
-    foreach ($m in @('Wuu.Configuration','Wuu.Presentation','Wuu.State','Wuu.Logging','Wuu.Scheduler','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Session','Wuu.Audit','Wuu.Command','Wuu.Navigate')) {
+    foreach ($m in @('Wuu.Configuration','Wuu.Presentation','Wuu.Actions.Display','Wuu.State','Wuu.Logging','Wuu.Scheduler','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Session','Wuu.Audit','Wuu.Command','Wuu.Navigate')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
@@ -100,6 +100,9 @@ $global:stateStore = $stateStore
 # write and pause/resume after this point has its dependency.
 Initialize-WuuPresentation -StateStore $stateStore
 Initialize-WuuBackgroundProcessing -BackgroundProcessing $backgroundProcessing
+# The console display actions resolve targets from the same store; they live in
+# src\Wuu.Actions.Display.psm1 (SS8) and take it explicitly.
+Initialize-WuuDisplayActions -StateStore $stateStore
 
 
 #region Logging
@@ -2785,74 +2788,19 @@ $eventLoadConfig = {
 #region Update Information and Service Management
 # Console edition: these handlers previously wrote to Out-GridView (a WPF-only cmdlet that
 # does not exist headlessly) and read $uiHash.Listview.SelectedItems. They now resolve rows
-# from the store and print to the console. Show-WuuObjectTable is a small local helper so the
-# output stays in the transcript (docs/CLI_AUDIT_PLAN.md section 5.3).
-function Show-WuuObjectTable {
-    param(
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
-        [Parameter(Mandatory)][string]$Title,
-        [int]$MaxWidth = 100
-    )
-    Write-Host ''
-    Write-Host ("  $Title") -ForegroundColor White
-    Write-Host ('  ' + ('-' * [Math]::Min($MaxWidth, 100))) -ForegroundColor DarkGray
-    if (-not $Items -or $Items.Count -eq 0) {
-        Write-Host '  (nothing to show)' -ForegroundColor DarkGray
-        return
-    }
-    foreach ($item in $Items) {
-        $props = @($item.PSObject.Properties | Where-Object { $_.Name -ne 'PSComputerName' })
-        foreach ($p in $props) {
-            $v = [string]$p.Value
-            if ([string]::IsNullOrWhiteSpace($v)) { continue }
-            if ($v.Length -gt $MaxWidth) { $v = $v.Substring(0, $MaxWidth - 1) + [char]0x2026 }
-            Write-Host ("  {0,-24} {1}" -f ($p.Name + ':'), $v)
-        }
-        Write-Host ''
-    }
-}
-
-$eventShowAvailableUpdates = {
-    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Show available updates for which computers?')
-    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
-    ForEach ($Computer in $rows) {
-        $updates = @($updatesHash[$computer.computer])
-        Show-WuuObjectTable -Items $updates -Title "$($Computer.computer): available updates ($($updates.Count))"
-        foreach ($u in $updates) {
-            Write-Host ("  - {0}" -f $u.Title)
-        }
-    }
-}
-$eventShowInstalledUpdates = {
-    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Show installed updates for which computers?')
-    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
-    ForEach ($Computer in $rows){
-        $comResult = Invoke-RemoteComWithTimeout -ComputerName $Computer.computer -TimeoutSeconds 30 -ScriptBlock {
-            param($ComputerName)
-            try {
-                $session = [activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session', $ComputerName))
-                $searcher = $session.CreateUpdateSearcher()
-                $updates = @($searcher.Search('IsInstalled=1').Updates)
-                $result = $updates | ForEach-Object {
-                    [PSCustomObject]@{
-                        Title = $_.Title
-                        Description = $_.Description
-                        IsUninstallable = $_.IsUninstallable
-                        SupportUrl = $_.SupportUrl
-                    }
-                }
-                return $result
-            } catch {
-                return @([PSCustomObject]@{ Error = $_.Exception.Message })
-            }
-        }
-        if ($comResult.Success) {
-            Show-WuuObjectTable -Items @($comResult.Output) -Title "$($Computer.computer): installed updates"
-        } else {
-            Update-Status "Failed to show installed updates for $($Computer.computer): $($comResult.Error)"
-        }
-    }
-}
+# from the store and print to the console.
+#
+# THE DISPLAY HANDLERS MOVED OUT (SS8): $eventShowAvailableUpdates, $eventShowInstalledUpdates,
+# $eventShowUpdateHistory, $eventViewUpdateLog and their Show-WuuObjectTable helper now live in
+# src\Wuu.Actions.Display.psm1, each taking the store explicitly. The console action layer below
+# calls them by name.
+#
+# WHAT STAYS HERE, and why:
+#   * $eventAuditWSUSUpdates - a remote COM query whose result feeds the audit trail.
+#   * $eventWUServiceAction / $WUServiceAction - the latter is a RUNSPACE PAYLOAD handed to the worker
+#     as `$ctx.WUServiceAction`; it may use only the injected $WriteDebugLogScript / $InvokePooledScript,
+#     never a module function, so it cannot move into a module.
+#   * $GetErrors - reads the ambient $Error collection and $performanceHash.
 $eventAuditWSUSUpdates = {
     # Audit WSUS-approved updates and compare with Windows Update count
     #
@@ -2928,59 +2876,6 @@ $eventAuditWSUSUpdates = {
             }
         } else {
             [PSCustomObject]@{Error = "WSUS audit timed out: $($comResult.Error)"} | Format-List | Write-Host -ForegroundColor Red
-        }
-    }
-}
-$eventShowUpdateHistory = {
-    Try{
-        $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Show update history for which computers?')
-        if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
-        foreach ($computer in $rows) {
-        $comResult = Invoke-RemoteComWithTimeout -ComputerName $computer.computer -TimeoutSeconds 30 -ScriptBlock {
-            param($ComputerName)
-            try {
-                $session = [activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session', $ComputerName))
-                $searcher = $session.CreateUpdateSearcher()
-                $history = @($searcher.QueryHistory(0, $searcher.GetTotalHistoryCount()))
-                return $history | ForEach-Object {
-                    [PSCustomObject]@{
-                        Operation = switch($_.Operation){1 {"Installation"}; 2 {"Uninstallation"}; 3 {"Other"}; default {$_.Operation}}
-                        Result = switch($_.ResultCode){1 {"Success"}; 2 {"Success (reboot required)"}; 4 {"Failure"}; default {$_.ResultCode}}
-                        HResult = '0x' + [Convert]::ToString($_.HResult, 16)
-                        Date = $_.Date
-                        Title = $_.Title
-                        Description = $_.Description
-                        SupportUrl = $_.SupportUrl
-                    }
-                }
-            } catch {
-                return @([PSCustomObject]@{ Error = $_.Exception.Message })
-            }
-        }
-        
-        if ($comResult.Success) {
-            Show-WuuObjectTable -Items @($comResult.Output) -Title "$($computer.computer): update history"
-        } else {
-            throw "Failed to retrieve update history: $($comResult.Error)"
-        }
-        }   # end foreach ($computer in $rows)
-    } Catch{
-            $computer.Status = "Error Occured: $($_.exception.Message)"
-        if ($stateStore) { $stateStore.Touch() }
-    }
-}
-$eventViewUpdateLog = {
-    # Console edition: print the local copy of the Windows Update log for each target.
-    # (The GUI opened \\<computer>\c$\windows\windowsupdate.log with the default handler.)
-    $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'View Windows Update log for which computers?')
-    if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
-    foreach ($r in $rows) {
-        $p = "\\$($r.computer)\c`$\windows\windowsupdate.log"
-        if (Test-Path -LiteralPath $p) {
-            Write-Host "  --- $($r.computer) ---" -ForegroundColor White
-            Get-Content -LiteralPath $p -Tail 200 | Write-Host
-        } else {
-            Write-Host "  $($r.computer): log not reachable at $p" -ForegroundColor Yellow
         }
     }
 }
@@ -3418,13 +3313,13 @@ $consoleActions.EventAddFile = {
 }
 
 # Read-only actions delegate to the existing handlers, which read the store's rows.
-$consoleActions.EventShowAvailableUpdates  = { & $eventShowAvailableUpdates }
-$consoleActions.EventShowInstalledUpdates  = { & $eventShowInstalledUpdates }
-$consoleActions.EventShowUpdateHistory     = { & $eventShowUpdateHistory }
+$consoleActions.EventShowAvailableUpdates = { Invoke-WuuShowAvailableUpdates -Store $stateStore }
+$consoleActions.EventShowInstalledUpdates = { Invoke-WuuShowInstalledUpdates -Store $stateStore }
+$consoleActions.EventShowUpdateHistory = { Invoke-WuuShowUpdateHistory -Store $stateStore }
 $consoleActions.EventAuditWSUSUpdates      = { & $eventAuditWSUSUpdates }
 # NOTE: this adapter was missing until the release validator caught the verb table pointing at a
 # nonexistent handler - the menu had the same gap (no key was bound to it), so nothing noticed.
-$consoleActions.EventViewUpdateLog         = { & $eventViewUpdateLog }
+$consoleActions.EventViewUpdateLog = { Invoke-WuuViewUpdateLog -Store $stateStore }
 $consoleActions.EventSaveComputerList      = { & $eventSaveComputerList }
 $consoleActions.EventSaveConfig            = { & $eventSaveConfig }
 $consoleActions.EventLoadConfig            = { & $eventLoadConfig }
