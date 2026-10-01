@@ -489,7 +489,14 @@ if ($Json) {
 #      exist. That is the same defect as exit code 4 being reserved-but-unproducible, and a reserved
 #      verdict is worse than an absent one because the report claims the distinction is available.
 $selfText = Get-Content -LiteralPath $PSCommandPath -Raw
-$gateCode = Get-WuuTextWithoutComments -Text $selfText
+# THE CORPUS IS THE GATE PLUS ITS FRAGMENTS. Validate-Release.ps1 was decomposed (SS39) into
+# Scripts\Test-*.ps1 files, and a verdict kind emitted from a fragment is just as reachable as one
+# emitted here. Reading only this file would report "defined but never emitted" for a kind whose call
+# site had moved - a FALSE FAILURE that would appear the moment someone extracted the block holding it.
+# Reading the concatenation keeps the check about the set of checks the gate runs, not about one file.
+$gateCorpus = @($selfText) + @(Get-ChildItem -Path $PSScriptRoot -Filter 'Test-*.ps1' -File |
+        ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) })
+$gateCode = Get-WuuTextWithoutComments -Text ($gateCorpus -join "`n")
 foreach ($kind in @('Warn', 'Skip', 'Not-Implemented')) {
     # Count INVOCATIONS, not the definition. `function Warn($m) {` and the report's 'WARN' string both
     # contain the word; only a call site means the kind is reachable.
@@ -510,10 +517,15 @@ if (-not $failed) {
 # removes comments but NOT string literals, so the check's own pattern text inflated the count twice in a
 # row. Counting occurrences of a token the check must quote is self-defeating. The window between the
 # writer and the exit contains no such token and states the real requirement directly.
-$writerCalls = ([regex]::Matches($gateCode, 'Write-WuuGateJsonReport')).Count
-$writerIdx = $gateCode.LastIndexOf('Write-WuuGateJsonReport -Path')
-$exitIdx = $gateCode.LastIndexOf('Validation FAILED')
-$lastCheckIdx = $gateCode.LastIndexOf('Not-Implemented')
+#
+# MEASURED AGAINST THE GATE ALONE, not the corpus: this is about the ORDER of the gate's own file - the
+# writer call, the exit statement, and whether a verdict is emitted between them. Concatenating the
+# fragments would put fragment text between those two points and report verdicts that are not there.
+$gateSelf = Get-WuuTextWithoutComments -Text $selfText
+$writerCalls = ([regex]::Matches($gateSelf, 'Write-WuuGateJsonReport')).Count
+$writerIdx = $gateSelf.LastIndexOf('Write-WuuGateJsonReport -Path')
+$exitIdx = $gateSelf.LastIndexOf('Validation FAILED')
+$lastCheckIdx = $gateSelf.LastIndexOf('Not-Implemented')
 
 if ($writerCalls -lt 2) {
     Fail "the report writer is referenced $writerCalls time(s) - it must be both defined and called (P4)"
@@ -522,7 +534,7 @@ if ($writerCalls -lt 2) {
 } elseif ($exitIdx -lt 0 -or $exitIdx -lt $writerIdx) {
     Fail 'the report writer is not followed by the failure exit - a failing run could produce no report (P4)'
 } else {
-    $window = $gateCode.Substring($writerIdx, $exitIdx - $writerIdx)
+    $window = $gateSelf.Substring($writerIdx, $exitIdx - $writerIdx)
     $lateVerdicts = ([regex]::Matches($window, '(?m)^\s*(Pass|Fail|Warn|Skip|Not-Implemented)\s')).Count
     if ($lateVerdicts -gt 0) {
         # THE BUG THIS CATCHES, and it was real: the writer was placed BEFORE the final blocks, so the
@@ -539,9 +551,10 @@ if ($writerCalls -lt 2) {
 }
 
 # The trap that silently produced an EMPTY report: @() over a generic List throws on PS 5.1.
-if ($gateCode -match '@\(\s*\$script:WuuGateVerdicts\s*\)') {
+# Asserted against the gate's own text, because the report writer lives there.
+if ($gateSelf -match '@\(\s*\$script:WuuGateVerdicts\s*\)') {
     Fail 'the report reads the verdict list with @(...) - on PS 5.1 that throws over a generic List and the assignment silently becomes $null, producing a report of one null verdict (P4)'
-} elseif ($gateCode -notmatch 'WuuGateVerdicts\.ToArray\(\)') {
+} elseif ($gateSelf -notmatch 'WuuGateVerdicts\.ToArray\(\)') {
     Fail 'the report does not enumerate the verdict list with .ToArray() (P4)'
 } else {
     Pass 'the report enumerates the verdict list safely (.ToArray(), not @() which throws on PS 5.1) (P4)'
