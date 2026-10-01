@@ -522,7 +522,12 @@ function Get-WuuCommandTable {
         }
         'export' = @{
             Action = 'EventSaveComputerList'; Mutating = $false
-            Answers = { param($p) @() }
+            # The action PROMPTS for its destination path through the input choke point. This builder
+            # used to supply @() because the old action took the path from a SaveFileDialog - a WPF
+            # type this edition cannot load, so the prompt was never reached. Now the path comes from
+            # the prompt: -Path answers it, and without -Path the run fails loudly (a missing required
+            # input must fail the command, not hang it) rather than blocking on a dialog.
+            Answers = { param($p) , $p.Path }
             Help = 'Export the list to a file:  wuu export -Path out.csv'
         }
         'config' = @{

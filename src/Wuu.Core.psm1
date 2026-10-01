@@ -2720,21 +2720,17 @@ $eventRemoveOfflineComputer = {
 #region Configuration Management
 $eventSaveComputerList = {
     If ($stateStore.Rows.Count -gt 0) {
-        #Save dialog
-        $dlg = new-object Microsoft.Win32.SaveFileDialog
-        $dlg.FileName = 'Computer List'
-        $dlg.DefaultExt = '*.txt'
-        $dlg.Filter = 'Text files (*.txt)|*.txt|CSV files (*.csv)|*.csv'
-        $dlg.InitialDirectory = $pwd
-        [void]$dlg.showdialog()
-        $filePath = $dlg.FileName
-
-        #Verify file was selected
-        If (-Not ([system.string]::IsNullOrEmpty($filepath))) {
-            #Save file
+        # Console edition: a PATH PROMPT, not the GUI's SaveFileDialog. That dialog is a WPF type
+        # (Microsoft.Win32.SaveFileDialog lives in PresentationFramework), which this edition
+        # deliberately does not load - so the old call threw "Cannot find type" the moment an
+        # operator picked "Export list to file". The action is registered and reachable, so the
+        # failure appeared only at use. Input goes through the choke point (Read-WuuAnswer) so a
+        # scripted or non-interactive run can answer it instead of blocking on a dialog.
+        $filePath = [string](Read-WuuAnswer -Prompt '  Path to save the computer list' -Default '')
+        if ([string]::IsNullOrWhiteSpace($filePath)) {
+            Update-Status 'Computer List not saved - no path given.'
+        } else {
             (Get-WuuComputerRow -Store $stateStore | Select-Object -Expand Computer) | Out-File $filePath -Force
-
-            #Update status
             Update-Status "Computer List saved to $filePath"
         }
     }

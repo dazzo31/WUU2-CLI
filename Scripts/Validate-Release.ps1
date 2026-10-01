@@ -137,7 +137,12 @@ $wpfPattern = 'XamlReader|PresentationFramework|PresentationCore|WindowsBase|Ite
 # false-positive class the headless test and the audit checks both hit. (Note the audit checks go
 # the other way and read raw text, because there the thing being searched for is NOT quoted in a
 # neighbouring comment. Match the representation to the text, never to habit.)
-$guiOnlyPattern = '\[System\.Windows\.MessageBox\]|\[System\.Windows\.Forms\.|\[Microsoft\.VisualBasic\.|Microsoft\.Win32\.OpenFileDialog'
+# Microsoft.Win32.(Open|Save)FileDialog BOTH live in PresentationFramework, so both are WPF types the
+# console edition cannot resolve. The pattern originally named only OpenFileDialog, and that omission
+# let a REAL, REACHABLE defect through THIS gate: "Export list to file" (menu key x, the guided UI, and
+# the EventSaveComputerList action) built a SaveFileDialog, which throws "Cannot find type" at the
+# moment an operator uses it. Name the FAMILY, not one member of it.
+$guiOnlyPattern = '\[System\.Windows\.MessageBox\]|\[System\.Windows\.Forms\.|\[Microsoft\.VisualBasic\.|Microsoft\.Win32\.(Open|Save)FileDialog'
 $wpfHits = New-Object System.Collections.ArrayList
 foreach ($f in $files) {
     # Skip this validator itself: it necessarily contains the very patterns it searches for.
@@ -197,11 +202,20 @@ foreach ($sub in 'EventShowAvailableUpdates', 'EventShowInstalledUpdates', 'Even
 if (-not $failed) { Pass 'sub-dispatched verb handlers resolved' }
 
 # --- 7. Every verb in the table has help text and an Answers builder ---------------------
-$verbKeys = [regex]::Matches($cmdCode, "(?m)^\s*'([a-z-]+)'\s*=\s*@\{\s*$") | ForEach-Object { $_.Groups[1].Value }
+# Sliced PER VERB, not through a fixed character window. A 400-char window silently failed a verb
+# whose entry carries an explanatory comment (the export verb, P2) - a FALSE FAILURE on correct code,
+# which is the failure mode this gate exists to prevent, and the same size-assumption trap as the
+# 3000-char body window documented above. Slicing from one verb key to the next has no size
+# assumption, so a comment of any length is harmless.
+$verbEntries = [regex]::Matches($cmdCode, "(?m)^\s*'([a-z-]+)'\s*=\s*@\{\s*$")
 $noHelp = @()
-foreach ($k in $verbKeys) {
-    if ($cmdCode -notmatch ("'$([regex]::Escape($k))'\s*=\s*@\{[\s\S]{0,400}?Help\s*=")) { $noHelp += $k }
+for ($vi = 0; $vi -lt $verbEntries.Count; $vi++) {
+    $start = $verbEntries[$vi].Index
+    $end = if ($vi + 1 -lt $verbEntries.Count) { $verbEntries[$vi + 1].Index } else { $cmdCode.Length }
+    $entryBody = $cmdCode.Substring($start, $end - $start)
+    if ($entryBody -notmatch 'Help\s*=') { $noHelp += $verbEntries[$vi].Groups[1].Value }
 }
+$verbKeys = @($verbEntries | ForEach-Object { $_.Groups[1].Value })
 if ($noHelp.Count) { Fail ('verb(s) missing Help text: ' + ($noHelp -join ', ')) }
 else { Pass "all $($verbKeys.Count) verbs have Help text" }
 

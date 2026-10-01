@@ -143,3 +143,38 @@ $consoleRaw2 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Console.psm1')
 if ($consoleRaw2 -notmatch '\$null\s+-ne\s+\$global:WuuGuidedTargets') {
     Fail 'the guided target override is not tested for $null - an empty list would fall through to prompting'
 } else { Pass 'the guided target override distinguishes "none" from "not decided"' }
+
+# (m) THE EXPORT ACTION MUST NOT USE A WPF FILE DIALOG. "Export list to file" (menu key x, the guided
+#     UI, and the EventSaveComputerList action behind `wuu export`) built a Microsoft.Win32.SaveFileDialog
+#     - a PresentationFramework type this edition deliberately does not load - so it threw "Cannot find
+#     type" the moment an operator used it. Reachable, therefore a live defect, not dead GUI debris.
+#     Asserted in two halves, because either alone re-opens the hole: the action must not build a GUI
+#     dialog, and the export verb's answer builder must actually supply the path the action now prompts
+#     for - the old builder supplied @() because the dialog, not the choke point, produced the value.
+# Sliced from the variable's assignment to the next top-level '$event' assignment. A brace-balanced
+# slice is the wrong tool here: the action's own comment names the dialog type it must not use, so a
+# brace count would walk into the comment text. Slicing to the NEXT assignment has no such exposure,
+# and it is the same "slice to the next definition" rule Get-WuuFunctionBody documents.
+$exportStart = $coreRaw2.IndexOf('$eventSaveComputerList = {')
+$exportEnd = if ($exportStart -ge 0) { $coreRaw2.IndexOf('$eventSaveConfig = {', $exportStart) } else { -1 }
+$exportBody = if ($exportStart -ge 0 -and $exportEnd -gt $exportStart) { $coreRaw2.Substring($exportStart, $exportEnd - $exportStart) } else { '' }
+# COMMENT-STRIPPED before matching, because the action's own comment NAMES the dialog type it must not
+# use. Matching raw text here flagged the explanation of the fix - the identical false positive the
+# audit and SS8 checks document, and the reason Get-WuuTextWithoutComments exists.
+$exportCode = Get-WuuTextWithoutComments -Text $exportBody
+if (-not $exportBody) {
+    Fail 'could not locate the $eventSaveComputerList action - the export path is unverified'
+} elseif ($exportCode -match 'Microsoft\.Win32\.|System\.Windows\.Forms\.|SaveFileDialog|OpenFileDialog') {
+    Fail 'the export action uses a GUI file dialog (a WPF/WinForms type this edition cannot load) - it throws "Cannot find type" when an operator exports (P2)'
+} elseif ($exportBody -notmatch 'Read-WuuAnswer') {
+    Fail 'the export action does not obtain its destination through the input choke point - a scripted or non-interactive export could not answer it (SS15)'
+} else {
+    $exportAnswers = [regex]::Match($cmdRaw, "(?s)'export'\s*=\s*@\{.*?Answers\s*=\s*\{\s*param\(\`$p\)([^}]*)\}")
+    if (-not $exportAnswers.Success) {
+        Fail 'could not read the export verb answer builder - the command-mode export path is unverified (SS10)'
+    } elseif ($exportAnswers.Groups[1].Value.Trim() -eq '@()') {
+        Fail "the export verb supplies no answers, so its path prompt can never be satisfied - scripted export fails with 'Required input missing' (SS10/SS15)"
+    } else {
+        Pass 'the export action prompts for its path through the choke point and the export verb supplies it (no WPF dialog, SS10/SS15)'
+    }
+}
