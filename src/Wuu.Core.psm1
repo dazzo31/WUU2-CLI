@@ -2296,6 +2296,21 @@ $eventSaveConfig = {
             # Default path for config
             $configPath = Join-Path $WuuRoot 'ComputerList.config'
 
+            # SS: retype the passphrase before it is used ONLY when this save is CHOOSING one - i.e. the
+            # file has to be created. Every list in a file shares one passphrase, so a typo there
+            # produces a file that opens with neither entry and is indistinguishable from an empty one
+            # later, which is how an operator silently loses every list they had.
+            #
+            # When the file already EXISTS the passphrase is not being chosen, it is being proved - and
+            # the read below already proves it by opening the file with it. Asking a second time there
+            # would be friction over a password the operator has used before, in the one place where a
+            # wrong one is already reported as a wrong one.
+            $confirm = Confirm-WuuPasswordPrompt -Password $securePassword -ExistingFile:(Test-Path -LiteralPath $configPath)
+            if (-not $confirm.Confirmed) {
+                Update-Status 'Save cancelled - the two passwords did not match.'
+                return
+            }
+
             # SS: several lists live in ONE encrypted file, so saving adds to a file that may already
             # hold others. Read it FIRST and stop if the passphrase will not open it: a file that
             # cannot be decrypted cannot be added to, and writing over it on a typo would destroy

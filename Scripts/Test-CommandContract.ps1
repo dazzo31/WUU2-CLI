@@ -367,6 +367,31 @@ if ($leakFiles.Count -gt 0) {
     Pass 'no log or audit call interpolates a password-shaped expression (SS6)'
 }
 
+# 6. The confirm field, for a passphrase that is being CHOSEN rather than proved. Every list in the
+#    file shares one passphrase, so a typo while creating it produces a file that opens with NEITHER
+#    entry - and a file the operator cannot identify, holding lists they can no longer read, is
+#    indistinguishable from an empty one at the next load.
+#
+#    Two properties, because either alone is insufficient. The prompt must EXIST on the create path
+#    (a rule nobody calls is not a rule), and it must be gated on the file NOT existing (a passphrase
+#    already in use is proved by opening the file; asking again is friction, and in command mode it
+#    is a prompt with nobody to answer it). The comparison itself must be case-SENSITIVE: PowerShell's
+#    -eq is case-INSENSITIVE by default, so "Password1" and "password1" compare EQUAL and a real typo
+#    passes the very check that exists to catch it.
+$pwConfirmCode = Get-WuuTextWithoutComments -Text (Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Credentials.psm1') -Raw)
+$saveConfirmCode = Get-WuuTextWithoutComments -Text $coreRawE
+if ($pwConfirmCode -notmatch 'function Confirm-WuuPasswordPrompt') {
+    Fail 'Confirm-WuuPasswordPrompt is missing - a passphrase could be saved with a typo in it (SS6)'
+} elseif ($pwConfirmCode -notmatch "'Confirm-WuuPasswordPrompt'") {
+    Fail 'Confirm-WuuPasswordPrompt is not exported, so the save path could not reach it (SS6)'
+} elseif ($pwConfirmCode -notmatch 'plain1 -ceq \$plain2') {
+    Fail 'the password comparison is not case-sensitive: -eq treats "Password1" and "password1" as EQUAL, so a real typo passes (SS6)'
+} elseif ($saveConfirmCode -notmatch 'Confirm-WuuPasswordPrompt[\s\S]{0,240}?-ExistingFile') {
+    Fail 'the save path does not confirm a passphrase being chosen, or does not gate it on the file existing (SS6)'
+} elseif (-not $failed) {
+    Pass 'a passphrase being chosen is confirmed, compared case-sensitively, and only when the file would be created (SS6)'
+}
+
 # (ae) -WHATIF REPORTS A PER-COMPUTER PLAN (brief SS11). `-WhatIf` printed one sentence ("would run
 #      'install' against all computers"), which is not reviewable before a production change - and for
 #      a RESTART it is wrong in the most expensive direction: a busy computer is NOT deferred for

@@ -272,6 +272,89 @@ function Show-PasswordPrompt {
     return $sec
 }
 
+function Test-WuuPasswordMatch {
+    <#
+    .SYNOPSIS Compares two passwords. The rule behind the confirm field, in one place so it can be driven.
+    .DESCRIPTION
+    -ceq, NOT -eq. PowerShell's -eq is case-INSENSITIVE by default, so "Password1" and "password1"
+    compare EQUAL and a real typo passes the check - which is exactly the mistake the confirm field
+    exists to catch. The values are read back through Marshal because a SecureString holds no raw text
+    to compare and .Length counts characters, so a trailing space that differs still matches by length.
+    #>
+    param(
+        [AllowNull()][System.Security.SecureString]$First,
+        [AllowNull()][System.Security.SecureString]$Second
+    )
+    if ($null -eq $First -and $null -eq $Second) { return $true }
+    if ($null -eq $First -or $null -eq $Second) { return $false }
+    $b1 = [IntPtr]::Zero; $b2 = [IntPtr]::Zero
+    try {
+        $b1 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($First)
+        $b2 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Second)
+        $plain1 = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($b1)
+        $plain2 = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($b2)
+        return ($plain1 -ceq $plain2)
+    } finally {
+        if ($b1 -ne [IntPtr]::Zero) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1) }
+        if ($b2 -ne [IntPtr]::Zero) { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2) }
+    }
+}
+
+function Confirm-WuuPasswordPrompt {
+    <#
+    .SYNOPSIS Asks an operator to retype a password they are about to save with (the confirm field).
+    .DESCRIPTION
+    TYPING A NEW PASSPHRASE TWICE, and refusing on a mismatch, is the only defence against the failure
+    this prompt exists to prevent: the file is encrypted as a unit with one passphrase shared by every
+    list in it, so a single mistyped character produces a file that opens with neither entry - and a
+    file the operator cannot identify, holding lists they can no longer read, is indistinguishable from
+    an empty one the next time they load.
+
+    SKIPS ITSELF WHEN IT CANNOT MEAN ANYTHING, and says which case it was. The check is only a check if
+    the operator is choosing a passphrase, so it is skipped - rather than guessed at - when the run is
+    not an interactive terminal (a scripted run cannot retype anything, and a prompt nobody can answer
+    must not be reached), when the file already exists (that passphrase is not being chosen, it is being
+    proved, and opening the file below is what proves it), or when there is no password to confirm.
+
+    Each skip returns before any prompting, so a caller can ask its question and get a truthful answer
+    without ever blocking - which is also what makes those paths testable.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()][System.Security.SecureString]$Password,
+        # Whether the target file already exists. The caller decides, because only the caller knows
+        # which file it is about to write.
+        [switch]$ExistingFile
+    )
+
+    if ((Get-WuuInputMode).NonInteractive) {
+        return @{ Confirmed = $true; Skipped = $true; Reason = 'not an interactive terminal' }
+    }
+    if ($ExistingFile) {
+        return @{ Confirmed = $true; Skipped = $true; Reason = 'the file exists, so the passphrase is proved by opening it, not chosen' }
+    }
+    if ($null -eq $Password) {
+        return @{ Confirmed = $true; Skipped = $true; Reason = 'there is no passphrase to confirm' }
+    }
+
+    Write-Host ""
+    $retyped = $null
+    try {
+        $retyped = _WuuReadPassword -Prompt "  Confirm Password"
+    } catch {
+        # A confirm prompt must never be the thing that breaks a save. If the console cannot read a
+        # second time the save proceeds - the operator still has the password they just typed, and
+        # blocking a save on the absence of a check is worse than saving without it and saying so.
+        Write-WarningLog "Password confirmation was unavailable: $($_.Exception.Message)"
+        return @{ Confirmed = $true; Skipped = $true; Reason = 'the confirm prompt could not be read' }
+    }
+
+    $confirmed = Test-WuuPasswordMatch -First $Password -Second $retyped
+    if (-not $confirmed) {
+        Write-Host "  The two passwords do not match - nothing has been saved." -ForegroundColor Yellow
+    }
+    return @{ Confirmed = $confirmed; Skipped = $false; Reason = '' }
+}
+
 function Show-CustomCredentialDialog {
     <#
     .SYNOPSIS Console credential prompt (was the WPF CredentialDialog.xaml dialog).
@@ -860,5 +943,5 @@ function New-WuuComputerListPrompt {
     return ''
 }
 
-Export-ModuleMember -Function @('Protect-Credential', 'Unprotect-Credential', 'Get-RemoteCredentials', 'Resolve-WuuOperationCredential', 'Update-WuuCredentialEpoch', 'Show-PasswordPrompt', 'Show-CustomCredentialDialog', 'Show-CredentialConfigDialog', 'Protect-ComputerListData', 'Unprotect-ComputerListData', 'Save-ComputerListConfig', 'Import-ComputerListConfig', 'Get-WuuComputerListNames', 'Read-WuuConfigFile', 'Write-WuuConfigFile', 'New-WuuComputerListPrompt', 'Get-WuuCredentialStateSignature', 'Test-WuuCredentialStateMatches')
+Export-ModuleMember -Function @('Protect-Credential', 'Unprotect-Credential', 'Get-RemoteCredentials', 'Resolve-WuuOperationCredential', 'Update-WuuCredentialEpoch', 'Show-PasswordPrompt', 'Confirm-WuuPasswordPrompt', 'Test-WuuPasswordMatch', 'Show-CustomCredentialDialog', 'Show-CredentialConfigDialog', 'Protect-ComputerListData', 'Unprotect-ComputerListData', 'Save-ComputerListConfig', 'Import-ComputerListConfig', 'Get-WuuComputerListNames', 'Read-WuuConfigFile', 'Write-WuuConfigFile', 'New-WuuComputerListPrompt', 'Get-WuuCredentialStateSignature', 'Test-WuuCredentialStateMatches')
 

@@ -265,6 +265,77 @@ try {
             Ok 'the config command hands -ListName to the handler as its prompt answer'
         }
     }
+
+    # --- 8. the confirm field on a passphrase that is being CHOSEN -----------------------
+    # Every list in the file shares one passphrase, so a typo while creating it produces a file that
+    # opens with neither entry - and a file the operator cannot identify, holding lists they can no
+    # longer read, is indistinguishable from an empty one at the next load.
+    function Sec([string]$plain) {
+        $s = New-Object System.Security.SecureString
+        foreach ($c in $plain.ToCharArray()) { $s.AppendChar($c) }
+        $s.MakeReadOnly()
+        return $s
+    }
+
+    $matchCases = @(
+        @{ Name = 'identical entries';      A = 'Correct-Horse'; B = 'Correct-Horse'; Want = $true }
+        @{ Name = 'different entries';      A = 'Correct-Horse'; B = 'Wrong-Horse';   Want = $false }
+        @{ Name = 'CASE differs only';      A = 'Password1';     B = 'password1';     Want = $false }
+        @{ Name = 'trailing space differs'; A = 'secret';        B = 'secret ';       Want = $false }
+        @{ Name = 'one character differs';  A = 'Passw0rd';      B = 'PasswOrd';      Want = $false }
+    )
+    $matchWrong = @()
+    foreach ($c in $matchCases) {
+        $got = Test-WuuPasswordMatch -First (Sec $c.A) -Second (Sec $c.B)
+        if ($got -ne $c.Want) { $matchWrong += "$($c.Name) -> $got" }
+    }
+    if ($matchWrong.Count -gt 0) {
+        Bad "the password comparison is wrong for: $($matchWrong -join '; ')"
+    } else {
+        Ok "the password comparison matches on $($matchCases.Count) cases, including case-only and whitespace differences"
+    }
+
+    # An empty retype must be REFUSED, not treated as "no change": it is the one entry an operator can
+    # produce by pressing Enter, and accepting it would save under a passphrase they never set.
+    if (Test-WuuPasswordMatch -First (Sec 'abc') -Second $null) {
+        Bad 'an empty confirmation is treated as a match'
+    } else {
+        Ok 'an empty confirmation is refused'
+    }
+
+    # The prompt must SKIP - and return before reaching a prompt - when the check cannot mean anything.
+    # Each of these would otherwise be a way for the save to block with nobody able to answer.
+    Initialize-WuuInputMode -NonInteractive -Answers @()
+    try {
+        $n = Confirm-WuuPasswordPrompt -Password (Sec 'abc')
+    } finally { Initialize-WuuInputMode -NonInteractive:$false }
+    if (-not $n.Confirmed -or -not $n.Skipped) {
+        Bad "the confirm field ran in a non-interactive run (Confirmed=$($n.Confirmed) Skipped=$($n.Skipped))"
+    } else {
+        Ok 'the confirm field skips itself in a non-interactive run (nothing can retype, and nothing blocks)'
+    }
+    if ((Get-WuuInputMode).AnswersUsed -ne 0) {
+        Bad 'the confirm field consumed a queued answer even though it skipped'
+    } else {
+        Ok 'a skipped confirm field consumes no queued answer (the answer queue is not shifted)'
+    }
+
+    $e = Confirm-WuuPasswordPrompt -Password (Sec 'abc') -ExistingFile
+    if (-not $e.Confirmed -or -not $e.Skipped) {
+        Bad "the confirm field prompted for a passphrase that is being proved, not chosen (Skipped=$($e.Skipped))"
+    } else {
+        Ok 'an existing file is not asked to confirm - that passphrase is proved by opening the file'
+    }
+
+    # ...and the save handler must actually consult it, only on the create path. A check nobody calls
+    # is not a check, and one that runs on every save is friction over a password already in use.
+    $coreSave = [regex]::Match((Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw),
+        'Confirm-WuuPasswordPrompt[\s\S]{0,240}?-ExistingFile').Value
+    if (-not $coreSave) {
+        Bad 'the save path never calls Confirm-WuuPasswordPrompt, or does not gate it on the file existing'
+    } else {
+        Ok 'the save path confirms a new passphrase, and only when the file would be created'
+    }
 } finally {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }

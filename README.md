@@ -234,6 +234,11 @@ Three things this design guarantees, because each is a way an operator could oth
 a prompt and mean opposite things. Nothing is written, and every list already in the file survives.
 * **A same-named list is not silently replaced.** Saving over an existing name is refused unless you
 confirm (interactively) or pass `-AllowOverwrite`.
+* **A new passphrase is typed twice.** Every list in a file shares one passphrase, so a typo while
+creating it produces a file that opens with *neither* entry — and a file you cannot identify, holding
+lists you can no longer read, looks exactly like an empty one at the next load. The confirmation runs
+only when the file would be created: an existing passphrase is not being chosen, it is being proved,
+and opening the file is what proves it.
 * **An older single-list file still works, and is not modified by reading it.** It is read as a list
 named `default` and is upgraded the next time you save. Merely opening the tool never rewrites your
 only copy.
