@@ -130,6 +130,49 @@ $mutatingTopLevel = @($tree | Where-Object { $_.ContainsKey('Mutating') -and $_.
 if ($mutatingTopLevel.Count) { Fail 'top-level navigation exposes a mutating operation' } else { Pass 'no mutating operation at the top level' }
 
 # ---------------------------------------------------------------------------------------
+# 5a. AUTOMATION must be reachable from the guided workflow, and its state VISIBLE.
+#
+# Before this, automation settings existed and the flat menu could toggle them, but the guided
+# workflow - the DEFAULT entry path - had no way to set or even see them. An operator using the
+# guided UI therefore could neither enable nor discover the automatic behaviours, and the
+# instruction set requires the operator always be able to determine what automation is enabled.
+# The settings engine was fine; the interface did not reach it.
+$automationCategory = $tree | Where-Object { $_.Id -eq 'AUTOMATION' }
+if (-not $automationCategory) {
+    Fail 'the guided navigation has no AUTOMATION category - automatic behaviour cannot be reached or seen from the default interface'
+} else { Pass 'the guided navigation exposes an AUTOMATION category' }
+
+$autoItems = @(Get-WuuAutomationMenu)
+if ($autoItems.Count -eq 0) { Fail 'the automation menu is empty' }
+else { Pass "the automation menu lists $($autoItems.Count) entry(ies)" }
+
+# The master control must be reachable, wired by name to the SAME handler the flat menu uses.
+if (-not ($autoItems | Where-Object { $_.Handler -eq 'EventToggleSettings' })) {
+    Fail 'the automation menu does not offer the master toggle (EventToggleSettings)'
+} else { Pass 'the automation menu offers the master automation toggle' }
+
+# Every automation entry needs a dispatch key, like every other category.
+$autoUndispatched = @($autoItems | Where-Object {
+        -not $_.ContainsKey('Handler') -and -not $_.ContainsKey('Preflight') -and
+        -not $_.ContainsKey('Starts') -and $_.Key -ne 'b'
+    })
+if ($autoUndispatched.Count -gt 0) { Fail "$($autoUndispatched.Count) automation entry(ies) dispatch to nothing" }
+else { Pass 'every automation menu entry dispatches to something' }
+
+# The workflow loop must actually dispatch the new state, or the category is unreachable.
+$navRawAuto = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Navigate.psm1') -Raw
+if ($navRawAuto -notmatch "'AUTOMATION'\s*\{\s*\`$state = Show-WuuCategoryScreen") {
+    Fail "the workflow loop has no dispatch for the 'AUTOMATION' state - the category would be a dead menu entry"
+} else { Pass "the workflow loop dispatches the 'AUTOMATION' state" }
+
+# ...and the DASHBOARD must SHOW the automation state, so the operator can determine it without
+# navigating. A setting that is only visible inside a submenu is one an operator forgets.
+$dashboardBody = [regex]::Match($navRawAuto, '(?s)function Show-WuuDashboardScreen.*?(?=\nfunction )').Value
+if ($dashboardBody -notmatch 'AutoDownload') {
+    Fail 'the dashboard does not show the automation state - the operator cannot tell what automation is enabled without navigating into a submenu'
+} else { Pass 'the dashboard reports the automation state' }
+
+# ---------------------------------------------------------------------------------------
 # 6. Every menu entry resolves to a handler that EXISTS IN THE ACTION LAYER (spec 23)
 # ---------------------------------------------------------------------------------------
 # $consoleActions is assembled inside Start-WuuApplication, so it is not available from a bare

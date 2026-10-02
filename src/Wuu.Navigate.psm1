@@ -52,10 +52,11 @@ function Get-WuuNavigationTree {
         @{ Id = 'UPDATES';     Key = '1'; Label = 'Update management' }
         @{ Id = 'COMPUTERS';   Key = '2'; Label = 'Computer management' }
         @{ Id = 'DEPLOYMENT';  Key = '3'; Label = 'Deployment phases' }
-        @{ Id = 'CREDENTIALS'; Key = '4'; Label = 'Credentials' }
-        @{ Id = 'DIAGNOSTICS'; Key = '5'; Label = 'Diagnostics' }
-        @{ Id = 'REPORTS';     Key = '6'; Label = 'Reports / audit' }
-        @{ Id = 'SAVE';        Key = '7'; Label = 'Save computer set' }
+        @{ Id = 'AUTOMATION';  Key = '4'; Label = 'Automation' }
+        @{ Id = 'CREDENTIALS'; Key = '5'; Label = 'Credentials' }
+        @{ Id = 'DIAGNOSTICS'; Key = '6'; Label = 'Diagnostics' }
+        @{ Id = 'REPORTS';     Key = '7'; Label = 'Reports / audit' }
+        @{ Id = 'SAVE';        Key = '8'; Label = 'Save computer set' }
         @{ Id = 'ADVANCED';    Key = '9'; Label = 'Advanced (all operations)' }
         @{ Id = 'EXIT';        Key = 'q'; Label = 'Exit' }
     )
@@ -135,6 +136,32 @@ function Get-WuuCredentialMenu {
         @{ Key = '1'; Label = 'Set domain credentials';        Handler = 'EventSetDomainCredentials';    Mutating = $false }
         @{ Key = '2'; Label = 'Test credentials (pre-flight)'; Preflight = 'check';                      Mutating = $false }
         @{ Key = 'b'; Label = 'Back';                          Handler = '';                             Mutating = $false }
+    )
+}
+
+function Get-WuuAutomationMenu {
+    <#
+    .SYNOPSIS Automation settings (instructions SS15/SS16).
+    .DESCRIPTION
+    The guided workflow is the DEFAULT entry path, and it had no automation entry at all: the
+    settings existed, the flat menu could toggle them, and an operator using the guided UI could
+    neither set nor even SEE them. That is the same class as any other unwired feature - it exists
+    and is unreachable - except worse, because the thing it hides decides whether a check silently
+    rolls forward into downloads, installs and reboots.
+
+    The master toggle is wired by NAME to EventToggleSettings, the same handler the flat menu's `t`
+    key uses, so the two entry points cannot implement different rules.
+
+    The other three entries are PRE-FLIGHT entries, deliberately: this build has no background
+    daemon, so there is nothing to configure the automation OF except connectivity and credentials.
+    Inventing separate "configure AutoDownload" screens would be a second place for one setting to
+    live, which the instruction set forbids.
+    #>
+    @(
+        @{ Key = '1'; Label = 'Switch ALL automation on/off (master)'; Handler = 'EventToggleSettings'; Mutating = $false }
+        @{ Key = '2'; Label = 'Test connectivity (pre-flight)';       Preflight = 'check';                     Mutating = $false }
+        @{ Key = '3'; Label = 'Test credentials (pre-flight)';        Preflight = 'check';                     Mutating = $false }
+        @{ Key = 'b'; Label = 'Back';                                Mutating = $false }
     )
 }
 
@@ -486,6 +513,26 @@ function Show-WuuDashboardScreen {
     Write-Host ("  COMPUTER SET: {0}{1}" -f $summary.Name, $(if ($Ctx.Set.IsSaved) { '' } else { '  (unsaved)' })) -ForegroundColor White
     Write-Host ("  Computers: {0}" -f $summary.Total)
     if ($Ctx.LastOperation) { Write-Host ("  Last operation: {0}" -f $Ctx.LastOperation) -ForegroundColor DarkGray }
+
+    # Automation state, shown HERE rather than only inside the Automation submenu. A setting an
+    # operator has to navigate to discover is one they forget, and this one decides whether a check
+    # silently rolls forward into downloads, installs and reboots. It is read from the store, which
+    # is the single source of truth - the same values the worker gates read.
+    $settings = $Ctx.Set.Store.Settings
+    $dlOn = [bool]$settings.AutoDownload
+    $ilOn = [bool]$settings.AutoInstall
+    $rbOn = [bool]$settings.AutoReboot
+    $allOn = $dlOn -and $ilOn -and $rbOn
+    $anyOn = $dlOn -or $ilOn -or $rbOn
+    if ($allOn) {
+        Write-Host '  Automation: ALL ON - a check continues into download, install and reboot' -ForegroundColor Yellow
+    } elseif ($anyOn) {
+        # Mixed is stated as its parts, because "MIXED" alone tells the operator nothing actionable.
+        Write-Host ("  Automation: PARTIAL - download {0}, install {1}, reboot {2}" -f `
+            $(if ($dlOn) { 'ON' } else { 'off' }), $(if ($ilOn) { 'ON' } else { 'off' }), $(if ($rbOn) { 'ON' } else { 'off' })) -ForegroundColor Yellow
+    } else {
+        Write-Host '  Automation: all off - operations stop after each step' -ForegroundColor DarkGray
+    }
 
     # The live table (existing renderer - reused, not reimplemented).
     Write-WuuStatusTable -Store $Ctx.Set.Store
@@ -1586,6 +1633,7 @@ function Start-WuuGuidedWorkflow {
             'UPDATES'      { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'UPDATE MANAGEMENT' -Items @(Get-WuuUpdateManagementMenu) -State 'UPDATES' }
             'COMPUTERS'    { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'COMPUTER MANAGEMENT' -Items @(Get-WuuComputerManagementMenu) -State 'COMPUTERS' }
             'DEPLOYMENT'   { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'DEPLOYMENT PHASES' -Items @(Get-WuuDeploymentMenu) -State 'DEPLOYMENT' }
+            'AUTOMATION'   { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'AUTOMATION' -Items @(Get-WuuAutomationMenu) -State 'AUTOMATION' }
             'CREDENTIALS'  { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'CREDENTIALS' -Items @(Get-WuuCredentialMenu) -State 'CREDENTIALS' }
             'DIAGNOSTICS'  { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'DIAGNOSTICS' -Items @(Get-WuuDiagnosticsMenu) -State 'DIAGNOSTICS' }
             'REPORTS'      { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'REPORTS / AUDIT' -Items @(Get-WuuReportsMenu) -State 'REPORTS' }
@@ -1615,6 +1663,7 @@ Export-ModuleMember -Function @(
     'Get-WuuUpdateManagementMenu'
     'Get-WuuComputerManagementMenu'
     'Get-WuuDeploymentMenu'
+    'Get-WuuAutomationMenu'
     'Get-WuuDiagnosticsMenu'
     'Get-WuuCredentialMenu'
     'Get-WuuReportsMenu'
