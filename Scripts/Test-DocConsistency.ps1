@@ -76,5 +76,33 @@ if (-not (Test-Path $docPathDC)) {
                 Pass 'SS45 states no current line counts that would rot (SS40)'
             }
         }
+
+        # GATE CITATIONS. Appendix A names a gate block per invariant, and a block is FOUND BY ITS
+        # LETTER - so a citation to a letter that no block declares is a pointer to nothing, and the
+        # reader cannot locate the evidence. This is not hypothetical: invariant 8.1 cited "(u)" while
+        # the letters ran s t v w x y z and no (u) existed, so the check that enforces one-operation-
+        # per-computer was unfindable from the table that claims it.
+        #
+        # Measured against the corpus, not against the gate alone: a letter belongs to whichever
+        # Scripts file declares it, and fragments are where most of them now live.
+        $citedDC = @([regex]::Matches($docTextDC, '\(([a-z]{1,2})\)') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        $declaredDC = @()
+        foreach ($fDC in @(Get-ChildItem -Path (Join-Path $root 'Scripts') -Filter '*.ps1' -File)) {
+            $textDC = [System.IO.File]::ReadAllText($fDC.FullName)
+            $declaredDC += @([regex]::Matches($textDC, '(?m)^# \(([a-z]{1,2})\)') |
+                ForEach-Object { $_.Groups[1].Value })
+        }
+        $declaredDC = @($declaredDC | Sort-Object -Unique)
+        $danglingDC = @($citedDC | Where-Object { $declaredDC -notcontains $_ })
+        if ($citedDC.Count -eq 0) {
+            Fail 'the document cites no gate blocks at all - either the citations were lost or this check has gone blind (SS40)'
+        } elseif ($declaredDC.Count -lt 20) {
+            Fail "only $($declaredDC.Count) gate block header(s) were found in Scripts - the corpus is not being read, so this check would pass vacuously (SS40)"
+        } elseif ($danglingDC.Count -gt 0) {
+            Fail ("the document cites gate block(s) that do not exist: {0} - a citation is how a reader finds the evidence, so a dangling one points at nothing (SS40)" -f (($danglingDC | ForEach-Object { "($_)" }) -join ', '))
+        } else {
+            Pass "every gate block cited by the document exists ($($citedDC.Count) cited, $($declaredDC.Count) declared) (SS40)"
+        }
     }
 }

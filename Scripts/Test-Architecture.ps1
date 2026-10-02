@@ -47,6 +47,11 @@ foreach ($setting in @('AutoDownload', 'AutoInstall', 'AutoReboot')) {
 }
 if (-not $failed) { Pass 'all three automatic behaviours are gated on $stateStore.Settings' }
 
+# (u) ONE ACTIVE OPERATION PER COMPUTER (brief SS3 / invariant 8.1). The gate must be consulted at the
+#     submission point, the row must be marked Running so the gate can ever say "busy", and the claim
+#     must use the sanctioned adoption path if it goes through the mutation funnel. Appendix A cites
+#     this block for invariant 8.1, so the header is load-bearing: without it the citation pointed at
+#     nothing and a reader could not find the check.
 $supBody = Get-WuuFunctionBody $wupdRaw 'Start-UpdateCheckJob'
 if (-not $supBody) { Fail 'could not locate Start-UpdateCheckJob' }
 else {
