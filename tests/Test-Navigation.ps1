@@ -630,7 +630,13 @@ if ($null -ne $resCtx.Preflight) { Fail 'retry did not clear the stale pre-fligh
 else { Pass 'retry clears the stale pre-flight (a retry must re-verify)' }
 
 # The results screen must offer a way out, not only a way back to the dashboard.
-Initialize-WuuInputMode -NonInteractive -Answers @('6')
+#
+# Driven by NUMBER, and the number moved from 6 to 7 when the deployment report was added as
+# option 5. That is a genuine UI change rather than a test being adjusted to pass: the assertion's
+# subject is "the screen offers a way out", and Exit is still offered - it is now the last entry,
+# after the report and Back. What must NOT change is that 7 leaves the workflow; if a future edit
+# silently repointed that key at another screen, this still fails.
+Initialize-WuuInputMode -NonInteractive -Answers @('7')
 if ((Show-WuuResultsScreen -Ctx $resCtx) -ne 'EXIT') { Fail 'results screen has no working Exit' }
 else { Pass 'spec 15: results screen offers exit' }
 

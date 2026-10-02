@@ -148,10 +148,11 @@ function Get-WuuReportsMenu {
     menu entry (the exact defect that made AD import unreachable).
     #>
     @(
-        @{ Key = '1'; Label = 'View audit history';        AuditSubVerb = 'show';   Mutating = $false }
-        @{ Key = '2'; Label = 'Verify audit chain';        AuditSubVerb = 'verify'; Mutating = $false }
-        @{ Key = '3'; Label = 'Export audit bundle';       AuditSubVerb = 'export'; Mutating = $false }
-        @{ Key = '4'; Label = 'Export computer list';      Handler = 'EventSaveComputerList'; Mutating = $false }
+        @{ Key = '1'; Label = 'Deployment report';        Report = $true;          Mutating = $false }
+        @{ Key = '2'; Label = 'View audit history';        AuditSubVerb = 'show';   Mutating = $false }
+        @{ Key = '3'; Label = 'Verify audit chain';        AuditSubVerb = 'verify'; Mutating = $false }
+        @{ Key = '4'; Label = 'Export audit bundle';       AuditSubVerb = 'export'; Mutating = $false }
+        @{ Key = '5'; Label = 'Export computer list';      Handler = 'EventSaveComputerList'; Mutating = $false }
         @{ Key = 'b'; Label = 'Back';                      Mutating = $false }
     )
 }
@@ -556,6 +557,10 @@ function Show-WuuCategoryScreen {
     foreach ($item in $Items) {
         if ($item.Key -eq $sel) {
             if ($sel -eq 'b' -or $sel -eq 'q') { return 'DASHBOARD' }
+            # The deployment report is a reporting ENGINE operation (Wuu.Reporting), not an
+            # action-layer handler, so it hands off to its own screen where the window can be
+            # chosen - the same reason audit subverbs are dispatched here rather than by Handler.
+            if ($item.ContainsKey('Report')) { return 'REPORT' }
             # Audit subverbs are command-layer operations, not action-layer handlers (spec 20).
             if ($item.ContainsKey('AuditSubVerb')) {
                 Invoke-WuuAuditSubVerb -Ctx $Ctx -SubVerb $item.AuditSubVerb
@@ -587,8 +592,111 @@ function Show-WuuCategoryScreen {
     return $State
 }
 
-function Invoke-WuuAuditSubVerb {
-    # Runs `audit verify|show|export` via the same path the command surface uses. Export is handed
+function Show-WuuReportScreen {
+    <#
+    .SYNOPSIS Spec 20: the deployment report, with its window chosen interactively.
+    .DESCRIPTION
+    CALLS THE SAME ENGINE as `wuu report`. Spec 23/24 require the guided UI and the command surface
+    to invoke the same operations, and this is the stronger form of that rule: not merely a shared
+    action, but the same FUNCTIONS (Get-WuuAuditHistory / Get-WuuDeploymentReport /
+    Format-WuuReportTable / Export-WuuDeploymentReport). If the two entry points could diverge, a
+    number quoted from the menu could disagree with the number quoted from the CLI for the same
+    window, which is exactly the kind of discrepancy that makes a report untrustworthy.
+
+    Every prompt goes through Read-WuuAnswer, so this screen is drivable from a test and cannot
+    block an unattended run.
+    #>
+    param([Parameter(Mandatory)]$Ctx)
+
+    Write-WuuHeader 'DEPLOYMENT REPORT'
+
+    # Window presets rather than a free-text period: the operator picking "last 7 days" from a menu
+    # should not have to remember the '<n>d' grammar, and the CLI still offers it for scripts.
+    Write-Host '  1. Last 24 hours'
+    Write-Host '  2. Last 7 days'
+    Write-Host '  3. Last 30 days'
+    Write-Host '  4. Everything recorded'
+    Write-Host '  b. Back'
+    $periodChoice = [string](Read-WuuAnswer -Prompt '  Period' -Default '2')
+    $period = switch ($periodChoice.Trim().ToLowerInvariant()) {
+        '1' { '24h' }
+        '2' { '7d' }
+        '3' { '30d' }
+        '4' { 'all' }
+        'b' { 'BACK' }
+        default { 'BACK' }
+    }
+    if ($period -eq 'BACK') { return 'REPORTS' }
+
+    # Ask which audit source BEFORE reading, so a missing store is a clear message rather than an
+    # empty table the operator has to interpret.
+    $dir = Get-WuuAuditDirectory
+    $files = @(Get-ChildItem -LiteralPath $dir -Filter 'audit-*.jsonl' -File -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) {
+        Write-Host ''
+        Write-Host '  No audit trail found - nothing has been recorded on this machine yet.' -ForegroundColor Yellow
+        Write-Host ("  Reporting reads {0}" -f $dir) -ForegroundColor DarkGray
+        $null = Read-WuuAnswer -Prompt '  Press Enter to continue' -Default ''
+        return 'REPORTS'
+    }
+
+    $history = Get-WuuAuditHistory -Period $period
+    if (-not $history.Ok) {
+        Write-Host ("  Could not read the audit trail: {0}" -f $history.Error) -ForegroundColor Red
+        $null = Read-WuuAnswer -Prompt '  Press Enter to continue' -Default ''
+        return 'REPORTS'
+    }
+
+    $report = Get-WuuDeploymentReport -Records $history.Records -GroupBy Day
+    Format-WuuReportTable -Report $report -Window $history -Top 5
+
+    Write-Host '  Next actions:'
+    Write-Host '    1. Wider window'
+    Write-Host '    2. Export these runs to CSV'
+    Write-Host '    3. Export failing targets to CSV'
+    Write-Host '    4. Verify the audit chain'
+    Write-Host '    5. Back to Reports'
+    $next = [string](Read-WuuAnswer -Prompt '  Selection' -Default '5')
+    switch ($next.Trim().ToLowerInvariant()) {
+        '1' { return 'REPORT' }
+        '2' { return (Invoke-WuuReportExportScreen -Report $report -Dataset 'Runs') }
+        '3' { return (Invoke-WuuReportExportScreen -Report $report -Dataset 'Targets') }
+        '4' { Invoke-WuuAuditSubVerb -Ctx $Ctx -SubVerb 'verify'; return 'REPORTS' }
+        default { return 'REPORTS' }
+    }
+}
+
+function Invoke-WuuReportExportScreen {
+    # Writes a report dataset to a path the operator supplies. Kept as its own function so both
+    # export choices share one prompt-and-report path, and so a failure names the DATASET as well
+    # as the error - "could not write" without saying what is a message the operator cannot act on.
+    param(
+        [Parameter(Mandatory)]$Report,
+        [Parameter(Mandatory)][string]$Dataset
+    )
+
+    $target = [string](Read-WuuAnswer -Prompt ("  Path for the {0} CSV" -f $Dataset.ToLowerInvariant()) -Default '')
+    if ([string]::IsNullOrWhiteSpace($target)) {
+        Write-Host '  Cancelled - nothing was written.' -ForegroundColor Yellow
+        return 'REPORTS'
+    }
+
+    $export = Export-WuuDeploymentReport -Report $Report -Path $target.Trim() -Dataset $Dataset
+    Write-Host ''
+    if ($export.Success) {
+        Write-Host ("  Wrote {0} row(s) of '{1}' to {2}" -f $export.Rows, $Dataset, $target.Trim()) -ForegroundColor Green
+        if ($export.Rows -eq 0) {
+            # Say WHY it is empty. A header-only file is correct but looks like a bug otherwise.
+            Write-Host '  (No rows matched - the file holds only its header.)' -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host ("  Could not write '{0}': {1}" -f $target.Trim(), $export.Error) -ForegroundColor Red
+    }
+    $null = Read-WuuAnswer -Prompt '  Press Enter to continue' -Default ''
+    return 'REPORTS'
+}
+
+function Invoke-WuuAuditSubVerb {    # Runs `audit verify|show|export` via the same path the command surface uses. Export is handed
     # the set's STORE because the operator is working in a computer set (spec 6) - the command-layer
     # default would export the saved config file instead of the set they are looking at.
     param([Parameter(Mandatory)]$Ctx, [Parameter(Mandatory)][string]$SubVerb)
@@ -1315,10 +1423,13 @@ function Show-WuuResultsScreen {
     Write-Host '    2. View errors'
     Write-Host '    3. Update history'
     Write-Host '    4. Export audit bundle'
-    Write-Host '    5. Back to dashboard'
-    Write-Host '    6. Exit'
+    Write-Host '    5. Deployment report (fleet history)'
+    Write-Host '    6. Back to dashboard'
+    Write-Host '    7. Exit'
 
-    $choice = [string](Read-WuuAnswer -Prompt '  Selection' -Default '5')
+    # Default moved to 6 because the new report entry took slot 5 and Enter must still mean
+    # "carry on" - landing on the report would turn a reflexive Enter into a slow audit scan.
+    $choice = [string](Read-WuuAnswer -Prompt '  Selection' -Default '6')
     switch ($choice.Trim().ToLowerInvariant()) {
         '1' {
             $targets = @(($failed + $timedOut) | ForEach-Object { $_.Computer })
@@ -1337,7 +1448,8 @@ function Show-WuuResultsScreen {
         '2' { Invoke-WuuGuidedHandler -Ctx $Ctx -Handler 'GetErrors'; return 'RESULTS' }
         '3' { Invoke-WuuGuidedHandler -Ctx $Ctx -Handler 'EventShowUpdateHistory'; return 'RESULTS' }
         '4' { Invoke-WuuAuditSubVerb -Ctx $Ctx -SubVerb 'export'; return 'RESULTS' }
-        '6' { return 'EXIT' }
+        '5' { return 'REPORT' }
+        '7' { return 'EXIT' }
         default { return 'DASHBOARD' }
     }
 }
@@ -1443,6 +1555,7 @@ function Start-WuuGuidedWorkflow {
             'CREDENTIALS'  { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'CREDENTIALS' -Items @(Get-WuuCredentialMenu) -State 'CREDENTIALS' }
             'DIAGNOSTICS'  { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'DIAGNOSTICS' -Items @(Get-WuuDiagnosticsMenu) -State 'DIAGNOSTICS' }
             'REPORTS'      { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'REPORTS / AUDIT' -Items @(Get-WuuReportsMenu) -State 'REPORTS' }
+            'REPORT'       { $state = Show-WuuReportScreen -Ctx $ctx }
             'ADVANCED'     { $state = Show-WuuAdvancedScreen -Ctx $ctx }
             'PREFLIGHT'    { $state = Show-WuuPreflightScreen -Ctx $ctx }
             'CONFIRM'      { $state = Show-WuuOperationConfirmationScreen -Ctx $ctx }
@@ -1479,6 +1592,8 @@ Export-ModuleMember -Function @(
     'Show-WuuComputerSetReviewScreen'
     'Show-WuuDashboardScreen'
     'Show-WuuCategoryScreen'
+    'Show-WuuReportScreen'
+    'Invoke-WuuReportExportScreen'
     'Show-WuuAdvancedScreen'
     'Show-WuuPreflightScreen'
     'Show-WuuOperationConfirmationScreen'

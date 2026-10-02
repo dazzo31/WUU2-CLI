@@ -272,9 +272,119 @@ try {
     if (-not $cliRes.Ok -or $cliRes.Runs -ne 1) { Bad "the CLI path did not report the fixture log (Ok=$($cliRes.Ok) Runs=$($cliRes.Runs))" }
     else { Ok 'the CLI reports only the named -LogPath file (1 run, not the host''s own history)' }
 
-    # --- 13. read-only over the synthetic log ----------------------------------------
+    # --- 14. GUIDED UI (phase 2) ------------------------------------------------------
+    # A stub action map: the guided screens resolve handlers by NAME out of this object, so the
+    # reporting screen must work with the same shape the real one has. Only the audit subverb path
+    # is exercised here, and that is a command-layer call, not an action.
+    $script:uiActions = [hashtable]::Synchronized(@{})
+    foreach ($h in @('EventDeploymentReport', 'EventSaveComputerList')) {
+        $script:uiActions[$h] = { param() }
+    }
+
+    # The menu must OFFER the report, and choosing it must hand off to a state the workflow
+    # loop actually dispatches. An entry that returns a state nobody handles is the "dead menu
+    # entry" defect this codebase has hit before (the AD-import handler existed for months,
+    # reachable from no menu).
+    $reportItems = @(Get-WuuReportsMenu)
+    $reportEntry = @($reportItems | Where-Object { $_.ContainsKey('Report') })
+    if ($reportEntry.Count -ne 1) { Bad "the Reports menu does not offer exactly one report entry (found $($reportEntry.Count))" }
+    else { Ok 'the Reports menu offers the deployment report' }
+
+    # Every entry needs ONE dispatch key: Handler, AuditSubVerb, Preflight, Starts or Report.
+    $undispatched = @($reportItems | Where-Object {
+            -not $_.ContainsKey('Handler') -and -not $_.ContainsKey('AuditSubVerb') -and
+            -not $_.ContainsKey('Preflight') -and -not $_.ContainsKey('Starts') -and
+            -not $_.ContainsKey('Report') -and $_.Key -ne 'b'
+        })
+    if ($undispatched.Count -gt 0) { Bad "$($undispatched.Count) Reports entry(ies) dispatch to nothing" }
+    else { Ok 'every Reports menu entry dispatches to something' }
+
+    $uiCtx = [pscustomobject]@{ Set = $null; Store = (New-WuuStateStore); Actions = $script:uiActions; AuditHook = $null; DenialHook = $null }
+
+    Initialize-WuuInputMode -NonInteractive -Answers @('1')
+    try { $nextState = Show-WuuCategoryScreen -Ctx $uiCtx -Title 'REPORTS / AUDIT' -Items $reportItems -State 'REPORTS' }
+    finally { Initialize-WuuInputMode -NonInteractive:$false }
+    if ($nextState -ne 'REPORT') { Bad "choosing the report entry returned '$nextState', not the REPORT state" }
+    else { Ok 'choosing the report entry hands off to the REPORT state' }
+
+    # The state must be one the workflow loop dispatches, or the hand-off dead-ends.
+    $navRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Navigate.psm1') -Raw
+    if ($navRaw -notmatch "'REPORT'\s*\{\s*\`$state = Show-WuuReportScreen") {
+        Bad "the workflow loop has no dispatch for the 'REPORT' state - the hand-off dead-ends"
+    } else { Ok "the workflow loop dispatches the 'REPORT' state" }
+
+    # Back must still work from the category screen after the new entry was inserted.
+    Initialize-WuuInputMode -NonInteractive -Answers @('b')
+    try { $backState = Show-WuuCategoryScreen -Ctx $uiCtx -Title 'REPORTS / AUDIT' -Items $reportItems -State 'REPORTS' }
+    finally { Initialize-WuuInputMode -NonInteractive:$false }
+    if ($backState -ne 'DASHBOARD') { Bad "Back returned '$backState' instead of DASHBOARD" }
+    else { Ok 'Back still leaves the Reports menu for the dashboard' }
+
+    # The screen drives the same engine, so the menu and the CLI cannot disagree.
+    $screenOut = ''
+    try {
+        Initialize-WuuInputMode -NonInteractive -Answers @('4', '5')
+        try { $screenOut = (& { Show-WuuReportScreen -Ctx $uiCtx } 6>&1 | Out-String) }
+        finally { Initialize-WuuInputMode -NonInteractive:$false }
+        Ok 'the guided report screen runs and returns'
+    } catch {
+        Bad "the guided report screen threw: $($_.Exception.Message)"
+    }
+    if ($screenOut -match 'WUU2 DEPLOYMENT REPORT') { Ok 'the guided screen renders the same report the CLI produces' }
+    else { Bad 'the guided screen did not render the report' }
+
+    # Every period preset must resolve - a preset that silently became 'BACK' would look like a
+    # dead menu entry to the operator.
+    $presetsOk = $true
+    foreach ($preset in @('1', '2', '3', '4')) {
+        Initialize-WuuInputMode -NonInteractive -Answers @($preset, '5')
+        try { $st = Show-WuuReportScreen -Ctx $uiCtx } finally { Initialize-WuuInputMode -NonInteractive:$false }
+        if ($st -ne 'REPORTS') { $presetsOk = $false }
+    }
+    if (-not $presetsOk) { Bad 'a period preset did not complete and return to REPORTS' }
+    else { Ok 'all four period presets (24h/7d/30d/all) run and return to the menu' }
+
+    # Export from the menu writes a file...
+    $guidedCsv = Join-Path $sandbox 'guided.csv'
+    Initialize-WuuInputMode -NonInteractive -Answers @($guidedCsv)
+    try { $gRes = Invoke-WuuReportExportScreen -Report $r -Dataset Runs } finally { Initialize-WuuInputMode -NonInteractive:$false }
+    if (-not (Test-Path $guidedCsv)) { Bad 'exporting from the menu wrote no file' }
+    elseif ($gRes -ne 'REPORTS') { Bad "the export screen returned '$gRes' instead of REPORTS" }
+    else { Ok 'the guided export writes the CSV and returns to the menu' }
+
+    # ...and a cancelled export writes NOTHING (a header-only file would look like a successful
+    # export of an empty dataset, which is a different thing).
+    $cancelCsv = Join-Path $sandbox 'guided-cancelled.csv'
+    Initialize-WuuInputMode -NonInteractive -Answers @('')
+    try { $cRes = Invoke-WuuReportExportScreen -Report $r -Dataset Runs } finally { Initialize-WuuInputMode -NonInteractive:$false }
+    if (Test-Path $cancelCsv) { Bad 'a cancelled export still wrote a file' }
+    elseif ($cRes -ne 'REPORTS') { Bad "a cancelled export returned '$cRes'" }
+    else { Ok 'a cancelled export writes nothing and returns quietly' }
+
+    # The flat menu entry must point at a handler that EXISTS. Its dispatcher calls $a.Run and
+    # discards the return value, so an entry returning a workflow state would go nowhere - which
+    # is why it delegates to the screen through an action-layer wrapper.
+    $flat = @(Get-WuuMenuActions)
+    $flatReport = @($flat | Where-Object { $_.Handler -eq 'EventDeploymentReport' })
+    if ($flatReport.Count -ne 1) { Bad 'the flat menu does not offer the deployment report' }
+    elseif ($flatReport[0].Mutating) { Bad 'the flat-menu report entry is flagged as mutating' }
+    else { Ok 'the flat menu offers the deployment report as a read-only action' }
+
+    $coreRaw2 = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
+    if ($coreRaw2 -notmatch '\$consoleActions\.EventDeploymentReport\s*=') {
+        Bad 'the flat menu references EventDeploymentReport but no such console action is registered (dead menu entry)'
+    } else { Ok 'EventDeploymentReport is registered in $consoleActions (the flat entry is reachable)' }
+
+    # Spec 15: the report is reachable after an operation, not only from the Reports menu.
+    # The option MOVED as the results screen grew, so the assertion is on the LABEL rather than on
+    # a number: pinning the digit here would make an unrelated menu edit fail this suite.
+    if ($navRaw -notmatch 'Deployment report \(fleet history\)' -or $navRaw -notmatch "return 'REPORT'") {
+        Bad 'the results screen does not offer the deployment report (spec 15)'
+    } else { Ok 'the results screen offers the report and maps it to the REPORT state (spec 15)' }
+
+    # --- 15. read-only over the synthetic log ----------------------------------------
     $before = (Get-FileHash -LiteralPath $log -Algorithm SHA256).Hash
-    $null = Invoke-WuuReportCommand -Period 'all'
+    $null = Invoke-WuuReportCommand -Period 'all' -LogPath $log
     $null = Get-WuuDeploymentReport -Records (Get-WuuAuditHistory -LogPath $log -Period 'all').Records
     $after = (Get-FileHash -LiteralPath $log -Algorithm SHA256).Hash
     if ($before -ne $after) { Bad 'reporting MODIFIED the audit log - the trail must be read-only to reporting' }

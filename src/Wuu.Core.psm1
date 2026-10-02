@@ -2799,6 +2799,19 @@ in Phase 4). Non-mutating actions run immediately.
 $consoleActions = [hashtable]::Synchronized(@{ Quit = $false })
 
 # --- helpers -----------------------------------------------------------------------------
+# The deployment report behind the flat menu's [y] key and the GUIDED Reports menu.
+#
+# It is an action-layer entry because THAT is what the flat menu can dispatch: its loop calls
+# $a.Run and discards the return value, so an entry that returned a workflow state would go
+# nowhere. It delegates to Show-WuuReportScreen - the same screen the guided workflow uses - which
+# is why the two paths cannot report different numbers for the same window. The screen is
+# documented as returning a state, which this wrapper deliberately ignores: from the flat menu
+# there is no workflow to navigate, so 'back' simply returns to the menu it came from.
+$consoleActions.EventDeploymentReport = {
+    $ctx = [pscustomobject]@{ Actions = $consoleActions; Store = $stateStore; Set = $null }
+    $null = Show-WuuReportScreen -Ctx $ctx
+}
+
 $consoleActions.ShowHelp = {
     Write-Host ''
     Write-Host '  WUU2-CLI - console Windows Update utility' -ForegroundColor White

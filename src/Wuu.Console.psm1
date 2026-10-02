@@ -149,6 +149,7 @@ function Get-WuuMenuActions {
         @{ Key = 'l';  Label = 'Load encrypted config';       Mutating = $false; Handler = 'EventLoadConfig';                   Run = { param($ctx) & $ctx.EventLoadConfig } }
         @{ Key = 'd';  Label = 'Set domain credentials';      Mutating = $false; Handler = 'EventSetDomainCredentials';         Run = { param($ctx) & $ctx.EventSetDomainCredentials } }
         @{ Key = 'o';  Label = 'Remove offline computers';    Mutating = $false; Handler = 'EventRemoveOfflineComputer';        Run = { param($ctx) & $ctx.EventRemoveOfflineComputer } }
+        @{ Key = 'y';  Label = 'Deployment report';           Mutating = $false; Handler = 'EventDeploymentReport';            Run = { param($ctx) & $ctx.EventDeploymentReport } }
         @{ Key = 'e';  Label = 'Show errors';                 Mutating = $false; Handler = 'GetErrors';                        Run = { param($ctx) & $ctx.GetErrors } }
         @{ Key = 'g';  Label = 'View Windows Update log';     Mutating = $false; Handler = 'EventViewUpdateLog';                Run = { param($ctx) & $ctx.EventViewUpdateLog } }
         @{ Key = 'w';  Label = 'Windows Update service';      Mutating = $true;  Handler = 'EventWUServiceActionInteractive';   Run = { param($ctx) & $ctx.EventWUServiceActionInteractive } }

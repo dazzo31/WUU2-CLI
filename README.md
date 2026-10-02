@@ -247,6 +247,12 @@ Counting those as failures would put it top of a "failing machines" table at a 1
 telling you a host is broken when in fact nobody ever tried to patch it. Refusals are reported (they
 are a real process finding), but separately, and they never appear as failing machines.
 
+**In the console**, the report is reachable three ways: `Reports / audit` → `Deployment report`, the
+flat menu's `y` key, and option 5 on the results screen after an operation — so a roll-out can be
+reviewed without leaving the workflow. The menu offers period presets (24h / 7d / 30d / everything)
+rather than the `<n>d` grammar, and each screen calls the same engine functions the CLI does, so the
+two entry points cannot report different numbers for the same window.
+
 Reporting is **read-only** over the audit trail: it never writes a record and never modifies a log.
 Its own invocation is recorded by the ordinary read path, like `show` and `export`, so a report never
 appears in its own figures.
