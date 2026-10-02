@@ -90,7 +90,14 @@ function Invoke-WuuAuditCommand {
             Write-Host ("  Verifying {0}" -f $resolvedLog) -ForegroundColor Gray
             $v = Test-WuuAuditChain -LogPath $resolvedLog -Quiet
             if ($Json) {
-                [pscustomobject]@{ Command = 'audit verify'; LogPath = $resolvedLog; Ok = $v.Ok; Checked = $v.Checked; FirstBreak = $v.FirstBreak; Problems = $v.Problems } | ConvertTo-Json -Depth 5
+                # SS34: ONE renderer, so this shape is versioned like every other command's. WRITTEN TO THE
+                # HOST rather than emitted, because emitting it made this function return TWO objects -
+                # the JSON string and the result below - and a caller doing `... | ConvertFrom-Json`
+                # then receives an array of two unrelated values.
+                Write-Host (Format-WuuJsonDocument -Command 'audit verify' -Fields ([ordered]@{
+                            LogPath = $resolvedLog; Ok = $v.Ok; Checked = $v.Checked
+                            FirstBreak = $v.FirstBreak; Problems = @($v.Problems)
+                        }))
             } elseif ($v.Ok) {
                 Write-Host ("  Chain intact: {0} record(s) verified." -f $v.Checked) -ForegroundColor Green
             } else {
@@ -108,7 +115,11 @@ function Invoke-WuuAuditCommand {
             $recs = @(Get-Content -LiteralPath $resolvedLog | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
                 ForEach-Object { $_ | ConvertFrom-Json })
             if ($Json) {
-                [pscustomobject]@{ Command = 'audit show'; LogPath = $resolvedLog; Count = $recs.Count; Records = $recs } | ConvertTo-Json -Depth 8
+                # SS34: versioned like every other command's document. Written to the HOST, not emitted -
+                # see the note on the verify branch above for why emitting returned two objects.
+                Write-Host (Format-WuuJsonDocument -Command 'audit show' -Depth 8 -Fields ([ordered]@{
+                            LogPath = $resolvedLog; Count = $recs.Count; Records = @($recs)
+                        }))
             } else {
                 Write-Host ("  {0}  ({1} record(s))" -f $resolvedLog, $recs.Count) -ForegroundColor White
                 $fmt = "  {0,5} {1,-21} {2,-13} {3,-10} {4,-18} {5}"
@@ -710,21 +721,24 @@ function Invoke-WuuCommand {
         # the exit code stayed 0. Luck, not design. Returning one object removes the dependency on it.
         $jsonText = $null
         if ($Json) {
-            $jsonText = [pscustomobject]@{
-                Command        = $Verb
-                WhatIf         = $true
-                Detail         = $plan.Detail
-                Policy         = $plan.Policy
-                Selected       = $plan.Selected
-                WouldRun       = $plan.WouldRun
-                WouldQueue     = $plan.WouldQueue
-                WouldSkip      = $plan.WouldSkip
-                WouldNoOp      = $plan.WouldNoOp
-                Unresolved     = $plan.Unresolved
-                Targets        = $plan.Targets
-                Would          = $plan.Detail
-                Ok             = $true
-            } | ConvertTo-Json -Depth 5
+            # SS34: the plan is a command document like any other, so it carries the same schema version.
+            # Depth 6, not the ConvertTo-Json default of 2 - at depth 2 a nested per-target detail is
+            # rendered as a TYPE NAME rather than as data, so a consumer silently receives a string
+            # where it expected an object.
+            $jsonText = Format-WuuJsonDocument -Command $Verb -Fields ([ordered]@{
+                    WhatIf     = $true
+                    Detail     = $plan.Detail
+                    Policy     = $plan.Policy
+                    Selected   = @($plan.Selected)
+                    WouldRun   = @($plan.WouldRun)
+                    WouldQueue = @($plan.WouldQueue)
+                    WouldSkip  = @($plan.WouldSkip)
+                    WouldNoOp  = @($plan.WouldNoOp)
+                    Unresolved = @($plan.Unresolved)
+                    Targets    = @($plan.Targets)
+                    Would      = $plan.Detail
+                    Ok         = $true
+                })
             Write-Host $jsonText
         } else {
             Write-WuuCommandPlan -Plan $plan

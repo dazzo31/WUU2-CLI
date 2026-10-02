@@ -46,7 +46,15 @@ Write-Host '=== 1. the documented contract (docs/EXIT_CODES.md) is preserved ===
 
 $doc = Get-Content -LiteralPath (Join-Path $root 'docs\EXIT_CODES.md') -Raw
 # The documented shape, read from the doc itself so this suite fails if either side drifts alone.
-$docFields = [regex]::Matches($doc, '"(\w+)":') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+#
+# SCOPED TO THE COMMAND-RESULT BLOCK, not the whole file. The doc now also publishes the READ-verb
+# documents (audit verify/show, -WhatIf), which carry their own fields such as LogPath. Reading every
+# "field": in the file made this suite assert that the COMMAND RESULT carries the READ verbs' fields -
+# and it failed on LogPath the moment that section was added. The scope is part of the assertion: this
+# suite proves the command-result contract is preserved, and the read verbs have their own suite.
+$docSection = [regex]::Match($doc, '(?s)```json\s*(\{[^`]*?"Computers"[^`]*?\})\s*```').Groups[1].Value
+if (-not $docSection) { $docSection = $doc }   # shape renamed: fall back to the whole file rather than pass vacuously
+$docFields = [regex]::Matches($docSection, '"(\w+)":') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
 Assert-True ($docFields.Count -ge 4) "the doc publishes a JSON shape ($($docFields.Count) field(s): $($docFields -join ', '))"
 
 $store = New-WuuStateStore

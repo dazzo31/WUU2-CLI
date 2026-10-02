@@ -104,5 +104,41 @@ if (-not (Test-Path $docPathDC)) {
         } else {
             Pass "every gate block cited by the document exists ($($citedDC.Count) cited, $($declaredDC.Count) declared) (SS40)"
         }
+
+        # SS34: EVERY command document goes through ONE renderer, so it carries the same schema version
+        # and cannot drift into a second shape. Before this, the read verbs hand-built their own JSON with
+        # no version field at all. The check is deliberately narrow about WHERE it applies: Wuu.Command's
+        # COMMAND OUTPUT must not call ConvertTo-Json directly. Wuu.Audit's canonical record rendering is a
+        # different concern (a hash-chained line, never parsed as a command document) and Wuu.Credentials
+        # writes an encrypted blob, so both are out of scope by module rather than by exception list.
+        # A new direct ConvertTo-Json inside Wuu.Command is what this catches.
+        $cmdTextDC = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Command.psm1'))
+        $cmdCodeDC = Get-WuuTextWithoutComments -Text $cmdTextDC
+        $rawJsonDC = @([regex]::Matches($cmdCodeDC, 'ConvertTo-Json'))
+        if ($rawJsonDC.Count -gt 0) {
+            Fail "Wuu.Command calls ConvertTo-Json directly ($($rawJsonDC.Count) time(s)) - every command document must go through Format-WuuJsonDocument so it carries the shared schema version (SS34)"
+        } elseif ($cmdCodeDC -notmatch 'Format-WuuJsonDocument') {
+            Fail 'Wuu.Command never calls Format-WuuJsonDocument - the versioned envelope is not being applied, or this check has gone blind (SS34)'
+        } else {
+            Pass 'every command document in Wuu.Command is rendered through the versioned envelope (SS34)'
+        }
+
+        # The renderer must exist, be exported, and be the ONE definition of the envelope.
+        if (-not (Get-Command Format-WuuJsonDocument -ErrorAction SilentlyContinue)) {
+            Fail 'Format-WuuJsonDocument is not resolvable - the shared JSON envelope has no implementation (SS34)'
+        } else {
+            try {
+                $probeDC = Format-WuuJsonDocument -Command 'gate' -Fields ([ordered]@{ A = 1 }) | ConvertFrom-Json
+                if ($null -eq $probeDC.PSObject.Properties['SchemaVersion']) {
+                    Fail 'Format-WuuJsonDocument does not stamp SchemaVersion - the versioned API is not versioned (SS34)'
+                } elseif ($probeDC.Command -ne 'gate') {
+                    Fail 'Format-WuuJsonDocument does not carry the command name - a document must be self-describing (SS34)'
+                } else {
+                    Pass 'the JSON envelope is versioned, self-describing, and used by every command document (SS34)'
+                }
+            } catch {
+                Fail "driving the JSON envelope threw instead of reporting: $($_.Exception.Message) (SS34)"
+            }
+        }
     }
 }

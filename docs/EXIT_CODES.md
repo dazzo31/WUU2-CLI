@@ -58,6 +58,28 @@ alone:
 { "Command": "install", "Ok": true, "ExitCode": 6, "Completed": false, "Outstanding": 2, "Computers": [ ] }
 ```
 
+### Every `-Json` document is versioned
+
+All commands emit the same envelope, so a consumer can detect a contract change rather than discover it:
+
+```json
+{ "SchemaVersion": 1, "Command": "audit verify", "LogPath": "...", "Ok": true }
+```
+
+`SchemaVersion` is bumped only for a **breaking** change - a renamed, removed or re-typed field. Adding a
+field is compatible and does not bump it. The mutating verbs additionally carry `ExitCode`, `Status` and
+the per-status counts; those are listed above and are unchanged.
+
+| Command | Fields (beyond the envelope) |
+|---|---|
+| `check`, `download`, `install`, `restart`, … | `Ok`, `ExitCode`, `Status`, `Completed`, `Outstanding`, the `*Count` fields, `Computers`, `ErrorMessage` |
+| `<verb> -WhatIf` | `WhatIf`, `Detail`, `Policy`, `Selected`, `WouldRun`, `WouldQueue`, `WouldSkip`, `WouldNoOp`, `Unresolved`, `Targets`, `Would`, `Ok` |
+| `audit verify` | `LogPath`, `Ok`, `Checked`, `FirstBreak`, `Problems` |
+| `audit show` | `LogPath`, `Count`, `Records` |
+
+A field that is present when empty is present when empty on purpose: a field that vanishes when it has
+no value is a field a consumer crashes on.
+
 ## Partial success (4)
 
 **4 means the settled targets disagreed**: at least one succeeded and at least one did not.

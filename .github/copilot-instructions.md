@@ -1021,8 +1021,11 @@ Human-readable output and JSON output should derive from the same result.
 
 Do not implement one result for console output and another independent result for JSON.
 
-> **Current: NOT IMPLEMENTED.** There is no structured command result. Per-target outcomes come from
-> `Get-WuuTargetOutcome` / `Get-WuuAggregateOutcome`.
+> **Current: DONE.** `src/Wuu.Result.psm1` is the single model. `New-WuuCommandResult` builds it, and
+> both renderings derive from it: `Format-WuuResultJson` for JSON and the command shell for prose. A field
+> cannot exist in one and not the other, which was the defect the two hand-built shapes had. Gate block
+> (az) and `tests/Test-ResultModel.ps1` drive it; the documented field list is read out of
+> `docs/EXIT_CODES.md` so either side drifting alone fails.
 
 ---
 
@@ -1048,9 +1051,20 @@ Do not casually rename/remove JSON fields.
 
 Breaking JSON output is a compatibility change.
 
-> **Current: PARTIAL.** `-Json` is honoured by read verbs only (`Wuu.Command`); mutating verbs return a
-> status string, and there is no `schemaVersion`. The release gate's `-Json` report is versioned
-> separately (`wuu.gate.v1`).
+> **Current: DONE.** Every command emits the same envelope — `SchemaVersion` then `Command` — rendered
+> by **one** function, `Format-WuuJsonDocument` (`src/Wuu.Result.psm1`). The mutating verbs render through
+> `Format-WuuResultJson`, which delegates to it, so the two cannot carry different versions. The read
+> verbs that previously hand-built their own shapes are routed through it too: `audit verify`,
+> `audit show`, and the `-WhatIf` plan. `SchemaVersion` is bumped only for a BREAKING change (renamed,
+> removed or re-typed field); adding a field is compatible and does not bump it.
+>
+> The contract per command is tabulated in `docs/EXIT_CODES.md`, and gate block (az) plus
+> `Scripts/Test-DocConsistency.ps1` fail if `Wuu.Command` calls `ConvertTo-Json` directly — a new
+> hand-built document is what that catches. `tests/Test-JsonContract.ps1` drives all four families.
+>
+> Not in scope, and deliberately so: `Wuu.Audit` renders a hash-chained record whose bytes are what the
+> chain hashes, and `Wuu.Credentials` writes an encrypted blob. Neither is a command document, and
+> re-shaping either would break the artifact rather than version it.
 
 ---
 
@@ -1418,10 +1432,9 @@ Appendix A for per-invariant evidence.
 
 1. Formalise command result model. — **DONE**: `Wuu.Result.psm1` (6 functions) is the single model;
    command mode builds ONE result via `New-WuuCommandResult` and renders both JSON and prose from it.
-2. Make JSON output a versioned API. — **PARTIAL**: the command-result JSON carries `schemaVersion`
-   (`Wuu.Result.psm1`), but the READ verbs do not use the model — `audit verify`, `audit show` and
-   `-WhatIf` each hand-build their own shape in `Wuu.Command.psm1` with no version field. A consumer
-   therefore cannot write one stable parser. This is the remaining external-contract gap.
+2. Make JSON output a versioned API. — **DONE**: one envelope (`SchemaVersion` + `Command`) rendered by
+   `Format-WuuJsonDocument`, used by the mutating verbs, `audit verify`, `audit show` and `-WhatIf`. The
+   read verbs previously hand-built their own unversioned shapes (SS34).
 3. Implement/remove unreachable exit code contracts. — **DONE**: all of `0`–`7` have producers.
 4. Improve pending-operation precedence. — **DONE**: semantic precedence in `Set-WuuPendingOperation`
    via `Get-WuuPendingOpRank` (SS16); a downgrade is declined and reported, an upgrade replaces.

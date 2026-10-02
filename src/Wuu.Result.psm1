@@ -189,23 +189,110 @@ function ConvertTo-WuuResultObject {
     return [pscustomobject]$ordered
 }
 
+function Format-WuuJsonDocument {
+    <#
+    .SYNOPSIS
+    Renders ANY command's JSON output: a versioned envelope, then the command's own fields (SS34).
+    .DESCRIPTION
+    WHY EVERY COMMAND NEEDS THIS. The result model covers the mutating verbs, but the READ verbs
+    published their own shapes with no version field at all - `audit verify` emitted Command/LogPath/Ok/
+    Checked/FirstBreak/Problems, `audit show` emitted Command/LogPath/Count/Records, and `-WhatIf` emitted
+    a plan object. A consumer therefore had to know which command it had called before it could parse
+    the answer, and had no way to detect a schema change. That is the same class of defect the
+    command-result model closed for the mutating verbs, and SS34 requires it be closed for all of them.
+
+    THE SHAPE IS ADDITIVE. Every field each verb already published keeps its exact spelling and meaning.
+    Two fields are PREPENDED:
+      SchemaVersion  which revision of the contract this is (SS34). A consumer can now detect a change
+                     instead of discovering it.
+      Command        the verb, so a document is self-describing. Commands that already published
+                     `Command` are unaffected: this sets the value they were already setting.
+    Field ORDER is stable (envelope first, then the caller's fields in the order given) so a diff of two
+    runs is readable, and the `Computers` array is kept as an array even when it holds one element or
+    none - unwrapping to a scalar is what breaks a consumer's iteration.
+
+    DEPTH DEFAULTS TO 6, not the ConvertTo-Json default of 2. At depth 2 a nested record is rendered as a
+    type name rather than as data, so a consumer silently receives a string where it expected an object.
+    The deepest shipped shape (a plan carrying per-target detail) needs 6.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [Parameter(Mandatory)][AllowNull()][object]$Fields,
+        [int]$Depth = 6
+    )
+
+    $doc = [ordered]@{}
+    $doc['SchemaVersion'] = Get-WuuResultSchemaVersion
+    $doc['Command'] = $Command
+
+    # Copy the caller's fields in the order given. A null/absent bag yields an envelope-only document,
+    # which is still valid and still versioned - a command with nothing to report must not emit nothing.
+    if ($null -ne $Fields) {
+        $names = @()
+        if ($Fields -is [System.Collections.IDictionary]) {
+            $names = @($Fields.Keys)
+        } elseif ($Fields -is [System.Management.Automation.PSCustomObject]) {
+            $names = @($Fields.PSObject.Properties | ForEach-Object { $_.Name })
+        } else {
+            $names = @($Fields.PSObject.Properties | ForEach-Object { $_.Name })
+        }
+        foreach ($name in $names) {
+            if ($name -eq 'SchemaVersion') { continue }   # the envelope owns this; a caller cannot override it
+            # AN EXPLICIT if-STATEMENT, never `$value = if (...) {...} else {...}`. An if used as an
+            # EXPRESSION runs its branch through the pipeline, which UNROLLS a collection: an empty
+            # array becomes $null and a one-element array becomes a bare scalar. Measured - the
+            # expression form rendered `"P": { }` where the statement form renders `"P": []`, and a
+            # single-element list was silently downgraded from a list to a value.
+            if ($Fields -is [System.Collections.IDictionary]) { $value = $Fields[$name] }
+            else { $value = $Fields.$name }
+            # Plain assignment, not `, $value`: comma-wrapping an array DOUBLE-NESTS it (an empty one
+            # became [[]], which parses back as one element rather than zero). Assignment already
+            # preserves an empty array as [] and a populated one as [ ... ].
+            $doc[$name] = $value
+        }
+    }
+
+    return ([pscustomobject]$doc | ConvertTo-Json -Depth $Depth)
+}
+
 function Format-WuuResultJson {
     <#
     .SYNOPSIS Renders a command result as JSON text (the -Json output).
-    .DESCRIPTION One renderer, so the two call sites that used to hand-build JSON cannot diverge again.
+    .DESCRIPTION One renderer, so the call sites that used to hand-build JSON cannot diverge again.
+    Delegates to Format-WuuJsonDocument for the versioned envelope, so the command result and every other
+    command's document carry the SAME schema version from the SAME place.
     #>
     param(
         [Parameter(Mandatory)][object]$Result,
         [int]$Depth = 6
     )
-    return ((ConvertTo-WuuResultObject -Result $Result) | ConvertTo-Json -Depth $Depth)
+    $obj = ConvertTo-WuuResultObject -Result $Result
+    $command = if ($obj.PSObject.Properties['Command']) { [string]$obj.Command } else { '' }
+    $fields = [ordered]@{}
+    foreach ($p in $obj.PSObject.Properties) {
+        if ($p.Name -eq 'SchemaVersion' -or $p.Name -eq 'Command') { continue }
+        $fields[$p.Name] = $p.Value
+    }
+    return (Format-WuuJsonDocument -Command $command -Fields $fields -Depth $Depth)
+}
+
+function Get-WuuJsonSchemaVersion {
+    <#
+    .SYNOPSIS The schema version of the whole command-JSON contract (an alias of the result version).
+    .DESCRIPTION Exists so a caller asking about JSON need not know that the version is defined by the
+    result model. One number, two entry points, no second constant to drift.
+    #>
+    return (Get-WuuResultSchemaVersion)
 }
 
 Export-ModuleMember -Function @(
     'Get-WuuResultSchemaVersion'
+    'Get-WuuJsonSchemaVersion'
     'Get-WuuCommandCounts'
     'New-WuuCommandResult'
     'Get-WuuExitCodeName'
     'ConvertTo-WuuResultObject'
+    'Format-WuuJsonDocument'
     'Format-WuuResultJson'
 )
