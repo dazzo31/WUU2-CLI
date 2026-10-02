@@ -314,10 +314,30 @@ Before adding a direct assignment, ask:
 If there is no compelling architectural reason, use the state API.
 
 > **Current:** the funnel is `Update-WuuOperationState` in `Wuu.State`. **41** direct operation-state
-> writes remain outside it (34 in `Wuu.Core`, 7 in `Wuu.WindowsUpdate`), and zero is **NOT IMPLEMENTED**.
-> Many sit inside payload scriptblocks that run in isolated runspaces, where **no module function is
-> callable** (`tests/Probe-PayloadFunctionReach.ps1`), so the funnel cannot be used there directly; those
-> paths use the inlined guard copies described in §19. Gate block (az) fails if the count **rises**.
+> writes remain, re-measured 2026-10-02 by **brace-matched payload ranges**:
+>
+> | Where | Count | Approved? |
+> |---|---|---|
+> | Core payloads (`$DownloadUpdates` 5, `$GetUpdates` 8, `$InstallUpdates` 4, `$RestartComputer` 4, `$RemoveOfflineComputer` 2) | 23 | yes - SS19 inlined twins |
+> | `Wuu.Workers` job-cleanup payload | 8 | yes - the injected copy of the funnel |
+> | The inlined funnel itself (`UpdateWuuOperationStateScript`, Wuu.WindowsUpdate 170-284) | 7 | yes - this IS approved state code |
+> | **Genuine module-scope bypasses** | **3** | **no - Wuu.WindowsUpdate 845, 910, 921** |
+>
+> So the P0 target is **3 sites, not 41**. Payload code runs in an isolated runspace where **no module
+> function is callable** (`tests/Probe-PayloadFunctionReach.ps1`), so the funnel cannot be used there;
+> those paths are the inlined guard copies described in SS19, and the cleanup copy is deliberately the
+> same copy the funnel's docstring promises. Gate block (az) fails if the count **rises**.
+>
+> **Scope labels mislead - do not classify by "nearest enclosing function".** A payload defines its own
+> helpers inside itself (including a definition of `Invoke-ServiceWithTimeout`), so a helper that looks
+> module-scope is usually payload code. Corroborate with a runspace-only marker: payload code calls the
+> injected hooks (`$SetComputerTimeoutScript`, `$UpdateWuuOperationStateScript`, `$WriteLogFileScript`)
+> rather than module functions.
+>
+> **(az) counts, but does not discriminate.** It matches `$x.<prop> =` and therefore counts the funnel's
+> own inlined twin and every SS19 duplicate. It cannot see whether a write is guarded, so a *rising*
+> count is meaningful while the absolute number is not. Lower `$directWriteCeilingAZ` when the count
+> falls, and treat a count that is stable for the wrong reason as debt.
 
 ---
 
@@ -1499,4 +1519,4 @@ the invariant regresses. Status is verified against the source, not the document
 | — | Refusals are recorded, and a stalled refusal is diagnosed | **ENFORCED** | `Update-WuuRefusalRecord`, `Test-WuuRefusalStalled`; gate (ap); `Test-RefusalSemantics` |
 | — | Inner probes respect the remaining operation budget | **PARTIAL** | CIM and service probes only; gate (av); `Test-RemainingBudget` |
 | — | Audit chain head can be anchored outside the log | **PARTIAL** | file-based, tamper-evident only; gate (aw); `Test-AuditAnchoring` |
-| — | Zero direct operation-state writes outside `Wuu.State` | **NOT IMPLEMENTED** | 41 remain; gate (az) fails if the count rises |
+| — | Zero direct operation-state writes outside `Wuu.State` | **NOT IMPLEMENTED** | 3 module-scope bypasses (`Wuu.WindowsUpdate` 845, 910, 921); the other 38 are payload code, including the inlined funnel itself (SS19); gate (az) counts but does not discriminate, and fails if the count rises |
