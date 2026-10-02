@@ -313,31 +313,42 @@ Before adding a direct assignment, ask:
 
 If there is no compelling architectural reason, use the state API.
 
-> **Current:** the funnel is `Update-WuuOperationState` in `Wuu.State`. **41** direct operation-state
-> writes remain, re-measured 2026-10-02 by **brace-matched payload ranges**:
+> **Current:** the funnel is `Update-WuuOperationState` in `Wuu.State`. The invariant is **zero
+> UNAUTHORISED module-scope operation-state writes** - not "zero occurrences of `$x.Prop =`".
+> Operation state is legitimately mutated in four approved contexts:
 >
-> | Where | Count | Approved? |
+> | Context | Where | Why approved |
 > |---|---|---|
-> | Core payloads (`$DownloadUpdates` 5, `$GetUpdates` 8, `$InstallUpdates` 4, `$RestartComputer` 4, `$RemoveOfflineComputer` 2) | 23 | yes - SS19 inlined twins |
-> | `Wuu.Workers` job-cleanup payload | 8 | yes - the injected copy of the funnel |
-> | The inlined funnel itself (`UpdateWuuOperationStateScript`, Wuu.WindowsUpdate 170-284) | 7 | yes - this IS approved state code |
-> | **Genuine module-scope bypasses** | **3** | **no - Wuu.WindowsUpdate 845, 910, 921** |
+> | `StateFunnel` | `Wuu.State.psm1` | the authoritative implementation |
+> | `WorkerStateFunnel` | `UpdateWuuOperationStateScript` (Wuu.WindowsUpdate) | a worker runspace has no module commands, so it MUST inline the rule; `Test-WuuOperationState` asserts the two copies agree |
+> | `CoreWorkerPayload` | `$DownloadUpdates`, `$GetUpdates`, `$InstallUpdates`, `$RestartComputer`, `$RemoveOfflineComputer` | they execute in isolated worker runspaces |
+> | `WorkerCleanupPayload` | `Get-WuuJobCleanupPayload` (Wuu.Workers) | the injected copy of the funnel |
 >
-> So the P0 target is **3 sites, not 41**. Payload code runs in an isolated runspace where **no module
-> function is callable** (`tests/Probe-PayloadFunctionReach.ps1`), so the funnel cannot be used there;
-> those paths are the inlined guard copies described in SS19, and the cleanup copy is deliberately the
-> same copy the funnel's docstring promises. Gate block (az) fails if the count **rises**.
+> Measured 2026-10-02: **2 unauthorised module-scope writes remain**, both terminal-state writes in the
+> submission/scheduler path (`settled -> Error` after a submission that never started; `settled ->
+> Queued` for phase-wait bookkeeping). A third - the scheduler clearing `PendingOp` - was converted to
+> `Update-WuuOperationState -ClearPendingOp`.
+>
+> **Do NOT convert the remaining two.** The funnel correctly REFUSES `settled -> Error` and `settled ->
+> Queued`; that refusal is invariant 8.4 working. Converting them to funnel calls would trade the
+> terminal-state invariant for a metric, and would silently stop phase gating from re-queueing. An
+> operator RESET is a real future need but needs its own operation (`ResetOperation`) and its own
+> specification - who may reset, whether it is interactive-only, whether it audits, whether the
+> OperationId changes, what happens to late workers - not a widened transition rule.
 >
 > **Scope labels mislead - do not classify by "nearest enclosing function".** A payload defines its own
-> helpers inside itself (including a definition of `Invoke-ServiceWithTimeout`), so a helper that looks
-> module-scope is usually payload code. Corroborate with a runspace-only marker: payload code calls the
-> injected hooks (`$SetComputerTimeoutScript`, `$UpdateWuuOperationStateScript`, `$WriteLogFileScript`)
-> rather than module functions.
+> helpers inside itself (Core defines `Invoke-ServiceWithTimeout` inside `$GetUpdates`), so a write that
+> looks like a module-scope function body is usually payload code. Classification in gate (az) is
+> **structural**: brace-matched line RANGES for each approved construction site, so no line numbers are
+> encoded and a new write anywhere in a payload's range is judged by the same rule. Corroborate by hand
+> with the runspace-only markers payload code calls (`$SetComputerTimeoutScript`,
+> `$UpdateWuuOperationStateScript`, `$WriteLogFileScript`), which a module function would call directly.
 >
-> **(az) counts, but does not discriminate.** It matches `$x.<prop> =` and therefore counts the funnel's
-> own inlined twin and every SS19 duplicate. It cannot see whether a write is guarded, so a *rising*
-> count is meaningful while the absolute number is not. Lower `$directWriteCeilingAZ` when the count
-> falls, and treat a count that is stable for the wrong reason as debt.
+> **The gate prevents regression, not approval.** It fails if the unauthorised count RISES, and it also
+> fails if the approved ranges stop resolving in a file that should contain one - otherwise a renamed
+> payload would look like a clean tree. A new legitimate mutation belongs inside an approved context, so
+> it needs no gate change; a new exception needs a named classification, a documented reason, and its
+> own regression test, never a bigger number.
 
 ---
 
@@ -1402,8 +1413,9 @@ for per-invariant evidence.
 
 ## P0
 
-1. Enforce zero direct operation-state mutation outside approved state code. — **NOT IMPLEMENTED**
-   (41 remain; gate (az) prevents increases).
+1. Enforce zero UNAUTHORISED module-scope operation-state mutation outside approved state code. —
+   **PARTIAL** (2 remain, both terminal-state writes the funnel must keep refusing; see SS9). The
+   scheduler's `PendingOp` clear was converted to the funnel operation `-ClearPendingOp`.
 2. Keep OperationId validation before mutation. — **ENFORCED** (gates (ah), (an)).
 3. Preserve global concurrency admission. — **ENFORCED** (gates (ai), (ao), (ax)).
 4. Preserve terminal-state protection. — **ENFORCED** (gate (ay)).
@@ -1519,4 +1531,4 @@ the invariant regresses. Status is verified against the source, not the document
 | — | Refusals are recorded, and a stalled refusal is diagnosed | **ENFORCED** | `Update-WuuRefusalRecord`, `Test-WuuRefusalStalled`; gate (ap); `Test-RefusalSemantics` |
 | — | Inner probes respect the remaining operation budget | **PARTIAL** | CIM and service probes only; gate (av); `Test-RemainingBudget` |
 | — | Audit chain head can be anchored outside the log | **PARTIAL** | file-based, tamper-evident only; gate (aw); `Test-AuditAnchoring` |
-| — | Zero direct operation-state writes outside `Wuu.State` | **NOT IMPLEMENTED** | 3 module-scope bypasses (`Wuu.WindowsUpdate` 845, 910, 921); the other 38 are payload code, including the inlined funnel itself (SS19); gate (az) counts but does not discriminate, and fails if the count rises |
+| — | Zero unauthorised module-scope operation-state writes | **PARTIAL** | 2 remain, both terminal-state writes the funnel correctly REFUSES (`settled -> Error` after a submission that never started; `settled -> Queued` for phase-wait bookkeeping). The scheduler's `PendingOp` clear routes through `Update-WuuOperationState -ClearPendingOp`. Gate (az) classifies by brace-matched payload RANGE, not by enclosing function, and fails if the count rises or an approved range stops resolving |

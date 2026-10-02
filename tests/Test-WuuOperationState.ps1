@@ -307,6 +307,84 @@ Assert-True ($wfunnel -ne '') 'the inlined worker funnel exists'
 Assert-True ($wfunnel -like '*rowOpId*' -and $wfunnel -like '*writerOpId*') 'the inlined worker funnel compares row identity against writer identity'
 Assert-True ($wfunnel -like '*cne*') 'the inlined worker funnel refuses on a DIFFERENCE (proven staleness), not on absence'
 
+# ---------------------------------------------------------------------------------------
+# 10b. ClearPendingOp - the explicit slot-clear operation (P0 #1, SS16)
+# ---------------------------------------------------------------------------------------
+# PendingOp is operation state, so clearing it belongs to the funnel rather than to the scheduler
+# that happens to hold the row. Before this there was NO way to clear the slot through the state API,
+# which made the scheduler's bare assignment one of the three module-scope writes the P0
+# investigation identified.
+
+# A. the operation clears the slot.
+$cpA = New-WuuComputerRow -Computer 'CP-A'
+$cpA.PendingOp = 'Install'
+$resA = Update-WuuOperationState -Row $cpA -ClearPendingOp
+Assert-True ($resA.Applied) 'A. ClearPendingOp is applied'
+Assert-True (-not $resA.Refused) 'A. ClearPendingOp is not a refusal'
+Assert-True ($null -eq $cpA.PendingOp) "A. ClearPendingOp empties the slot (got '$($cpA.PendingOp)')"
+
+# B/C. clearing is NOT a transition, so the settled-row rule must not interfere - and this is the
+# direction that makes the operation necessary: a settled row still CARRYING a pending op is
+# invariant violation 5, so clearing must remain legal or that violation could never be repaired.
+$cpB = New-WuuComputerRow -Computer 'CP-B'
+$cpB.State = 'Error'
+$cpB.PendingOp = 'Download'
+$resB = Update-WuuOperationState -Row $cpB -ClearPendingOp
+Assert-True ($resB.Applied -and $null -eq $cpB.PendingOp) 'B. a SETTLED (Error) row can still have its slot cleared - the repair path for invariant 5'
+Assert-Equal ([string]$cpB.State) 'Error' 'B. clearing the slot does NOT rewrite the settled display state'
+
+$cpC = New-WuuComputerRow -Computer 'CP-C'
+$cpC.State = 'Timeout'
+$cpC.PendingOp = 'Download'
+$resC = Update-WuuOperationState -Row $cpC -ClearPendingOp
+Assert-True ($resC.Applied -and $null -eq $cpC.PendingOp) 'C. a TIMED-OUT row can have its slot cleared'
+Assert-Equal ([string]$cpC.State) 'Timeout' 'C. clearing the slot does NOT launder a timeout into another outcome'
+
+# ...while the two transitions the instructions protect must STILL be refused, with or without the
+# clear. This is the pair Test A/B/C must not have broken to make themselves pass.
+foreach ($probe in @(
+        @{ From = 'Complete'; To = 'Error'; Label = 'settled -> Error' },
+        @{ From = 'Complete'; To = 'Queued'; Label = 'settled -> Queued' },
+        @{ From = 'Timeout'; To = 'Queued'; Label = 'timed-out -> Queued' })) {
+    $rowP = New-WuuComputerRow -Computer 'CP-GUARD'
+    $rowP.State = $probe.From
+    $refP = Update-WuuOperationState -Row $rowP -State $probe.To
+    Assert-True ($refP.Refused) "$($probe.Label) is STILL refused by the funnel"
+    Assert-Equal ([string]$rowP.State) $probe.From "$($probe.Label) refusal leaves the row untouched"
+}
+
+# D. a SUPERSEDED operation must not clear the slot of the operation that replaced it. The clear is
+# operation state like any other write, so it goes through the same identity rule.
+$cpD = New-WuuComputerRow -Computer 'CP-D'
+$cpD.OperationId = 'op-B'
+$cpD.PendingOp = 'Install'
+$resD = Update-WuuOperationState -Row $cpD -OperationId 'op-A' -ClearPendingOp
+Assert-True ($resD.Refused) 'D. stale worker A is refused when it tries to clear the slot'
+Assert-Equal ([string]$cpD.PendingOp) 'Install' "D. A did NOT clear B's pending op (got '$($cpD.PendingOp)')"
+
+# ...and the same clear by the OWNER is applied, so D is not refusing everything.
+$resD2 = Update-WuuOperationState -Row $cpD -OperationId 'op-B' -ClearPendingOp
+Assert-True ($resD2.Applied -and $null -eq $cpD.PendingOp) 'D. the owning operation CAN clear its own slot'
+
+# ORDER: a combined clear-of-slot + end-of-operation must settle the row, not re-queue it for a
+# follow-up the same call removed. The row starts settled and STILL carrying a queued op - invariant
+# violation 5, which is precisely the row the follow-up branch of ClearOperation exists to re-queue.
+# If the two were applied in the other order, that branch would see the not-yet-cleared slot and force
+# State back to 'Queued', so this asserts the order and not merely the outcome.
+$cpE = New-WuuComputerRow -Computer 'CP-E'
+$cpE.State = 'Complete'
+$cpE.PendingOp = 'Install'
+$cpE.OpState = 'Running'
+$cpE.OperationId = 'op-E'
+$null = Update-WuuOperationState -Row $cpE -OperationId 'op-E' -ClearPendingOp -ClearOperation
+Assert-Equal ([string]$cpE.OpState) 'Idle' 'E. a combined clear-slot+collapse leaves the operation ended'
+Assert-True ($null -eq $cpE.PendingOp) 'E. the combined call emptied the slot'
+Assert-Equal ([string]$cpE.State) 'Complete' "E. the removed follow-up did NOT re-queue a settled row (got '$($cpE.State)')"
+
+# PARITY: the scheduler runs in the module scope, but the worker twin carries the same operation or
+# the two copies disagree - the exact drift Test-WuuOperationState exists to catch.
+Assert-True ($wfunnel -like '*ClearPendingOp*') 'the inlined worker funnel carries ClearPendingOp too, or the copies disagree'
+
 '=== 11. NO unguarded async write remains ==='
 # This is the reviewer's actual P1 requirement: "prove every async write identity-guarded".
 #

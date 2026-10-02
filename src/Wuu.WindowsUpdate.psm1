@@ -178,6 +178,7 @@ function New-ComputerRunspace {
                 [string]$Phase = '',
                 [int]$TimeoutSec = 0,
                 [switch]$ClearOperation,
+                [switch]$ClearPendingOp,
                 [switch]$Heartbeat
             )
 
@@ -251,6 +252,13 @@ function New-ComputerRunspace {
                     $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
                     $Computer.TimeoutSource = $Phase
                     $Computer.UpdatesStatus = 'Timeout'
+                }
+
+                if ($ClearPendingOp) {
+                    # ORDER: before ClearOperation, so a combined call settles the row instead of
+                    # leaving it Queued for a follow-up the same call removes. Mirrors the module
+                    # funnel; tests\Test-WuuOperationState.ps1 asserts the two copies agree.
+                    if ($Computer.PSObject.Properties['PendingOp']) { $Computer.PendingOp = $null }
                 }
 
                 if ($ClearOperation) {
@@ -842,6 +850,12 @@ function Start-UpdateCheckJob {
             try {
                 $ComputerItem.Status = "Failed to initialize: $errorMessage"
                 $ComputerItem.UpdatesStatus = 'Error'
+                # APPROVED-STATE-EXCEPTION(submission-never-started). Failure reporting for a
+                # submission that never began, so there is no operation to attribute and no
+                # transition to gate. Routing it through the funnel would be REFUSED when the row
+                # is settled, and that refusal is correct - the terminal-state rule (invariant 8.4) outranks
+                # this metric. Do not "fix" this into a funnel call; an operator RESET needs its
+                # own specification (ResetOperation), not a widened transition rule.
                 $ComputerItem.State = 'Error'
                 # Errored entries render grey
                 $ComputerItem.Color = 'Error'
@@ -907,6 +921,10 @@ function Start-PendingUpdateCheck {
         if (-not (Test-PhaseReady -Phase $item.Phase)) {
             if ($item.Status -notlike 'Waiting for previous phase*') {
                 $item.Status = "Waiting for previous phase to complete. Current phase: $($item.Phase)"
+                # APPROVED-STATE-EXCEPTION(phase-wait-bookkeeping). Display bookkeeping that holds
+                # the row out of the scheduler while its phase is blocked; it is not a transition
+                # and the row is not running. The funnel refuses a settled row by design (invariant 8.4),
+                # so routing this there would silently stop phase gating from re-queueing.
                 if ($item.PSObject.Properties['State']) { $item.State = 'Queued' }
                 # Was $uiHash.Listview.Items.Refresh() - the store's redraw signal replaces it.
                 $store.Touch()
@@ -914,11 +932,15 @@ function Start-PendingUpdateCheck {
             continue
         }
         $item.Pending = $false
-        # Consume and clear any queued follow-up op so this item starts the right chain.
+        # Consume and clear any queued follow-up op so this item starts the right chain. The clear goes
+        # through the mutation funnel (SS16) rather than assigning the property: the scheduler is the
+        # CONSUMER of the slot, and PendingOp is operation state, so the write belongs to Wuu.State.
+        # Unattributed on purpose - the scheduler is not a worker and holds no operation id, which
+        # Test-WuuStaleWrite permits (a write is refused only when PROVEN stale).
         $op = 'Check'
         if ($item.PSObject.Properties['PendingOp'] -and $item.PendingOp) {
             $op = $item.PendingOp
-            $item.PendingOp = $null
+            [void](Update-WuuOperationState -Row $item -ClearPendingOp)
         }
         [void](Start-UpdateCheckJob -ComputerItem $item -Op $op)
     }

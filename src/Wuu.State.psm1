@@ -835,6 +835,13 @@ function Update-WuuOperationState {
       TimeoutSec  seconds from now for Phase.
       ClearOperation ends the operation: OpState='Idle', clears the deadline, retires the identity
                   and detaches the runspace. This is the copy-pasted 6-line cleanup block, once.
+      ClearPendingOp empties the ONE queued-follow-up slot. This is the scheduler CONSUMING the
+                  request it just read, so the slot is one-shot and must be emptied in the same step
+                  or the operation would run twice. Deliberately NOT expressed as "set PendingOp to
+                  $null": the intent is what a reviewer needs to see, and it is NOT a transition -
+                  no -State is passed, so the settled-row rule does not apply. A settled row still
+                  CARRYING a pending op is invariant 5 (see Test-WuuOperationStateInvariant), so
+                  clearing it must stay legal or that violation could not be repaired.
       Heartbeat   when true, refreshes LastHeartbeatAt and increments Heartbeats.
       Runspace    sets the runspace reference ($null to detach).
       UpdatesStatus sets UpdatesStatus.
@@ -868,6 +875,7 @@ function Update-WuuOperationState {
         [Parameter(Mandatory=$false)][string]$Phase = '',
         [Parameter(Mandatory=$false)][int]$TimeoutSec = 0,
         [Parameter(Mandatory=$false)][switch]$ClearOperation,
+        [Parameter(Mandatory=$false)][switch]$ClearPendingOp,
         [Parameter(Mandatory=$false)][switch]$Heartbeat,
         [Parameter(Mandatory=$false)][AllowNull()]$Runspace = $null,
         [Parameter(Mandatory=$false)][string]$UpdatesStatus = '',
@@ -980,6 +988,13 @@ function Update-WuuOperationState {
         & $set 'TimeoutExpiresAt' $Now.AddSeconds($effTimeout)
         & $set 'TimeoutSource' $Phase
         & $set 'UpdatesStatus' 'Timeout'
+    }
+
+    if ($ClearPendingOp) {
+        # ORDER: applied BEFORE ClearOperation, so that a combined call settles the row rather than
+        # leaving it Queued for a follow-up that the same call is removing. No caller passes both
+        # today; the order is fixed so that one eventually cannot get it wrong.
+        & $set 'PendingOp' $null
     }
 
     if ($ClearOperation) {

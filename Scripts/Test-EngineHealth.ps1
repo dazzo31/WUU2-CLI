@@ -320,30 +320,156 @@ if ((Get-Command Get-WuuTerminalStates -ErrorAction SilentlyContinue) -and (Get-
     Fail 'the terminal-state functions could not be resolved, so invariant 8.4 was never driven (P1/SS4)'
 }
 
-# (az) DIRECT OPERATION-STATE WRITES OUTSIDE Wuu.State (instructions P0 #1). Zero is the target and is
-#      NOT IMPLEMENTED; the ceiling is a ratchet so the count can only fall. Lower it when it does.
-$directWriteCeilingAZ = 41
-$directWritePropsAZ = @('State', 'OpState', 'OperationId', 'PendingOp', 'TimeoutExpiresAt')
-$directWritesAZ = 0
-$directWriteDetailAZ = @()
-foreach ($modAZ in @(Get-ChildItem -Path (Join-Path $root 'src') -Filter '*.psm1' -File | Where-Object { $_.Name -ne 'Wuu.State.psm1' })) {
-    $codeAZ = Get-WuuTextWithoutComments -Text ([System.IO.File]::ReadAllText($modAZ.FullName))
-    foreach ($propAZ in $directWritePropsAZ) {
-        # (?!=) excludes -eq style comparisons written as '=='.
-        $nAZ = ([regex]::Matches($codeAZ, "\`$\w+\.$propAZ\s*=(?!=)")).Count
-        if ($nAZ -gt 0) { $directWritesAZ += $nAZ; $directWriteDetailAZ += "$($modAZ.Name).$propAZ=$nAZ" }
+# (az) UNAUTHORISED MODULE-SCOPE OPERATION-STATE WRITES (instructions P0 #1).
+#
+# The invariant is "zero UNAUTHORISED module-scope operation-state writes", NOT "zero occurrences of
+# `$x.Prop =`". Operation state is legitimately mutated in four approved contexts, and counting their
+# assignments as violations is what made the earlier form of this check report 41 when the real number
+# is 2:
+#
+#   1. StateFunnel          - Wuu.State.psm1: the authoritative implementation (not scanned here).
+#   2. WorkerStateFunnel    - UpdateWuuOperationStateScript in Wuu.WindowsUpdate: the runspace-local
+#                             twin. A worker runspace has no module commands, so it MUST inline the
+#                             rule; Test-WuuOperationState asserts the two copies agree.
+#   3. CoreWorkerPayload    - the Core scriptblocks added to a worker runspace: $DownloadUpdates,
+#                             $GetUpdates, $InstallUpdates, $RestartComputer, $RemoveOfflineComputer.
+#   4. WorkerCleanupPayload - the scriptblock returned by Get-WuuJobCleanupPayload.
+#
+# CLASSIFICATION IS STRUCTURAL, NEVER BY ENCLOSING FUNCTION NAME. A payload defines helpers INSIDE
+# itself - Core defines Invoke-ServiceWithTimeout inside $GetUpdates - so a write that looks like a
+# module-scope function body is usually payload code. Payload membership is therefore decided by
+# BRACE-MATCHED LINE RANGE. Corroborate by hand with the runspace-only markers payload code calls
+# ($SetComputerTimeoutScript, $UpdateWuuOperationStateScript, $WriteLogFileScript), which a module
+# function would call directly instead.
+#
+# NO LINE NUMBERS ARE ENCODED. A range is found by the payload's own construction site, so moving the
+# payload moves its approval with it, and a new write added anywhere in the range is judged by the
+# same rule rather than by a remembered position.
+
+function Get-ApprovedRangeAZ {
+    # Brace-matched line ranges for the approved payload construction sites in one file. Handles every
+    # shape a payload is built with: $name = { ... }, SetVariable('Name', [scriptblock]::Create({...)),
+    # and return { ... } from a factory function (named for that function). Line-preserving: a line
+    # inside a <# #> block is skipped without being dropped, so the ranges stay true source line numbers.
+    param([string[]]$Lines, [string[]]$Names)
+    $found = New-Object System.Collections.ArrayList
+    $inBlock = $false
+    $currentFn = ''
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $raw = $Lines[$i]
+        if ($inBlock) { if ($raw -match '#>') { $inBlock = $false }; continue }
+        if ($raw -match '<#') { if (-not ($raw -match '#>')) { $inBlock = $true }; continue }
+        $code = ($raw -split '#')[0]
+
+        $name = ''
+        if ($code -match '^\s*function\s+([\w-]+)') {
+            $currentFn = $Matches[1]
+            if ($Names -contains $currentFn) { $name = $currentFn }
+        }
+        if (-not $name) {
+            if ($code -match '^\s*(\$[\w]+)\s*=\s*\{') { $name = $Matches[1] }
+            elseif ($code -match "SetVariable\(\s*'(\w+)'") { $name = $Matches[1] }
+            elseif ($code -match '^\s*return\s*\{') { $name = $currentFn }
+        }
+        if (-not $name -or ($Names -notcontains $name)) { continue }
+
+        $depth = 0; $started = $false; $end = -1
+        for ($j = $i; $j -lt $Lines.Count; $j++) {
+            $l = ($Lines[$j] -split '#')[0]
+            foreach ($ch in $l.ToCharArray()) {
+                if ($ch -eq '{') { $depth++; $started = $true }
+                elseif ($ch -eq '}') { $depth--; if ($started -and $depth -eq 0) { $end = $j; break } }
+            }
+            if ($end -ge 0) { break }
+        }
+        if ($end -ge 0) {
+            [void]$found.Add([pscustomobject]@{ Name = $name; Start = $i + 1; End = $end + 1 })
+        }
+    }
+    return $found
+}
+
+$unauthorisedCeilingAZ = 2
+$statePropsAZ = @('State', 'OpState', 'OperationId', 'PendingOp', 'TimeoutExpiresAt')
+$approvedNamesAZ = @{
+    'Wuu.Core.psm1'          = @('$DownloadUpdates', '$GetUpdates', '$InstallUpdates', '$RestartComputer',
+        '$RemoveOfflineComputer', '$WUServiceAction', '$GetErrors', '$drainScheduler')
+    'Wuu.WindowsUpdate.psm1' = @('UpdateWuuOperationStateScript')
+    'Wuu.Workers.psm1'       = @('Get-WuuJobCleanupPayload')
+}
+$unauthorisedAZ = @()
+$approvedSitesAZ = 0
+$rangesFoundAZ = 0
+$rangesFoundDetailAZ = @()
+foreach ($modAZ in @(Get-ChildItem -Path (Join-Path $root 'src') -Filter '*.psm1' -File |
+        Where-Object { $_.Name -ne 'Wuu.State.psm1' })) {
+    $linesAZ = [System.IO.File]::ReadAllLines($modAZ.FullName)
+    $namesAZ = @()
+    if ($approvedNamesAZ.ContainsKey($modAZ.Name)) { $namesAZ = $approvedNamesAZ[$modAZ.Name] }
+    $rangesAZ = @(Get-ApprovedRangeAZ -Lines $linesAZ -Names $namesAZ)
+    $rangesFoundAZ += $rangesAZ.Count
+    foreach ($rAZ in $rangesAZ) { $rangesFoundDetailAZ += [pscustomobject]@{ File = $modAZ.Name; Name = $rAZ.Name } }
+
+    $inBlockAZ = $false
+    for ($i = 0; $i -lt $linesAZ.Count; $i++) {
+        $rawAZ = $linesAZ[$i]
+        if ($inBlockAZ) { if ($rawAZ -match '#>') { $inBlockAZ = $false }; continue }
+        if ($rawAZ -match '<#') { if (-not ($rawAZ -match '#>')) { $inBlockAZ = $true }; continue }
+        $codeAZ = ($rawAZ -split '#')[0]
+        if ($codeAZ.Trim() -eq '') { continue }
+        $isWriteAZ = $false
+        foreach ($propAZ in $statePropsAZ) {
+            # (?!=) excludes -eq style comparisons written as '=='.
+            if ($codeAZ -match "\`$\w+\.$propAZ\s*=(?!=)") { $isWriteAZ = $true; break }
+        }
+        if (-not $isWriteAZ) { continue }
+
+        $lnAZ = $i + 1
+        $insideAZ = ''
+        foreach ($rAZ in $rangesAZ) {
+            if ($lnAZ -gt $rAZ.Start -and $lnAZ -lt $rAZ.End) { $insideAZ = $rAZ.Name; break }
+        }
+        if ($insideAZ) { $approvedSitesAZ++ }
+        else { $unauthorisedAZ += "$($modAZ.Name):$lnAZ" }
     }
 }
-if ($directWritesAZ -gt $directWriteCeilingAZ) {
-    Fail "direct operation-state writes outside Wuu.State rose to $directWritesAZ (ceiling $directWriteCeilingAZ) - route new writes through Update-WuuOperationState: $($directWriteDetailAZ -join ', ') (P0)"
+
+# NON-VACUITY. If a payload were renamed and this check silently stopped finding it, every write in it
+# would move to the unauthorised list and the count would RISE - so a rename cannot hide a violation.
+# What a rename COULD hide is APPROVAL itself, so assert that every file that is expected to contain an
+# approved payload actually yielded one. An empty set would mean the classifier is blind, not that the
+# tree is clean. Checked per FILE rather than against a total, so adding or removing a payload in one
+# file cannot mask the loss of classification in another.
+$missingRangesAZ = @()
+foreach ($fileAZ in $approvedNamesAZ.Keys) {
+    $hitAZ = $false
+    foreach ($rAZ in $rangesFoundDetailAZ) { if ($rAZ.File -eq $fileAZ) { $hitAZ = $true } }
+    if (-not $hitAZ) { $missingRangesAZ += $fileAZ }
+}
+if ($missingRangesAZ.Count -gt 0) {
+    Fail "the approved-payload classifier found NO construction site in $($missingRangesAZ -join ', ') - those payload ranges are not resolving, so writes in them would be misreported as unauthorised (P0)"
+} elseif ($unauthorisedAZ.Count -gt $unauthorisedCeilingAZ) {
+    Fail "UNAUTHORISED module-scope operation-state writes rose to $($unauthorisedAZ.Count) (ceiling $unauthorisedCeilingAZ) at $($unauthorisedAZ -join ', ') - route new writes through Update-WuuOperationState, or add a narrow named classification with its own test (P0)"
 } else {
-    Pass "no new direct operation-state writes outside Wuu.State ($directWritesAZ, ceiling $directWriteCeilingAZ) (P0)"
-    if ($directWritesAZ -lt $directWriteCeilingAZ) {
-        Warn "direct operation-state writes fell to $directWritesAZ - lower `$directWriteCeilingAZ to $directWritesAZ so the ratchet holds (P0)"
+    Pass "no unauthorised module-scope operation-state writes ($($unauthorisedAZ.Count), ceiling $unauthorisedCeilingAZ; $approvedSitesAZ sites inside the $rangesFoundAZ approved payload ranges) (P0)"
+    if ($unauthorisedAZ.Count -lt $unauthorisedCeilingAZ) {
+        Warn "unauthorised module-scope operation-state writes fell to $($unauthorisedAZ.Count) - lower `$unauthorisedCeilingAZ to $($unauthorisedAZ.Count) so the ratchet holds (P0)"
     }
 }
-if ($directWritesAZ -gt 0) {
-    Not-Implemented "zero direct operation-state writes outside Wuu.State: $directWritesAZ remain, many inside payload runspaces where the funnel is not callable (P0)"
+
+# EVERY unauthorised site must be one of the two KNOWN terminal-state exceptions, and both must be
+# present. A new bare write is caught above; this catches the opposite drift - a site being silently
+# REMOVED or reclassified so the number looks better without the behaviour being fixed, and a
+# third kind of exception appearing without anyone deciding to allow it.
+$exceptionSitesAZ = @($unauthorisedAZ | Where-Object { $_ -like 'Wuu.WindowsUpdate.psm1:*' })
+if ($unauthorisedAZ.Count -eq $unauthorisedCeilingAZ -and $exceptionSitesAZ.Count -ne $unauthorisedAZ.Count) {
+    Fail "an unauthorised operation-state write appeared outside Wuu.WindowsUpdate ($($unauthorisedAZ -join ', ')) - the two known exceptions are both terminal-state writes in the submission/scheduler path (P0)"
+} elseif ($exceptionSitesAZ.Count -eq 2) {
+    Pass 'the 2 remaining exceptions are the known terminal-state writes (settled -> Error, settled -> Queued), which the funnel must keep refusing (P0, SS8.4)'
+}
+
+if ($unauthorisedAZ.Count -gt 0) {
+    Not-Implemented "zero unauthorised module-scope operation-state writes: $($unauthorisedAZ.Count) remain - both are terminal-state writes that the funnel correctly REFUSES, and converting them would trade invariant 8.4 for this metric. An operator reset needs its own operation (ResetOperation) and its own specification (P0)"
 } else {
-    Pass 'every operation-state write goes through Wuu.State (P0)'
+    Pass 'every operation-state write is in an approved context (P0)'
 }

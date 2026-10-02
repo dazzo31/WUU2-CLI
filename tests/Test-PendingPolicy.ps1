@@ -190,8 +190,18 @@ Assert-Equal ($reported -join ',') 'Download' '6. the displaced Download was REP
 # ---------------------------------------------------------------------------------------
 # 7. the scheduler consumes the slot by clearing it, so nothing is left to displace
 # ---------------------------------------------------------------------------------------
+# The clear must go THROUGH THE MUTATION FUNNEL (SS16). It used to be a bare
+# `$item.PendingOp = $null`, which is why this site was one of the three module-scope
+# operation-state writes the P0 investigation identified. Asserting the call - not merely that the
+# text disappeared - is the point: the requirement is that pending state IS cleared, and that it is
+# cleared by the state API rather than by whoever happened to be holding the row.
 $schedCode = Get-CodeNoComments (Get-Content (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw)
-Assert-True ($schedCode -match '\$item\.PendingOp = \$null') '7. the scheduler clears the slot when it consumes it (otherwise a stale request would displace the next one)'
+Assert-True ($schedCode -match 'Update-WuuOperationState\s+-Row\s+\$item\s+-ClearPendingOp') `
+    '7. the scheduler clears the slot through the mutation funnel (-ClearPendingOp), not by assigning the property'
+Assert-True (-not ($schedCode -match '\$item\.PendingOp\s*=\s*\$null')) `
+    '7. the scheduler no longer assigns PendingOp directly (the direct write is what SS16 removed)'
+Assert-True ($schedCode -match 'if \(\$item\.PSObject\.Properties\[''PendingOp''\] -and \$item\.PendingOp\)') `
+    '7. the slot is still read BEFORE it is cleared (a blind clear would discard the queued request without running it)'
 
 # ---------------------------------------------------------------------------------------
 # 8. A SETTLED row cannot take a queued follow-up (the 8.4 contradiction).
