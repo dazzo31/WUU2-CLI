@@ -249,3 +249,43 @@ foreach ($f in $files) {
 if ($guiMemberHits.Count) {
     Fail ('shipped source reads a GUI control member - in this edition $uiHash is empty, so the read is silently $null and the behaviour is dead: ' + (($guiMemberHits | Select-Object -Unique) -join ', '))
 } else { Pass 'no shipped source reads a GUI control member (no silent-$null dead behaviour)' }
+
+# (s) A GUIDED HANDLER'S OUTPUT MUST NOT REACH THE PIPELINE.
+#
+#     Every screen that calls Invoke-WuuGuidedHandler RETURNS A WORKFLOW STATE, and a PowerShell
+#     function's output goes to the pipeline - so an unpiped `& $Ctx.Actions[$Handler]` makes the
+#     caller return an ARRAY of (handler output..., state) rather than the state. That produced two
+#     field symptoms, neither of which named its cause:
+#
+#       * the workflow loop received a PSCustomObject (a $GetErrors error row, Timestamp and all -
+#         the results screen's "2. View errors" path) and printed it as an unknown workflow state;
+#       * and since a switch over a 2-element array runs EVERY matching arm, the arm that reassigns
+#         $state ran alongside `default`, which then printed $state AFTER the reassignment - naming a
+#         perfectly VALID state ('DASHBOARD') as unknown.
+#
+#     Matched on the AST's command nodes rather than on text, because the function's own comment
+#     explains the defect and quotes the unpiped call - the false-positive class this file records at
+#     (r) and gate 2. A comment cannot be a CommandAst.
+$navPathForLeak = Join-Path $root 'src\Wuu.Navigate.psm1'
+$navAstForLeak = $null
+try { $navAstForLeak = [System.Management.Automation.Language.Parser]::ParseFile($navPathForLeak, [ref]$null, [ref]$null) } catch { $navAstForLeak = $null }
+if (-not $navAstForLeak) {
+    Fail 'could not parse Wuu.Navigate.psm1, so the handler-output leak check would pass vacuously'
+} else {
+    $unpiped = @()
+    foreach ($cmd in $navAstForLeak.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        # Only plain invocations of the context's handler table; a piped one is a PipelineAst element
+        # rather than a bare statement, which is exactly the distinction being asserted.
+        $el = $cmd.Parent
+        $isPiped = ($el -is [System.Management.Automation.Language.PipelineAst]) -and (@($el.PipelineElements).Count -gt 1)
+        $text = $cmd.Extent.Text
+        if (-not $isPiped -and $text -match '^\s*&\s*\$Ctx\.Actions\[.+\]\s*$') {
+            $unpiped += "line $($cmd.Extent.StartLineNumber): $text"
+        }
+    }
+    if ($unpiped.Count -gt 0) {
+        Fail ("a guided handler is invoked WITHOUT piping its output, so the calling screen's return value becomes an array and the workflow state it hands back is corrupted: " + ($unpiped -join '; '))
+    } else {
+        Pass "every guided handler invocation discards its output, so a screen's return value stays a state name"
+    }
+}

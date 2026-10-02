@@ -696,5 +696,55 @@ $pfNext = Show-WuuPreflightScreen -Ctx $emptyCtx
 if ($pfNext -ne 'DASHBOARD') { Fail "pre-flight on an empty set returned '$pfNext'" }
 else { Pass 'pre-flight on an empty set returns to the dashboard cleanly' }
 
+# ---------------------------------------------------------------------------------------
+# A GUIDED HANDLER'S OUTPUT MUST NOT REACH THE PIPELINE.
+#
+# Every screen that calls Invoke-WuuGuidedHandler RETURNS A WORKFLOW STATE, and a handler's output
+# goes to the pipeline - so an unpiped call makes the screen return an ARRAY of (handler output,
+# state) instead of the state. Two field symptoms came from exactly that, and neither named the
+# cause:
+#
+#   * the loop received a PSCustomObject (a $GetErrors error row, complete with its Timestamp -
+#     the results screen's "2. View errors" path) and reported it as an unknown workflow state;
+#   * and because a switch over a 2-element array runs EVERY matching arm, the arm that reassigns
+#     $state ran alongside `default`, which then printed $state AFTER the reassignment - naming a
+#     perfectly valid state ('DASHBOARD') as unknown.
+#
+# The assertion is on the TYPE and COUNT of what comes back, not on the value: a handler that
+# returns nothing must not turn the state into an array even when the state itself is correct.
+$leakActions = [hashtable]::Synchronized(@{})
+$leakActions['ReturningHandler'] = {
+    # Two objects with a Timestamp, mirroring $GetErrors' real shape.
+    [PSCustomObject]@{ Timestamp = Get-Date; Type = 'PowerShell Error'; Message = 'first' }
+    [PSCustomObject]@{ Timestamp = Get-Date; Type = 'PowerShell Error'; Message = 'second' }
+}
+$leakCtx = [pscustomobject]@{ Set = $null; Store = (New-WuuStateStore); Actions = $leakActions; AuditHook = $null; DenialHook = $null }
+
+# 1. The handler call itself must leak nothing.
+$leak = Invoke-WuuGuidedHandler -Ctx $leakCtx -Handler 'ReturningHandler'
+if ($null -ne $leak) {
+    Fail "Invoke-WuuGuidedHandler leaked the handler's output ($($leak.GetType().Name)) into the pipeline"
+} else { Pass 'a guided handler''s output does not reach the pipeline' }
+
+# 2. ...and the call-then-return shape must still yield exactly one string.
+function Get-ProbeScreenState {
+    Invoke-WuuGuidedHandler -Ctx $leakCtx -Handler 'ReturningHandler'
+    return 'RESULTS'
+}
+$probeState = Get-ProbeScreenState
+if (@($probeState).Count -ne 1) {
+    Fail "a screen that returns a state after a guided handler returned $((@($probeState) | ForEach-Object { $_.GetType().Name }) -join ' + ') instead of one string"
+} elseif ($probeState -isnot [string]) {
+    Fail "the screen state came back as $($probeState.GetType().Name), not a string"
+} elseif ($probeState -ne 'RESULTS') {
+    Fail "the screen state came back as '$probeState', not 'RESULTS'"
+} else { Pass 'a screen returns exactly the state string after a guided handler runs' }
+
+# 3. The workflow loop must refuse a non-string hand-off instead of reporting it as an unknown state.
+$navSource = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Navigate.psm1') -Raw
+if ($navSource -notmatch '\$state -isnot \[string\]') {
+    Fail 'the workflow loop does not validate the state type - a screen returning an object would be reported as an unknown state, naming the symptom and hiding the cause'
+} else { Pass 'the workflow loop validates that a screen handed it a state name' }
+
 if ($fail) { Write-Host 'SOME CHECKS FAILED' -ForegroundColor Red; exit 1 }
 else { Write-Host 'ALL PASS' -ForegroundColor Cyan }

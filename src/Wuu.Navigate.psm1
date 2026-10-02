@@ -759,7 +759,13 @@ function Invoke-WuuGuidedHandler {
         $reason = if ($Ctx.PSObject.Properties['Reason']) { [string]$Ctx.Reason } else { '' }
         if ([string]::IsNullOrWhiteSpace($reason) -and -not $Ctx.AuditHook) {
             Write-Host '  WARNING: auditing is not active, so this change will not be recorded.' -ForegroundColor Yellow
-            & $Ctx.Actions[$Handler]
+            # OUT-NULL IS LOAD-BEARING, not tidiness. A handler's OUTPUT goes to the pipeline, and the
+            # screens that call this function return a workflow state - so an unpiped call makes the
+            # caller's return value an ARRAY of ('<whatever the handler printed>', '<the state>').
+            # A switch over that array runs EVERY matching arm, and the state the loop receives is the
+            # whole object, which it reports as "unknown workflow state". See the note on the
+            # Out-Null below for the full failure this caused.
+            & $Ctx.Actions[$Handler] | Out-Null
             if ($guidedTargetsSet) { $global:WuuGuidedTargets = $null }
             return
         }
@@ -788,7 +794,17 @@ function Invoke-WuuGuidedHandler {
         return
     }
 
-    & $Ctx.Actions[$Handler]
+    # OUT-NULL IS NOT COSMETIC. This function is called from screens that RETURN A WORKFLOW STATE, and
+    # a handler's output goes to the pipeline: without the pipe, the screen's return value becomes an
+    # ARRAY of (handler output..., state) instead of the state. That produced two symptoms which looked
+    # like unrelated bugs and cost real time to trace:
+    #   * the loop received a PSCustomObject (a $GetErrors error row, complete with its Timestamp - the
+    #     '2. View errors' path on the results screen) and reported it as an unknown workflow state;
+    #   * worse, a switch over a 2-element array runs BOTH matching arms, so the arm that reassigns
+    #     $state ran as well as 'default' - and 'default' printed $state AFTER the reassignment, naming
+    #     a perfectly valid state ('DASHBOARD') as unknown.
+    # 11 call sites depend on this function not leaking; the audit branch above has always piped.
+    & $Ctx.Actions[$Handler] | Out-Null
     if ($guidedTargetsSet) { $global:WuuGuidedTargets = $null }
 }
 
@@ -1542,6 +1558,24 @@ function Start-WuuGuidedWorkflow {
         # steps themselves). The loop is not ticking while a screen is on the stack, so the drain
         # is passed down as ctx.Tick and the pre-flight/deployment loops poll it per computer.
         $ctx | Add-Member -NotePropertyName Tick -NotePropertyValue $DrainScheduler -Force
+
+        # Validate the hand-off BEFORE dispatching. A screen that returns something other than a state
+        # name (see the Out-Null note in Invoke-WuuGuidedHandler) makes the switch below meaningless, and
+        # the old `default` arm then reported it as an "unknown workflow state" - which names the symptom
+        # and hides the cause. Naming the real problem where it happens is the difference between a
+        # five-minute fix and the two confusing messages that this check exists to replace.
+        if ($state -isnot [string] -or [string]::IsNullOrWhiteSpace($state)) {
+            # $null is the most likely value here, and $null.GetType() throws - so the type name is
+            # derived defensively. A diagnostic that crashes while reporting a defect is worse than
+            # the defect.
+            $stateType = if ($null -eq $state) { 'null' } else { $state.GetType().Name }
+            Write-Host ''
+            Write-Host '  DEFECT: a workflow screen returned something that is not a state name, so the' -ForegroundColor Red
+            Write-Host '          workflow cannot continue from it. Returning to the dashboard.' -ForegroundColor Red
+            Write-Host ("          Received: {0} of type {1}" -f ($state | Out-String -Width 200).Trim(), $stateType) -ForegroundColor DarkRed
+            $state = 'DASHBOARD'
+            continue
+        }
 
         switch ($state) {
             'ACQUIRE'      { $state = Show-WuuAcquisitionScreen -Ctx $ctx }
