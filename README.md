@@ -158,7 +158,8 @@ wuu <verb> [options]         run one operation and exit
 | `config` | `save` \| `load` — encrypted computer-list config (one file, several named lists) |
 | `export` | Export the computer list to a file |
 | `logs` | View a target's Windows Update log |
-| `audit` | `wsus` (audit a target) \| `verify` \| `show` \| `export` (the local audit trail) |
+| `audit` | `wsus` (audit a target) \| `verify` \| `show` \| `export` \| `anchor` (the local audit trail) |
+| `report` | Deployment/reliability report over the audit trail (read-only) |
 
 Common options: `-Computer`, `-All`, `-Reason`, `-Path`, `-LogPath`, `-Json`, `-WhatIf`, `-Async`,
 `-ListName`, `-Help`. `-Reason` is **required** for verbs that change remote state — see the audit
@@ -217,8 +218,40 @@ worse, does not).
 > **This changed.** Earlier builds wrote an always-blank identity into the saved config *and* read
 > nothing back on load, so the warning did not exist.
 
-### Encrypted computer lists
+### Deployment reporting
 
+`wuu report` answers "did the roll-out work, and what keeps failing?" from the audit trail.
+
+```powershell
+wuu report                                  # last 7 days, by day
+wuu report -Period 30d -GroupBy Week        # wider window, weekly buckets
+wuu report -FailedOnly -Json                # just failures, machine-readable
+wuu report -Out report.csv -Dataset Runs    # CSV: Runs | Targets | Causes
+wuu report -LogPath D:\handover\audit-20261001.jsonl   # one file, e.g. an air-gapped bundle
+```
+
+**What it reports, and what it deliberately does not.** The trail records a deployment BATCH: its
+outcome and the list of machines it targeted. It does **not** record a per-machine result, so a
+fleet-wide "95% of machines patched" cannot be derived from it — and the report says so rather than
+printing a rate that implies it. What it does report, and what those numbers mean:
+
+| Figure | Level | Meaning |
+| --- | --- | --- |
+| Succeeded / Failed / Refused | per RUN | the batch outcome; success rate is over settled runs |
+| Failing targets | per MACHINE | machines that **failed** a deployment, with attempts and last error |
+| Top causes | per RUN | why runs did not settle, refusals marked separately from failures |
+
+**A refusal is not a machine failure.** This distinction is the one that matters most, and getting it
+wrong is easy: on this machine's own store, one host had 112 runs refused for a missing `-Reason`.
+Counting those as failures would put it top of a "failing machines" table at a 100% failure rate —
+telling you a host is broken when in fact nobody ever tried to patch it. Refusals are reported (they
+are a real process finding), but separately, and they never appear as failing machines.
+
+Reporting is **read-only** over the audit trail: it never writes a record and never modifies a log.
+Its own invocation is recorded by the ordinary read path, like `show` and `export`, so a report never
+appears in its own figures.
+
+### Encrypted computer lists
 Save and load computer lists — including phase assignments — protected by a password-derived AES
 key, replacing the original tool's plain-text export.
 

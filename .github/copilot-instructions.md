@@ -202,6 +202,7 @@ not exist, or if the two disagree in either direction. Add the row before adding
 | `Wuu.Configuration` | Paths and `$global:*` settings, resolved from `$WuuRoot` |
 | `Wuu.Command` | The `wuu` verb surface: parse, dispatch, exit codes, JSON for read verbs |
 | `Wuu.Result` | The command result model and its JSON rendering |
+| `Wuu.Reporting` | Deployment reporting: reads the audit trail and aggregates runs, failing targets and causes |
 <!-- module-inventory:end -->
 
 ## Boundaries that matter

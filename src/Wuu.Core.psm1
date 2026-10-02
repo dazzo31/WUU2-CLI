@@ -22,7 +22,10 @@ function Import-WuuModules {
     # scriptable verb layer; Wuu.Audit the tamper-evident trail. Wuu.Session models the computer
     # set as a first-class object and Wuu.Navigate owns the guided interactive workflow - both sit
     # ABOVE the engine and only read/delegate to it.
-    foreach ($m in @('Wuu.Configuration','Wuu.Presentation','Wuu.Actions.Display','Wuu.Result','Wuu.State','Wuu.Logging','Wuu.Scheduler','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Session','Wuu.Audit','Wuu.Command','Wuu.Navigate')) {
+    #
+    # Wuu.Reporting sits between Wuu.Audit (whose directory it reads) and Wuu.Command (which dispatches
+    # `wuu report` to it), and it is READ-ONLY over the trail it reports on.
+    foreach ($m in @('Wuu.Configuration','Wuu.Presentation','Wuu.Actions.Display','Wuu.Result','Wuu.State','Wuu.Logging','Wuu.Scheduler','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Session','Wuu.Audit','Wuu.Reporting','Wuu.Command','Wuu.Navigate')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
@@ -3221,6 +3224,10 @@ try {
                 -ServiceAction $(if ($parsed.Verb -eq 'service') { [string]$parsed.SubVerb } else { '' }) `
                 -SubVerb $parsed.SubVerb -Reason $parsed.Options['Reason'] `
                 -ListName $wantedList `
+                -Period $parsed.Options['Period'] -GroupBy $parsed.Options['GroupBy'] `
+                -From $parsed.Options['From'] -To $parsed.Options['To'] `
+                -FailedOnly:$parsed.Options['FailedOnly'] -Out $parsed.Options['Out'] `
+                -Dataset $parsed.Options['Dataset'] -LogPath $parsed.Options['LogPath'] `
                 -Json:$parsed.Options['Json'] -WhatIf:$parsed.Options['WhatIf'] -Async:$parsed.Options['Async']
 
             # Give queued background work a bounded chance to run, then report state. A one-shot

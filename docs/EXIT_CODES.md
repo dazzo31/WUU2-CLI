@@ -6,14 +6,25 @@ branches on them, so the meaning is fixed and is implemented in exactly one plac
 
 | Code | Name | Meaning | Typical cause |
 | --- | --- | --- | --- |
-| 0 | Success | the requested operation **completed** successfully | `wuu check -All` finished |
+| 0 | Success | the requested operation **completed** successfully | `wuu check -All` finished, or `wuu report` produced a report |
 | 1 | OperationFailed | one or more targets failed | a handler threw, or a target errored |
-| 2 | UsageError | unknown verb, missing argument, invalid input | `wuu shwo`, `wuu show` with no subverb |
+| 2 | UsageError | unknown verb, missing argument, invalid input | `wuu shwo`, `wuu show` with no subverb, `wuu report -Period bogus` |
 | 3 | Timeout | the wait elapsed with work still outstanding | work still running after `$CommandWaitSeconds` |
 | 4 | PartialSuccess | **some settled targets succeeded and some did not** | `wuu install -Computer A,B,C` where A and B succeeded and C failed |
 | 5 | AuditFailure | the audit chain failed to verify, or a fail-closed audit write failed | `wuu audit verify` on a tampered log |
 | 6 | Queued | `-Async` was requested and the work was **accepted**, not completed | `wuu install -All -Async` |
 | 7 | Refused | declined before running | a mutating verb without `-Reason` |
+
+`wuu report` follows the same contract, with one deliberate property: **it exits 0 even when the
+report it produced is full of failures.** Reporting a failure is a SUCCESSFUL report. A non-zero exit
+for a bad quarter would make the command useless in exactly the CI job that wants to detect failures
+and act on the CONTENT, and a script would have to ignore the exit code to read the report.
+
+| Result | Exit | When |
+| --- | --- | --- |
+| report produced | 0 | including when every run it found failed |
+| audit store unreadable | 1 | a named `-LogPath` does not exist, or the directory cannot be read |
+| bad arguments | 2 | invalid `-Period`, unparseable `-From`/`-To`, inverted range, unwritable `-Out` |
 
 ## The rule that matters most
 

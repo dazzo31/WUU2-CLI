@@ -264,6 +264,138 @@ function Invoke-WuuAuditCommand {
     }
 }
 
+function Invoke-WuuReportCommand {
+    <#
+    .SYNOPSIS The `wuu report` verb: a deployment/reliability report over the audit trail.
+    .DESCRIPTION
+    READ-ONLY over the audit store. It reads historical records and writes nothing back to them; its
+    own invocation is recorded by the ordinary read path in Invoke-WuuCommand (one 'operational'
+    record), so the report never appears in its own figures as a deployment.
+
+    EXIT CODES follow the documented contract (docs/EXIT_CODES.md):
+      0  a report was produced - even when it reports historical failures, because reporting a
+         failure is a SUCCESSFUL report. A non-zero here would make `wuu report` unusable in CI
+         where the whole point is to detect failures and act on the CONTENT.
+      1  the audit store could not be read at all.
+      2  bad arguments (invalid period, invalid dates, an unwritable -Out path).
+    #>
+    param(
+        [string]$Period = '7d',
+        [string]$GroupBy = 'Day',
+        [string]$From = '',
+        [string]$To = '',
+        [string]$Computer = '',
+        [switch]$FailedOnly,
+        [string]$Out = '',
+        [string]$Dataset = 'Runs',
+        [string]$LogPath = '',
+        [switch]$Json
+    )
+
+    # Parse the dates HERE rather than passing strings down, so a malformed date is a UsageError
+    # naming the argument instead of an exception from somewhere inside the aggregation.
+    #
+    # The variables are TYPED because [datetime]::TryParse takes [ref][datetime] and PowerShell cannot
+    # infer the overload from a $null (untyped) variable - it throws "Cannot find an overload for
+    # TryParse and the argument count: 2" rather than returning $false.
+    [datetime]$fromDate = [datetime]::MinValue
+    [datetime]$toDate = [datetime]::MinValue
+    $hasFrom = $false; $hasTo = $false
+    if ($From) {
+        if (-not [datetime]::TryParse($From, [ref]$fromDate)) {
+            if ($Json) { Write-Host (Format-WuuJsonDocument -Command 'report' -Fields ([ordered]@{ Ok = $false; Error = "invalid -From '$From'" })) }
+            Write-Host ("  Invalid -From '{0}' - use an ISO date such as 2026-10-01 or 2026-10-01T08:00:00Z" -f $From) -ForegroundColor Red
+            return [pscustomobject]@{ Ok = $false; Verb = 'report'; Error = "invalid -From '$From'"; Result = 'UsageError' }
+        }
+        $hasFrom = $true
+    }
+    if ($To) {
+        if (-not [datetime]::TryParse($To, [ref]$toDate)) {
+            if ($Json) { Write-Host (Format-WuuJsonDocument -Command 'report' -Fields ([ordered]@{ Ok = $false; Error = "invalid -To '$To'" })) }
+            Write-Host ("  Invalid -To '{0}' - use an ISO date such as 2026-10-01 or 2026-10-01T08:00:00Z" -f $To) -ForegroundColor Red
+            return [pscustomobject]@{ Ok = $false; Verb = 'report'; Error = "invalid -To '$To'"; Result = 'UsageError' }
+        }
+        $hasTo = $true
+    }
+
+    # A window is validated BEFORE reading, so a nonsense range fails fast with a usage message
+    # rather than after streaming every log on the machine.
+    $windowProbe = ConvertTo-WuuReportWindow -Period $Period `
+        -FromUtc $(if ($hasFrom) { $fromDate } else { $null }) -ToUtc $(if ($hasTo) { $toDate } else { $null })
+    if (-not $windowProbe.Ok) {
+        if ($Json) { Write-Host (Format-WuuJsonDocument -Command 'report' -Fields ([ordered]@{ Ok = $false; Error = $windowProbe.Error })) }
+        Write-Host ("  {0}" -f $windowProbe.Error) -ForegroundColor Red
+        return [pscustomobject]@{ Ok = $false; Verb = 'report'; Error = $windowProbe.Error; Result = 'UsageError' }
+    }
+
+    $computers = @($Computer -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+    $history = Get-WuuAuditHistory -Period $Period `
+        -FromUtc $(if ($hasFrom) { $fromDate } else { $null }) -ToUtc $(if ($hasTo) { $toDate } else { $null }) `
+        -Computer $computers -LogPath $LogPath
+    if (-not $history.Ok) {
+        Write-Host ("  {0}" -f $history.Error) -ForegroundColor Red
+        return [pscustomobject]@{ Ok = $false; Verb = 'report'; Error = $history.Error; Result = 'OperationFailed' }
+    }
+
+    if ($history.Empty -and -not $history.Files) {
+        Write-Host '' 
+        Write-Host '  No audit trail found. Nothing has been recorded on this machine yet.' -ForegroundColor Yellow
+        Write-Host '  (Reporting reads %PROGRAMDATA%\WUU2\audit\audit-*.jsonl - see docs\CLI_AUDIT_PLAN.md.)' -ForegroundColor DarkGray
+        # Exit 0 WITH an empty report: "no deployments happened" is a valid answer to "how did the
+        # deployments go?", and returning a failure would make an empty estate look like a broken tool.
+        if ($Json) {
+            Write-Host (Format-WuuJsonDocument -Command 'report' -Fields ([ordered]@{
+                        Period = $history.Label; From = ''; To = ''; Runs = 0; Empty = $true; AuditAvailable = $false
+                    }))
+        }
+        return [pscustomobject]@{ Ok = $true; Verb = 'report'; Empty = $true; Result = 'Success' }
+    }
+
+    $report = Get-WuuDeploymentReport -Records $history.Records -GroupBy $(if ($GroupBy) { $GroupBy } else { 'Day' }) -FailedOnly:$FailedOnly
+    $s = $report.Summary
+
+    if ($Out) {
+        $datasetName = if ($Dataset) { $Dataset } else { 'Runs' }
+        $export = Export-WuuDeploymentReport -Report $report -Path $Out -Dataset $datasetName
+        if (-not $export.Success) {
+            Write-Host ("  Could not write '{0}': {1}" -f $Out, $export.Error) -ForegroundColor Red
+            return [pscustomobject]@{ Ok = $false; Verb = 'report'; Error = $export.Error; Result = 'UsageError' }
+        }
+        Write-Host ''
+        Write-Host ("  Wrote {0} row(s) of '{1}' to {2}" -f $export.Rows, $datasetName, $Out) -ForegroundColor Green
+        if ($Json) {
+            Write-Host (Format-WuuJsonDocument -Command 'report' -Fields ([ordered]@{
+                        Period = $history.Label; Dataset = $datasetName; Path = $Out; Rows = $export.Rows; Summary = $s
+                    }))
+        }
+        return [pscustomobject]@{ Ok = $true; Verb = 'report'; Path = $Out; Rows = $export.Rows; Dataset = $datasetName; Result = 'Success' }
+    }
+
+    if ($Json) {
+        # Arrays are wrapped with @() on the way in so a single-element bucket or target list stays an
+        # array - a consumer that does .Count on a scalar crashes, and one-run windows are the common case.
+        Write-Host (Format-WuuJsonDocument -Command 'report' -Fields ([ordered]@{
+                    Period         = $history.Label
+                    From           = ([datetime]$history.From).ToString('o')
+                    To             = ([datetime]$history.To).ToString('o')
+                    GroupBy        = $GroupBy
+                    FailedOnly     = [bool]$FailedOnly
+                    ComputerFilter = @($computers)
+                    LogFiles       = @($history.Files)
+                    MalformedLines = [int]$history.MalformedLines
+                    Summary        = $s
+                    TimeBuckets    = @($report.TimeBuckets)
+                    ProblemTargets = @($report.ProblemTargets)
+                    ErrorBreakdown = @($report.ErrorBreakdown)
+                }))
+    } else {
+        Format-WuuReportTable -Report $report -Window $history -Top 5
+    }
+
+    return [pscustomobject]@{ Ok = $true; Verb = 'report'; Runs = $s.TotalRuns; Failed = $s.FailedRuns; SuccessRate = $s.SuccessRatePercent; Result = 'Success' }
+}
+
 function Get-WuuCommandPlan {
     <#
     .SYNOPSIS What a command WOULD do, per computer, without doing any of it (hardening brief SS11).
@@ -631,6 +763,14 @@ function Get-WuuCommandTable {
             Answers = { param($p) @($p.ListName, $p.ListName) }
             Help = 'Config:  wuu config save [-ListName <name>] | wuu config load [-ListName <name>]'
         }
+        'report' = @{
+            # READ-ONLY, and sub-dispatched directly in Invoke-WuuCommand because it is not a
+            # $consoleActions operation. Mutating = $false keeps it on the best-effort audit path
+            # (one 'operational' record), exactly like show/export.
+            Action = $null; Mutating = $false
+            Answers = { param($p) @() }
+            Help = 'Generate deployment report:  wuu report [-Period 7d|30d|all] [-GroupBy Day|Week|Month|None] [-From <date>] [-To <date>] [-Computer <names>] [-FailedOnly] [-Out <file.csv>] [-Dataset Runs|Targets|Causes] [-LogPath <file>] [-Json]'
+        }
         'credentials' = @{
             Action = 'EventSetDomainCredentials'; Mutating = $false
             Answers = { param($p) @() }
@@ -671,7 +811,7 @@ function Get-WuuCommandHelp {
     Write-Host '    -All                shortcut for -Computer all'
     Write-Host '    -Reason <text>      why this change was made (recorded in the audit trail)'
     Write-Host '    -Path <file>        audit verify|show: the log to inspect. audit export: the output destination'
-    Write-Host '    -LogPath <file>     audit verify|show|export: the audit log to read (unambiguous)'
+    Write-Host '    -LogPath <file>     audit verify|show|export, report: the audit log to read (unambiguous)'
     Write-Host '    -Json               machine-readable output (read verbs)'
     Write-Host '    -WhatIf             report what would happen; change nothing'
     Write-Host '    -Async              queue the work and return (exit 6 = accepted, NOT completed)'
@@ -725,8 +865,19 @@ function Invoke-WuuCommand {
         # SS: which list inside the encrypted config file to save into or load from. Empty means the
         # default name on save, and the default-named list (else the first) on load.
         [string]$ListName = '',
-        # The audit log to inspect/export, for `audit verify|show|export`. Distinct from -Path,
-        # which is ambiguous (a log for verify/show, an output destination for export).
+        # report: the reporting window and shaping. -Period accepts <n>h|d|w|m or 'all'; -From/-To
+        # override it. -GroupBy buckets the timeline. -Out writes CSV instead of printing.
+        [string]$Period = '7d',
+        [ValidateSet('', 'Day', 'Week', 'Month', 'None')][string]$GroupBy = 'Day',
+        [string]$From = '',
+        [string]$To = '',
+        [switch]$FailedOnly,
+        [string]$Out = '',
+        [ValidateSet('', 'Runs', 'Targets', 'Causes')][string]$Dataset = 'Runs',
+        # The audit log to inspect/export, for `audit verify|show|export`, and the single file to read
+        # for `report`. Distinct from -Path, which is ambiguous (a log for verify/show, an output
+        # destination for export). One parameter serves both because it means the same thing in both
+        # cases: "this is the audit file, not the default one".
         [string]$LogPath,
         # Required for mutating verbs once audit is active (Phase 4): records WHY the change was
         # made. Interactive mode prompts; non-interactive mode fails without it.
@@ -779,6 +930,13 @@ function Invoke-WuuCommand {
         if ($SubVerb -ne 'wsus') {
             return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu audit needs one of: wsus, verify, show, export, anchor'; Result = 'UsageError' }
         }
+    }
+    elseif ($Verb -eq 'report') {
+        # Handled like the local audit verbs: a read over the audit trail, not a $consoleActions
+        # operation. Returning here is what keeps it on the read-only path (no mutating choke point,
+        # no -Reason requirement) while still producing ONE operational audit record via the caller.
+        return Invoke-WuuReportCommand -Period $Period -GroupBy $GroupBy -From $From -To $To `
+            -Computer $Computer -FailedOnly:$FailedOnly -Out $Out -Dataset $Dataset -LogPath $LogPath -Json:$Json
     }
 
     if (-not $actionName -or -not $Actions.ContainsKey($actionName)) {
@@ -964,6 +1122,10 @@ function ConvertTo-WuuCommandLine {
         # SS: names which of the lists in the encrypted config file to save into or load from.
         # Omitted, a save uses the default name and a load prefers the default-named list.
         '-listname' = 'ListName'
+        # Reporting window and shaping. Each takes a VALUE, so ConvertTo-WuuCommandLine consumes the
+        # following token - see the value-taking option branch below.
+        '-period' = 'Period'; '-groupby' = 'GroupBy'; '-from' = 'From'; '-to' = 'To'
+        '-failedonly' = 'FailedOnly'; '-out' = 'Out'; '-dataset' = 'Dataset'
         # Declare "queue and return" as the DESIRED outcome (SS10). Without it, a command whose
         # bounded wait expires with work still outstanding exits 3 (timeout) instead of 0, because
         # success must mean completed, not accepted.
@@ -986,7 +1148,17 @@ function ConvertTo-WuuCommandLine {
             $key = $a.ToLowerInvariant()
             if (-not $known.ContainsKey($key)) { [void]$result.Unknown.Add($a); $i++; continue }
             $name = $known[$key]
-            if ($name -in @('Computer', 'Path', 'Column', 'Set', 'Reason')) {
+            # Options that TAKE A VALUE. A name missing from this list is added to Options as $true,
+            # which silently drops the value the operator typed - `wuu report -Period 30d` would then
+            # treat '30d' as a positional and report on the default window with no error.
+            #
+            # LogPath WAS missing here, and it is registered in $known, so
+            # `wuu audit show -LogPath D:\copy.jsonl` set LogPath to $true and left the path as a stray
+            # positional: the command then inspected the NEWEST log instead of the one named, with no
+            # error and no hint that the argument was ignored. Pre-existing, found while adding the
+            # report options to this same list - the gate asserted that -LogPath is REGISTERED, which
+            # it was, and never that it consumes a value.
+            if ($name -in @('Computer', 'Path', 'Column', 'Set', 'Reason', 'LogPath', 'Period', 'GroupBy', 'From', 'To', 'Out', 'Dataset', 'ListName')) {
                 if ($i + 1 -ge $Arguments.Count) { [void]$result.Unknown.Add("$a (missing value)"); $i++; continue }
                 $result.Options[$name] = $Arguments[$i + 1]; $i += 2; continue
             }
@@ -1016,6 +1188,8 @@ Export-ModuleMember -Function @(
     'Get-WuuExitCodeMeaning'
     'Get-WuuCommandPlan'
     'Write-WuuCommandPlan'
+    'Invoke-WuuAuditCommand'
+    'Invoke-WuuReportCommand'
     'Invoke-WuuCommand'
     'ConvertTo-WuuCommandLine'
     # Exported because the guided UI's Reports/audit category (spec 20) invokes the audit verbs
