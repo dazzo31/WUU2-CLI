@@ -7,6 +7,11 @@ across a fleet of remote machines from a terminal, with a hash-chained **audit t
 No GUI, no WPF, no XAML. Pure PowerShell 5.1. Same update engine as the
 [GUI edition](https://github.com/dazzo31/WUU2), driven from a menu or from scriptable commands.
 
+> **This document tracks the released version.** When a release changes behaviour described here,
+> this file is updated in the same commit as the version bump; see
+> [`docs/RELEASE_NOTES_v1.5.0-beta.7-cli.md`](docs/RELEASE_NOTES_v1.5.0-beta.7-cli.md) for what
+> changed most recently.
+
 ```
   WUU2-CLI - Windows Update Utility (console edition)
   Press ? for help, t to toggle auto download/install/reboot, q to quit.
@@ -57,7 +62,7 @@ computer set exists.
 
 ```powershell
 .\WUU.ps1                 # guided workflow (default)
-.\WUU.ps1 --flat-menu     # the older single-screen menu (26 keyed operations)
+.\WUU.ps1 --flat-menu     # the older single-screen menu (27 keyed operations)
 ```
 
 The flat menu is retained as a deliberate fallback: the guided workflow is newer orchestration, and
@@ -90,7 +95,9 @@ Prefer commands? The operations that change remote state are verbs:
 
 ### Exit codes
 
-Eight documented codes, so a pipeline can gate on the specific outcome rather than on "non-zero":
+The numbers are the contract: a script branches on them. This table names each code; the full
+contract - per-verb causes, the `-Async` interaction, and what the `-Json` document carries - is in
+[`docs/EXIT_CODES.md`](docs/EXIT_CODES.md), which is the normative copy if the two ever disagree.
 
 | Code | Meaning |
 | --- | --- |
@@ -320,9 +327,15 @@ status line shows the operation, its remaining budget and how long since the las
 
 ## Audit trail (ISO/IEC 27001:2022 A.8.15)
 
-This is the main reason the console edition exists. Every operation — from the menu or the command
-line — is recorded to `%PROGRAMDATA%\WUU2\audit\audit-YYYYMMDD.jsonl`: one JSON object per line, one
-file per UTC day.
+Every action is appended to a hash-chained log under `%PROGRAMDATA%\WUU2\audit`, one file per UTC day
+(`audit-YYYYMMDD.jsonl`). Mutating actions are **two** records - an intent and an outcome, linked by a
+correlation id - so evidence exists that the action was attempted even if the process dies mid-flight.
+Each record carries WHO (`operator`/`runId`), WHAT (`action`/`category`/`parameters`), WHICH
+(`targets`), WHEN, WHERE (`host`/`pid`) and OUTCOME (`result`/`error`/`counts`), which is the field set
+A.8.15 asks for. Use `wuu report` to read it back as operational figures - run outcomes, failing
+machines and their causes - without inspecting JSONL by hand.
+
+This is the main reason the console edition exists.
 
 **One deliberate exception: `-WhatIf`.** A dry run writes **nothing** to the trail and changes
 nothing anywhere else — so it can be repeated freely while preparing a change, with no artefacts to
@@ -407,8 +420,8 @@ Same engine, different presentation layer. What actually changed:
 | Concurrency | No per-computer guard: a second operation was silently discarded | One operation per computer, decided at a single submission point, plus a global cap |
 | Timeouts | One flat 10-minute stop | A per-operation budget, recorded at submission, with a heartbeat |
 | Liveness | ICMP (`Test-Connection`) decided online/offline | The management endpoint decides — ICMP is blocked by default on Windows |
-| Interface | Mouse-driven context menus | A guided workflow (default) **and** 26 keyed operations **and** 17 scriptable verbs |
-| Exit codes | n/a | Eight documented codes; `0` means completed |
+| Interface | Mouse-driven context menus | A guided workflow (default) **and** 27 keyed operations **and** 18 scriptable verbs |
+| Exit codes | n/a | A documented code per outcome, not one failure number; `0` means completed |
 | Audit | none | Hash-chained ISO 27001 A.8.15 audit trail with a required change reason |
 
 **Not carried over:** column drag-resize/auto-fit, clipboard and context-menu affordances, the AD
@@ -428,11 +441,17 @@ The plan and per-phase progress notes are in [`docs/CLI_AUDIT_PLAN.md`](docs/CLI
 WUU.ps1                  entry point: interactive menu, or a single verb + options
 src/
   Wuu.Core.psm1          application wiring, action layer, validation, elevation/STA handling
+  Wuu.Configuration.psm1 paths and $global:* settings (version, timeouts, deadlines, concurrency)
   Wuu.Console.psm1       console shell: status table, menu, input choke point
+  Wuu.Presentation.psm1  presentation helpers shared by the display paths
+  Wuu.Actions.Display.psm1  the display/table actions (show updates, installed, history, log)
   Wuu.Command.psm1       verb table, argument parser, dispatcher, help
-  Wuu.Audit.psm1         ISO 27001 A.8.15 audit trail: schema, hash chain, verification
+  Wuu.Result.psm1        the command result model and its versioned JSON rendering
+  Wuu.Audit.psm1         ISO 27001 A.8.15 audit trail: schema, hash chain, verification, anchoring
+  Wuu.Reporting.psm1     deployment reporting: reads the audit trail, aggregates runs and failures
   Wuu.State.psm1         thread-safe computer state store (replaces the WPF ListView)
   Wuu.WindowsUpdate.psm1 update search/download/install, per-computer runspaces, phases
+  Wuu.Scheduler.psm1     worker-runspace construction for the scheduling and cleanup machinery
   Wuu.Remote.psm1        DCOM CIM sessions, remote task execution, timeouts
   Wuu.Network.psm1       connectivity and system performance probes
   Wuu.Credentials.psm1   credential cache, encrypted computer-list config, credential-mode check
@@ -452,6 +471,10 @@ tests/                   headless regression suites
 docs/                    design, progress and compliance documentation
 ```
 
+Not listed above but part of the surface: `Scripts\Test-*.ps1` are the release gate's constituent
+checks (dot-sourced by `Validate-Release.ps1` in verdict order), and `Scripts\Invoke-TestSuites.ps1`
+is the suite runner. Both are dev tooling and are not run by the application.
+
 ---
 
 ## Development
@@ -463,7 +486,6 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Scripts\Validate-
 ```
 
 This is a real gate, not a smoke test, and it is what CI should run. It:
-
 - parses every shipped file under the PS 5.1 engine;
 - asserts no WPF/XAML reference remains in code (comments excluded, so explanatory notes do not
   trip it);
@@ -513,7 +535,8 @@ runner (behaviour). See [`.github/workflows/validate.yml`](.github/workflows/val
 > **Two stale suites:** `tests\Test-ColumnResize.ps1` and `tests\Test-DragResize.ps1` are GUI-edition
 > leftovers that exercise WPF column drag-resize, which does not exist here. ColumnResize fails on
 > its missing WPF assemblies; **DragResize hangs** (blocking dispatcher pump). Both should be deleted,
-> and both are excluded by the runner. The timeout exists because of DragResize.
+> and both are excluded by the runner (the exclusion list is `$excludedSuites` in
+> `Scripts\Invoke-TestSuites.ps1`). The per-suite timeout exists because of DragResize.
 
 Build a release zip:
 
