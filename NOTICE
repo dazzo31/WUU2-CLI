@@ -1,0 +1,61 @@
+﻿WUU2-CLI — Windows Update Utility (Console Edition)
+=====================================================
+
+This software is an evolved derivative work based upon multiple open-source
+PowerShell patch management utilities. All upstream projects and this derivative
+work are released under the terms of the MIT License (see LICENSE).
+
+Upstream Lineage & Copyright Attribution:
+------------------------------------------
+
+1. PoshPAIG (PowerShell Patch Audit/Installation GUI)
+   - Initial Release: 2011; GitHub repository established 2014
+   - Author: Boe Prox
+   - Original Repository: CodePlex (poshpaig.codeplex.com) / GitHub (https://github.com/proxb/PoshPAIG)
+   - Copyright: Copyright (c) 2014 Boe Prox
+   - Key contributions retained/descended:
+     * Synchronized runspace collection design ($jobs, $jobCleanup, $updatesHash)
+     * Host exclusion list handling (Exempt.txt)
+     * Administrative elevation check patterns
+     * Remote patch check and installation workflow concepts
+
+2. Windows Update Utility (WUU)
+   - Release: December 14, 2016
+   - Author: Tyler Siegrist
+   - Publication: Microsoft TechNet / Script Center (ID 1d72e520) / GitHub (https://github.com/HashGambit97/WindowsUpdateUtility)
+   - Attribution: Documented as a major architectural rewrite of PoshPAIG
+   - Copyright: Copyright (c) 2016 Tyler Siegrist
+   - Key contributions retained/descended:
+     * Consolidation into unified automation scriptblocks ($GetUpdates, $DownloadUpdates, $InstallUpdates)
+     * Native Windows Update Agent (WUA) COM API automation (Microsoft.Update.Session)
+     * Update search query criteria ("IsInstalled=0 and IsHidden=0") and local install loops
+
+3. WUU2
+   - Initial Release: October 2018
+   - Maintainer: HanSolo71
+   - Forum Contributor: Phaere
+   - Repository: GitHub (https://github.com/HanSolo71/WUU2)
+   - Copyright: Copyright (c) 2018 HanSolo71
+   - Key contributions retained/descended:
+     * Runspace scope isolation and stability fixes
+     * Formal publication under the MIT License on GitHub
+
+4. WUU2 (GUI Edition) & WUU2-CLI (Console Edition)
+   - Development: 2025–2026
+   - Author: dazzo31
+   - Repositories:
+     * GUI Edition: https://github.com/dazzo31/WUU2
+     * CLI Edition: https://github.com/dazzo31/WUU2-CLI
+   - Copyright: Copyright (c) 2025-2026 dazzo31
+   - Key architectural enhancements and new implementations:
+     * Removal of PsExec dependency in favour of temporary SYSTEM scheduled tasks
+     * 5-wave phased deployment engine with automated phase gates
+     * Multi-target custom credential isolation via DCOM CIM sessions
+     * Hardened timeout budgets, deadline floors, and heartbeat monitoring
+     * Complete elimination of WPF/XAML/UI dependencies in WUU2-CLI
+     * Thread-safe, monotonic, revision-guarded state machine (Wuu.State)
+     * ISO/IEC 27001:2022 A.8.15 hash-chained audit logging subsystem (Wuu.Audit)
+     * Scriptable command parser and terminal guided workflow (Wuu.Command, Wuu.Navigate)
+     * Automated regression suites and release verification gates
+
+For complete details on the migration and code transformation, see docs/PROVENANCE.md.

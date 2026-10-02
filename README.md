@@ -1,4 +1,4 @@
-# WUU2-CLI
+﻿# WUU2-CLI
 
 **Windows Update Utility — console edition.** Check, download, install and reboot Windows Updates
 across a fleet of remote machines from a terminal, with a hash-chained **audit trail** built for
@@ -470,13 +470,17 @@ Stated plainly, because they are real:
 
 ---
 
-## License
+## License and Provenance
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-Based on the original Windows Update Utility by **Tyler Siegrist** (TechNet / PoshPIAG):
-<https://gallery.technet.microsoft.com/scriptcenter/Windows-Update-Utility-WUU-1d72e520>
+This project is a multi-generation evolution of open-source PowerShell patch management utilities:
+- **PoshPAIG** (2011–2014) by **Boe Prox** ([GitHub](https://github.com/proxb/PoshPAIG) / CodePlex)
+- **Windows Update Utility / WUU** (2016) by **Tyler Siegrist** ([TechNet](https://gallery.technet.microsoft.com/scriptcenter/Windows-Update-Utility-WUU-1d72e520) / [GitHub](https://github.com/HashGambit97/WindowsUpdateUtility))
+- **WUU2** (2018) by **HanSolo71** with forum fixes by **Phaere** ([GitHub](https://github.com/HanSolo71/WUU2))
+- **WUU2 (GUI) & WUU2-CLI (Console)** (2025–2026) by **dazzo31**
 
-The GUI edition of this fork lives at <https://github.com/dazzo31/WUU2>. Its release notes and
-GUI-specific documentation remain in `docs/` for history — they describe the WPF edition, not this
-one.
+For the detailed lineage, architectural evolution, and code ancestry matrix, see [docs/PROVENANCE.md](docs/PROVENANCE.md).
+
+The companion GUI edition of this fork lives at <https://github.com/dazzo31/WUU2>. Its release notes and
+GUI-specific documentation remain in docs/ for historical reference.
