@@ -22,6 +22,11 @@
 #   * if a gate is moved to a different setting, the truth table fails -> this test fails;
 #   * the test cannot drift away from the implementation, because it does not contain a copy.
 #
+# Section 10 applies the same technique to the master toggle itself. The handler tells the operator
+# "Nothing has been started - this only changes how FUTURE operations behave." Nothing asserted that:
+# section 9 proves WHICH settings change, never what the handler CALLS, so a submission or a remote
+# call could be added to the branch and every prior assertion would still pass.
+#
 # Run: powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File tests\Test-AutoSettings.ps1
 #
 # -CorePath exists so this suite can be pointed at a PRE-FIX copy of the module to prove it has
@@ -241,6 +246,73 @@ if (-not $toggleBlock.Success) {
     # would restore the defect silently.
     $inverts = @([regex]::Matches($coreSource, '=\s*-not\s+\$\w*\.?(AutoDownload|AutoInstall|AutoReboot)'))
     Assert-Equal $inverts.Count 0 'no automation setting is INVERTED (the toggle computes an explicit value)'
+}
+
+# --- 10. THE MASTER TOGGLE CANNOT START WORK (instructions SS16) --------------------------------
+#
+# The handler tells the operator "(Nothing has been started - this only changes how FUTURE operations
+# behave.)". Section 9 above proves WHICH settings change; it says nothing about what the handler
+# CALLS, so a submission or a remote call could be slipped into the branch and every assertion above
+# would still pass.
+#
+# Asserted on the handler's own AST, not on its text. A comment naming a command is not a call, and
+# this suite tests behaviour rather than prose (instructions SS37). The allowlist is CLOSED - a
+# command that is not listed fails even if it is also not on the denylist - so the check keeps its
+# teeth when someone later invents a new dispatch helper.
+$toggleAssign = @($ast.FindAll({
+            param($x) ($x -is [System.Management.Automation.Language.AssignmentStatementAst]) -and
+            ($x.Left.Extent.Text -ceq '$consoleActions.EventToggleSettings')
+        }, $true))
+
+Assert-Equal $toggleAssign.Count 1 'the EventToggleSettings handler was located exactly once in the shipped source'
+if ($toggleAssign.Count -eq 1) {
+    $handlerAst = [System.Management.Automation.Language.Parser]::ParseInput(
+        $toggleAssign[0].Right.Extent.Text, [ref]$null, [ref]$null)
+
+    # Every command the handler can invoke. `Out-Null` appears because each funnel call is piped to
+    # it; that is a pipe sink, not work.
+    $called = @($handlerAst.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            ForEach-Object { $_.GetCommandName() })
+    $distinct = @($called | Where-Object { $_ } | Sort-Object -Unique)
+    Write-Host ('  EventToggleSettings invokes: {0}' -f ($distinct -join ', ')) -ForegroundColor DarkGray
+
+    $allow = @('Set-WuuSetting', 'Update-Status', 'Write-Host', 'Out-Null')
+    $unexpected = @($distinct | Where-Object { $allow -notcontains $_ })
+    $unnamed = @($called | Where-Object { -not $_ }).Count
+
+    Assert-Equal $unexpected.Count 0 "the master toggle invokes only the settings funnel and presentation (unexpected: $($unexpected -join ', '))"
+    Assert-Equal $unnamed 0 'the master toggle invokes no command through a variable or expression (an indirect call cannot be allowlisted)'
+
+    # Named explicitly as well as covered by the closed allowlist, so a failure names the hazard
+    # instead of only reporting an unrecognised command.
+    $remote = @('Invoke-Command', 'New-PSSession', 'Enter-PSSession', 'Start-Job', 'Start-ThreadJob',
+        'Start-Process', 'Invoke-WuuRemoteTask', 'Invoke-CimMethod', 'Invoke-WmiMethod',
+        'Invoke-Expression', 'New-WuuWorker', 'Submit-WuuOperation')
+    $present = @($remote | Where-Object { $called -contains $_ })
+    Assert-Equal $present.Count 0 "the master toggle starts no work and calls nothing remote (found: $($present -join ', '))"
+
+    # It changes SETTINGS, not operation state. A row write from here would be a mutation outside the
+    # approved state code (instructions SS9), which the module-scope gate cannot see because this is
+    # a scriptblock body rather than module scope.
+    $stateWrites = @($handlerAst.FindAll({
+                param($x) ($x -is [System.Management.Automation.Language.AssignmentStatementAst]) -and
+                ($x.Left.Extent.Text -match '\.(OperationId|OpState|PendingOp|Revision|Pending|State|StateSource)\b')
+            }, $true))
+    Assert-Equal $stateWrites.Count 0 'the master toggle writes no operation state (it changes settings only)'
+
+    # All three settings, by name, through the funnel. Two or four would be a defect the table in
+    # section 9 cannot see, because it only reads the resulting values.
+    $funnelNames = @()
+    foreach ($c in $handlerAst.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        if ($c.GetCommandName() -ceq 'Set-WuuSetting') {
+            for ($i = 0; $i -lt ($c.CommandElements.Count - 1); $i++) {
+                if ($c.CommandElements[$i].Extent.Text -ceq '-Name') {
+                    $funnelNames += ([string]$c.CommandElements[$i + 1].Extent.Text).Trim([char]39, [char]34)
+                }
+            }
+        }
+    }
+    Assert-Equal ((@($funnelNames | Sort-Object -Unique)) -join ', ') 'AutoDownload, AutoInstall, AutoReboot' 'all three settings, and only those, are written through the funnel'
 }
 
 # The toggle must go through the settings funnel. Set-WuuSetting exists and is exported, so a

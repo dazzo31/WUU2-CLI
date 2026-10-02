@@ -2844,6 +2844,11 @@ $consoleActions.EventToggleSettings = {
     direction is chosen for safety of INTENT rather than of effect: pressing the master control
     never leaves a partially-enabled pipeline, and the state it leaves is the one the operator can
     then switch off in a single further press.
+
+    It STARTS NOTHING, and that is asserted rather than merely stated. The handler may invoke only
+    the settings funnel and presentation; Test-AutoSettings section 10 reads this block's own AST
+    and fails if it invokes anything else, calls anything through a variable, calls anything remote,
+    or writes operation state. Do not add work to this handler - changing a setting is its whole job.
     #>
     $s = $stateStore.Settings
 
