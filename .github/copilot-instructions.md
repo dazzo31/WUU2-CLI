@@ -1418,8 +1418,9 @@ Never assume uncommitted changes belong to you.
 ---
 
 # 45. Current architectural priorities
-These are the recommended development priorities. Status is as of `v1.5.0-beta.5-cli`; see Appendix A
-for per-invariant evidence.
+These are the recommended development priorities. Status corrected 2026-10-02 against the tree (the
+previous revision had drifted - three entries marked NOT IMPLEMENTED were done or partly done); see
+Appendix A for per-invariant evidence.
 
 ## P0
 
@@ -1434,17 +1435,25 @@ for per-invariant evidence.
 
 ## P1
 
-1. Formalise command result model. — **NOT IMPLEMENTED**.
-2. Make JSON output a versioned API. — **NOT IMPLEMENTED** (read verbs only, no `schemaVersion`).
+1. Formalise command result model. — **DONE**: `Wuu.Result.psm1` (6 functions) is the single model;
+   command mode builds ONE result via `New-WuuCommandResult` and renders both JSON and prose from it.
+2. Make JSON output a versioned API. — **PARTIAL**: the command-result JSON carries `schemaVersion`
+   (`Wuu.Result.psm1`), but the READ verbs do not use the model — `audit verify`, `audit show` and
+   `-WhatIf` each hand-build their own shape in `Wuu.Command.psm1` with no version field. A consumer
+   therefore cannot write one stable parser. This is the remaining external-contract gap.
 3. Implement/remove unreachable exit code contracts. — **DONE**: all of `0`–`7` have producers.
 4. Improve pending-operation precedence. — **DONE**: semantic precedence in `Set-WuuPendingOperation`
    via `Get-WuuPendingOpRank` (SS16); a downgrade is declined and reported, an upgrade replaces.
 
 ## P2
 
-1. Extract scheduler responsibility. — **PARTIAL** (`Wuu.Scheduler` owns the worker-helper surface only).
-2. Reduce `Wuu.Core.psm1`. — **NOT IMPLEMENTED**.
-3. Reduce `Validate-Release.ps1`. — **NOT IMPLEMENTED**.
+1. Extract scheduler responsibility. — **PARTIAL** (`Wuu.Scheduler` owns the worker-helper surface only;
+   the tick `Start-PendingUpdateCheck` and admission still live in `Wuu.WindowsUpdate`).
+2. Reduce `Wuu.Core.psm1`. — **PARTIAL**: 4,129 -> 3,430 lines (Configuration, Presentation, Display
+   actions, the job-cleanup payload and 6 code-less GUI regions have moved out). Still the largest
+   file; the remaining regions all have real in/out coupling, so each move needs a measured plan.
+3. Reduce `Validate-Release.ps1`. — **DONE**: 3,312 -> 265 lines; 12 fragments under `Scripts/`,
+   dot-sourced in verdict order (two of them by another fragment, to keep that order).
 4. Reduce worker duplication. — **PARTIAL** (one log appender; guard copies remain by necessity).
 
 ## P3
