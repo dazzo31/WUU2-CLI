@@ -515,27 +515,19 @@ function New-ComputerRunspace {
 function Start-UpdateCheckJob {
     param(
         $ComputerItem,
-        # Optional follow-up operation to chain in a SINGLE pipeline. NEVER BeginInvoke a
-        # second pipeline onto a busy per-computer runspace from inside that runspace:
-        # the inner payload silently never runs and EndInvoke throws "pipeline already
-        # running" (root cause of auto-download/auto-install doing nothing). Chained
-        # ops run sequentially inside one BeginInvoke, exactly like $eventInstallUpdates.
+        # Optional follow-up operation to chain in a SINGLE pipeline. NEVER BeginInvoke a second
+        # pipeline onto a busy per-computer runspace from inside that runspace: the inner payload
+        # silently never runs and EndInvoke throws "pipeline already running". Chained ops run
+        # sequentially inside one BeginInvoke.
         #
-        # THIS IS THE ONLY PLACE A PER-COMPUTER OPERATION IS SUBMITTED (SS3/SS4). The console
-        # handlers in Wuu.Core used to compose their own [powershell]::Create() + BeginInvoke per
-        # computer, which meant: the per-computer gate could not see them (they never set OpState),
-        # the global MaxConcurrentJobs cap did not apply to them, and EventGetUpdates took the
-        # unguarded branch on every re-check (it only called this function when the row had NO
-        # runspace). They now all delegate here.
+        # THIS IS THE ONLY PLACE A PER-COMPUTER OPERATION IS SUBMITTED (SS3/SS4), and BOTH admission
+        # gates live in it: 8.1 (one operation per computer, via Test-WuuComputerBusy) and 8.6 (the
+        # global cap, via Test-WuuConcurrencyAvailable). A caller that reaches this function has
+        # therefore already had both applied - do not re-check them at a call site, or the copies drift.
         #
-        # Both admission gates live in this function: 8.1 (one operation per computer, via
-        # Test-WuuComputerBusy) and 8.6 (the global cap, via Test-WuuConcurrencyAvailable). A caller
-        # that reaches this function has therefore already had BOTH applied - do not re-check them at
-        # a call site, or the two copies will drift.
-        #
-        # ONE JOB ENTRY PER ADMITTED OPERATION: the job list is the cap's counter, so exactly one
-        # entry may be added per admitted operation. Anything that adds a second entry for the same
-        # operation would count it twice and make the cap refuse work it has capacity for.
+        # ONE JOB ENTRY PER ADMITTED OPERATION: the job list is the cap's counter, so exactly one entry
+        # may be added per admitted operation. A second entry for the same operation counts it twice and
+        # makes the cap refuse work it has capacity for.
         [ValidateSet('Check','Download','InstallAndRecheck','AutoFlow','Restart','RemoveOffline','ServiceAction')]
         [string]$Op = 'Check',
         # Only used by 'ServiceAction' (start|stop|restart). Passed through rather than carried on
@@ -570,24 +562,19 @@ function Start-UpdateCheckJob {
         }
 
         # ---- GLOBAL CONCURRENCY CAP (SS4) ------------------------------------------------------
-        # The SECOND admission gate, and the one that was missing. 8.1 bounds each computer to one
-        # operation; this bounds how many computers run at once.
+        # The SECOND admission gate: 8.1 bounds each computer to one operation, this bounds how many
+        # computers run at once. It belongs HERE, not only in the scheduler, because console handlers
+        # call this function directly in a loop - the limit must be a property of the submission
+        # contract rather than of one caller's discipline. The scheduler keeps its own check so the
+        # estate does not spin through rows that cannot run; this one makes the limit unconditional.
         #
-        # WHY IT BELONGS HERE AND NOT ONLY IN THE SCHEDULER: the scheduler applied the cap itself, but
-        # every console handler calls this function DIRECTLY in a loop, so the cap was never consulted
-        # on that path. A `-All check` over a large estate could therefore start one pipeline per
-        # computer with no ceiling. The scheduler's own check is kept (it stops before SUBMITTING, so
-        # the estate does not spin through rows that cannot run); this one makes the limit a property
-        # of the submission contract rather than of one caller's discipline.
+        # A refusal is a NORMAL outcome, not an error - the same contract as the per-computer gate. The
+        # caller leaves the row Pending and the scheduler admits it on a later tick. Logged at INFO so a
+        # run can be reconstructed.
         #
-        # A refusal is a NORMAL outcome, not an error - the same contract as the per-computer gate.
-        # The caller leaves the row Pending, and the scheduler admits it on a later tick once capacity
-        # frees. Logged at INFO so a run can be reconstructed.
-        #
-        # SS4: THIS CHECK IS ADVISORY. Passing it reserves nothing - the job entry that the cap COUNTS
-        # is appended ~140 lines below, after runspace creation and pipeline composition, so a second
-        # submission during that span sees the same count and admits too. It is kept because it is
-        # cheap and it defers work early; the AUTHORITATIVE test is taken under the submission lock
+        # THIS CHECK IS ADVISORY. Passing it reserves nothing - the job entry the cap COUNTS is appended
+        # after runspace creation and pipeline composition, so a concurrent submission during that span
+        # sees the same count and admits too. The AUTHORITATIVE test is taken under the submission lock
         # immediately before the append (see the reservation block below).
         if (-not (Test-WuuConcurrencyAvailable -Jobs $jobs -MaxConcurrentJobs $MaxConcurrentJobs)) {
             # PHASE 5: a cap refusal is the most likely kind to be TRANSIENT (the estate is full right

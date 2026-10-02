@@ -244,8 +244,7 @@ try {
 
 #region PowerShell STA Mode Validation
     # STA is required because the Windows Update COM APIs and the per-computer runspaces are
-    # apartment-affine. (The original comment said "required for WPF" - that was true of the GUI
-    # edition; this edition has no GUI, but the COM/runspace requirement remains.)
+    # apartment-affine. There is no GUI in this edition, but the COM/runspace requirement remains.
     Write-DebugLog "Checking PowerShell apartment state: $($host.Runspace.ApartmentState)" -Level 'INFO'
     if ($host.Runspace.ApartmentState -ne 'STA') {
         Write-Warning "This script must be run in PowerShell started with the -STA switch!"
@@ -291,11 +290,10 @@ try {
 function Set-ComputerState {
     <#
     .SYNOPSIS
-    Updates a computer's State and Status consistently. The State column in the
-    ListView is the canonical pipeline position; Status is the human-readable text.
-    Callers should prefer Set-ComputerState over direct `$Computer.Status = '...'`
-    assignments so the two never drift.
-    .PARAMETER Computer - ListView row object (the per-computer PSCustomObject)
+    Updates a computer's State and Status consistently. The State field is the canonical pipeline
+    position; Status is the human-readable text. Callers must prefer this over a direct
+    `$Computer.Status = '...'` assignment so the two never drift.
+    .PARAMETER Computer - the per-computer row object held by the state store
     .PARAMETER State - One of the canonical pipeline states
     .PARAMETER StatusDetail - Optional suffix appended to the canned status text
     #>
@@ -327,11 +325,10 @@ function Set-ComputerState {
 function Set-ComputerTimeout {
     <#
     .SYNOPSIS
-    Marks a computer's operation as timed out WITHOUT marking it as a terminal
-    error. Timeout is recoverable (the next phase or a Phase-E retry may still
-    complete); Error is terminal. UI treats them differently (Timeout = yellow,
-    Error = grey) via the row Background callsites.
-    .PARAMETER Computer - ListView row object
+    Marks a computer's operation as timed out WITHOUT marking it as a terminal error. Timeout is
+    recoverable (the next phase or a Phase-E retry may still complete); Error is terminal. The two are
+    rendered differently (Timeout yellow, Error grey), which is why they must not be conflated.
+    .PARAMETER Computer - the per-computer row object held by the state store
     .PARAMETER Phase - What timed out ('WUA Session','Update Search','Reboot Wait',
                        'Performance Query','Credential Probe', etc.)
     .PARAMETER TimeoutSec - The timeout that was exceeded
@@ -519,68 +516,6 @@ function Invoke-AutoRecovery {
 }
 
 #endregion Monitoring and Performance
-
-#region Utility Functions
-# UPDATE-STATUS / UPDATE-STATUSBACKGROUND / _WuuReadPassword / SHOW-ERRORDIALOG /
-# SHOW-WARNINGDIALOG were extracted to src\Wuu.Presentation.psm1 (instructions SS8/SS7: presentation is
-the console module's business, and Core should become a bootstrap layer). The store they used to close
-over now arrives through Initialize-WuuPresentation, called during startup below.
-
-# Function to log info messages
-
-# Function to log warning messages
-
-# Function to log error messages
-
-# Function to log success messages
-
-#endregion Utility Functions
-
-#region System Utilities
-
-# Dependency checker
-
-# Helper function to safely execute operations with timeout
-
-# Encryption helper functions for computer list configuration
-
-
-# Function to save encrypted computer list configuration
-
-# Function to import encrypted computer list configuration
-# SUSPEND-/RESUME-BACKGROUNDPROCESSING extracted to src\Wuu.Presentation.psm1 (SS8). They set the SHARED
-# synchronized flag from Wuu.Configuration, which arrives through Initialize-WuuBackgroundProcessing.
-
-
-# Function to log warning messages
-
-# Function to log error messages
-
-# Console password prompt (replaces the WPF Show-PasswordPrompt dialog).
-# Returns a SecureString, or $null if the operator cancelled (empty password).
-#
-# ROUTED THROUGH Read-WuuAnswer (the single input choke point) rather than calling Read-Host here.
-# The project rule is that all input goes through the choke point because a screen calling Read-Host
-# directly cannot be driven in non-interactive mode; the choke point's -Secure path is also the one
-# that supplies a queued test answer, so a scripted run can exercise this prompt. A bare Read-Host
-# Function to log success messages
-
-#endregion Utility Functions
-
-#region System Utilities
-
-# Dependency checker
-
-# Helper function to safely execute operations with timeout
-
-# Encryption helper functions for computer list configuration
-
-
-# Function to save encrypted computer list configuration
-
-# Function to import encrypted computer list configuration
-#endregion Helper Functions
-
 #region ScriptBlocks
 
 # Helper function to update computer rows (main-session copy).
@@ -608,18 +543,15 @@ function Update-WuuComputerRow {
 
         # SS3: STALE-WRITER GUARD.
         #
-        # This is the choke point every payload uses to write row state, and it resolves its target
-        # by COMPUTER NAME - which is the row's key, not an identity. So a payload that outlives its
-        # operation still finds a live row: it may be the one a newer operation now owns (the timeout
-        # path detaches the runspace precisely so this happens on a detached object, but a writer can
-        # still be parked mid-write when the detach lands). Writing then would let a superseded
-        # operation restamp State/Status/Colour on the operation that replaced it.
+        # This is the choke point every payload uses to write row state, and it resolves its target by
+        # COMPUTER NAME - the row's key, not an identity. So a payload that outlives its operation still
+        # finds a live row: it may be the one a newer operation now owns. Writing then would let a
+        # superseded operation restamp State/Status/Colour on the operation that replaced it.
         #
-        # The guard is deliberately ASYMMETRIC: it refuses only the case it can PROVE is stale (a
-        # row that names an operation, and a writer naming a different one). An unattributed write is
-        # still permitted, because startup/import paths legitimately write rows that have no
-        # operation, and refusing those would break list loading. Proven-stale is refused; merely
-        # unattributed is allowed.
+        # The guard is deliberately ASYMMETRIC: it refuses only what it can PROVE is stale (a row that
+        # names an operation, and a writer naming a different one). An unattributed write is permitted,
+        # because startup/import paths legitimately write rows that have no operation, and refusing those
+        # would break list loading. Proven-stale is refused; merely unattributed is allowed.
         #
         # A refusal is logged, not silent: otherwise "the guard held" and "the write never happened"
         # look identical to an operator reading the log.

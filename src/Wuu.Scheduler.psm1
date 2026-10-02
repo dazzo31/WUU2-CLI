@@ -1,29 +1,15 @@
 # Wuu.Scheduler - worker-runspace construction for the scheduling and cleanup machinery.
 #
-# WHY THIS MODULE EXISTS
-# ----------------------
-# Worker runspaces are ISOLATED: an injected scriptblock cannot resolve a module function, cannot see a
-# sibling module's variables, and cannot be written as a literal `{ }` (a literal captures the defining
-# session state and sees nothing from SetVariable). So every helper a payload needs must be built as a
-# STRING and SetVariable'd in.
+# WHY THIS MODULE EXISTS. A worker runspace is ISOLATED: an injected scriptblock cannot resolve a module
+# function, cannot see a sibling module's variables, and cannot be written as a literal `{ }` (a literal
+# captures the defining session state and sees nothing from SetVariable). Every helper a payload needs
+# must therefore be built as a STRING and SetVariable'd in. That set IS the worker's capability surface,
+# so it must be assembled in one place rather than copied per call site - a copy makes agreement a
+# discipline instead of a construction guarantee.
 #
-# That constraint caused two problems this module fixes:
-#
-#   1. DUPLICATION. The fault-tolerant log appender - the one helper every payload and the cleanup loop
-#      needs - was written TWICE, once in Wuu.Core for the cleanup runspace and once in Wuu.WindowsUpdate
-#      for each per-computer runspace. The two copies were byte-identical after whitespace normalisation
-#      (verified), and each carried a comment telling the reader to keep them in sync. They are now built
-#      by ONE factory, so agreement is a construction guarantee rather than a discipline.
-#
-#   2. NO SINGLE PLACE TO REVIEW. The set of helpers a worker receives is the worker's actual capability
-#      surface. Reading it required searching two modules at call sites. It is now one function.
-#
-# SCOPE: this module owns HOW a worker runspace is wired - the injected helper set and the log appender
-# they share. It deliberately does NOT own WHEN work is submitted or how capacity is decided: that is the
-# submission point (Wuu.WindowsUpdate) and the concurrency contract (Wuu.State). Extracting the 349-line
-# Start-UpdateCheckJob was considered and rejected for this slice - it holds the credential epoch, the
-# pipeline composition and the reservation, and moving it would make this change far larger than the
-# dedupe it exists to perform.
+# SCOPE: this module owns HOW a worker runspace is wired. It does NOT own WHEN work is submitted or how
+# capacity is decided - that is the submission point (Wuu.WindowsUpdate) and the concurrency contract
+# (Wuu.State).
 
 function Add-WuuWorkerHelper {
     <#

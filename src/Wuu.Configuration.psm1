@@ -34,20 +34,14 @@ $global:WuuVersion = 'v1.5.0-beta.6-cli'
 
 # SS18: PROVENANCE, immediately after the literal so the resolved value cannot be overwritten by it.
 #
-# WHY THE ORDER MATTERS AND WHY THIS IS NOT AT MODULE SCOPE. This whole configuration region lives
-# inside Start-WuuApplication, not at module top level, so the literal above is evaluated when the
-# application starts. An earlier placement of this block was ABOVE the literal - the resolver ran
-# first, then the literal overwrote it, silently reverting to the embedded value. That is the same
-# class of bug as the version mismatch this is meant to prevent, which is why the resolved value is
-# written after the literal and nowhere else.
+# WHY THE ORDER MATTERS. This whole region lives inside Start-WuuApplication, so the literal above is
+# evaluated when the application starts. Placing this block ABOVE the literal lets the resolver run
+# first and the literal then overwrite it, silently reverting to the embedded value - the same class of
+# bug this is meant to prevent. The resolved value is therefore written after the literal and nowhere
+# else, and a DISAGREEMENT is reported rather than quietly resolved: the version is recorded on every
+# audit record, so picking a winner silently would label evidence with a build that did not make it.
 #
-# A git tag at HEAD wins (provenance for an operator, and it self-corrects when a release is tagged);
-# otherwise the embedded literal stands. A DISAGREEMENT is reported rather than quietly resolved:
-# the version is written on every audit record, so picking a winner silently is exactly how evidence
-# would end up labelled with a build that did not produce it.
-#
-# A release zip has no .git, so an operator running the packaged build legitimately falls back to the
-# embedded value - that is an expected case, not an error.
+# A release zip has no .git, so a packaged build legitimately falls back to the embedded value.
 try {
     $versionInfo = Resolve-WuuVersion -Embedded $global:WuuVersion -RepoRoot $WuuRoot
     if ($versionInfo) {
@@ -67,24 +61,16 @@ if ($global:WuuVersionSource -eq 'tag') {
 
 # Toggle debug logging. DEFAULT IS OFF.
 #
-# WHY OFF. This is a patch-management tool, so the default has to suit unattended operation: a
-# scheduled task or a CI job cannot act on a log size it was never told about. With verbose logging
-# on by default the consequences are real rather than cosmetic - large logs, unnecessary I/O on
-# every run, extra filesystem contention, operational detail written to disk by default, and
-# diagnostic noise interleaved with the audit records an ISO 27001 review reads.
+# WHY OFF. This is a patch-management tool, so the default must suit unattended operation: a scheduled
+# task or a CI job cannot act on a log size it was never told about. Verbose-by-default has real costs -
+# log growth, I/O on every run, filesystem contention, and diagnostic noise interleaved with the audit
+# records an ISO 27001 review reads.
 #
-# The comment here used to claim "$false by default" while the assignment said $true - the file's
-# own history block and the README both described the off default. The code was the outlier.
-#
-# HOW TO TURN IT ON WITHOUT EDITING SOURCE (editing a shipped file is not a supported way to change
-# behaviour - a reinstall silently reverts it, and the change is invisible to anyone reading the
-# configuration):
-#   1. environment variable  WUU_DEBUG=1   (best for a scheduled task or a CI job)
-#   2. source edit                          (last resort - see the warning above)
-# There is deliberately no config-file key for this yet: the only config the tool carries is the
-# encrypted computer list, and inventing a half-plumbed setting would be worse than the env var.
-# The env var wins over the default, so an operator can force it on for one run without touching
-# anything persistent.
+# HOW TO TURN IT ON WITHOUT EDITING SOURCE. Editing a shipped file is not a supported way to change
+# behaviour: a reinstall silently reverts it, and the change is invisible to anyone reading the
+# configuration. Set WUU_DEBUG=1 instead (best for a scheduled task or a CI job). There is deliberately
+# no config-file key yet - the only config the tool carries is the encrypted computer list, and a
+# half-plumbed setting would be worse than the env var.
 $global:EnableDebugLogging = $false
 
 # Apply the overrides. Kept here, immediately after the default, so there is one place to read for
@@ -127,20 +113,12 @@ $global:EndpointProbeTimeoutMs    = 3000
 $global:ConnectivityFailuresBeforeRemoval = 2
 
 # SS5: OPERATION-SPECIFIC deadlines (seconds), keyed by the op handed to Start-UpdateCheckJob.
-# WHY PER OP AND NOT ONE NUMBER. The cleanup loop force-stopped every job at a flat 10 minutes
-# (Core, "Job timeout detected"). Windows Update has no single sensible deadline:
-#   * a SEARCH can legitimately take 20+ minutes on a large estate against WSUS, so a flat 10 was
-#     killing healthy work and reporting a false timeout (the "10 minute hard stop" in the findings);
-#   * an INSTALL can take hours (an in-place servicing stack update alone can exceed 10 minutes);
-#   * a restart is the LONGEST - the offline and online waits are 600s + 1800s, so 10 minutes
-#     guaranteed a false timeout on EVERY reboot;
-#   * a SERVICE action that has not returned in 5 minutes is stuck, not slow.
-# A single number cannot express that, and choosing the largest one would mean a genuinely hung
-# service restart occupied a runspace for 45 minutes before anyone noticed.
-#
-# The deadline is recorded per computer (TimeoutExpiresAt/TimeoutSource) when the job is SUBMITTED,
-# so the decision is inspectable while the job is still running and is not recomputed from a
-# start time that a restart could reset.
+# WHY PER OP AND NOT ONE NUMBER. Windows Update has no single sensible deadline: a SEARCH can take
+# 20+ minutes on a large estate against WSUS, an INSTALL can take hours (an in-place servicing-stack
+# install alone can exceed 10), and a restart is the LONGEST because its offline and online waits are
+# 600s + 1800s. One number either kills healthy work or lets a hung service action hold a runspace for
+# 45 minutes. The deadline is recorded per computer (TimeoutExpiresAt/TimeoutSource) at SUBMISSION, so
+# it is inspectable while the job runs rather than recomputed from a start time a restart could reset.
 $global:OperationTimeoutSeconds = @{
     'Check'            = 2700   # 45 min - large-estate search + download scan
     'Download'         = 2700   # 45 min

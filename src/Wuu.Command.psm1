@@ -732,19 +732,11 @@ function Invoke-WuuCommand {
 
         # NO AUDIT RECORD IS WRITTEN. -WhatIf is side-effect free in the AUDIT TRAIL as well, and that
         # contract is asserted by tests\Test-AuditTrail.ps1 ("-WhatIf wrote audit records (expected
-        # none)").
-        #
-        # I first added one (session-start + a 'declined' record) on the grounds that ISO 27001 A.8.15
-        # covers denied attempts - and the hardening brief describes -WhatIf as "audited already". Both
-        # were wrong to act on here:
-        #   * the brief's "audited already" is simply not true (the test measures zero records), so it
-        #     was an argument from a mistaken premise;
-        #   * a SIMULATION is not a denied attempt. Mixing plans into the trail degrades it as evidence:
-        #     an auditor reading it cannot distinguish "a change this system refused to make" from "an
-        #     operator asking what a change WOULD do", and 'declined' would be actively misleading for
-        #     the second case (nothing was declined - the caller asked for a report).
-        # A side-effect-free dry run is also more useful than an audited one: it can be run freely,
-        # including repeatedly while preparing a change, without leaving artefacts that need explaining.
+        # none)"). A SIMULATION is not a denied attempt: mixing plans into the trail makes an auditor
+        # unable to distinguish "a change this system refused to make" from "an operator asking what a
+        # change WOULD do", and a 'declined' record would be actively misleading for the second case.
+        # A side-effect-free dry run is also more useful - it can be repeated freely while preparing a
+        # change without leaving artefacts that then need explaining.
         #
         # -WhatIf is a SUCCESS: it correctly did what was asked (report the intent, change nothing). It
         # is never 'Queued' (nothing was accepted for later) and never a failure for having skipped busy
