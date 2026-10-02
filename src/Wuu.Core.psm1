@@ -22,7 +22,7 @@ function Import-WuuModules {
     # scriptable verb layer; Wuu.Audit the tamper-evident trail. Wuu.Session models the computer
     # set as a first-class object and Wuu.Navigate owns the guided interactive workflow - both sit
     # ABOVE the engine and only read/delegate to it.
-    foreach ($m in @('Wuu.Configuration','Wuu.Presentation','Wuu.Actions.Display','Wuu.State','Wuu.Logging','Wuu.Scheduler','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Session','Wuu.Audit','Wuu.Command','Wuu.Navigate')) {
+    foreach ($m in @('Wuu.Configuration','Wuu.Presentation','Wuu.Actions.Display','Wuu.Result','Wuu.State','Wuu.Logging','Wuu.Scheduler','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Console','Wuu.Session','Wuu.Audit','Wuu.Command','Wuu.Navigate')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
@@ -3226,20 +3226,28 @@ try {
                 $exitCode = Get-WuuExitCode -Result 'Success'
             }
 
-            if ($parsed.Options['Json']) {
-                $snapshot = @(Get-WuuComputerRow -Store $stateStore | ForEach-Object {
-                    [pscustomobject]@{
-                        Computer = $_.Computer; Phase = $_.Phase; State = $_.State
-                        UpdatesStatus = $_.UpdatesStatus; Available = $_.Available
-                        Downloaded = $_.Downloaded; RebootRequired = $_.RebootRequired
-                        Status = $_.Status; OpState = $_.OpState; Pending = [bool]$_.Pending
-                    }
-                })
+            # SS33/SS34: ONE structured result, from which BOTH renderings derive. Before this, the
+            # JSON was hand-built here and the human output was written separately, so the two could
+            # - and did - describe the command differently. The result object now carries the counts,
+            # the exit code and its vocabulary name, and both branches read the same fields.
+            $snapshot = @(Get-WuuComputerRow -Store $stateStore | ForEach-Object {
                 [pscustomobject]@{
-                    Command = $parsed.Verb; Ok = $result.Ok; ExitCode = $exitCode
-                    Completed = -not $busy; Outstanding = $outstanding.Count
-                    Computers = $snapshot
-                } | ConvertTo-Json -Depth 5
+                    Computer = $_.Computer; Phase = $_.Phase; State = $_.State
+                    UpdatesStatus = $_.UpdatesStatus; Available = $_.Available
+                    Downloaded = $_.Downloaded; RebootRequired = $_.RebootRequired
+                    Status = $_.Status; OpState = $_.OpState; Pending = [bool]$_.Pending
+                }
+            })
+            $commandCounts = Get-WuuCommandCounts -Rows $targetRows
+            $commandResult = New-WuuCommandResult -Command $parsed.Verb -Ok ([bool]$result.Ok) `
+                -ExitCode $exitCode -Completed (-not $busy) -Outstanding $outstanding.Count `
+                -Counts $commandCounts -Computers $snapshot `
+                -ErrorMessage $(if ($result.PSObject.Properties['Error']) { [string]$result.Error } else { '' })
+
+            if ($parsed.Options['Json']) {
+                # The documented contract (PascalCase, docs/EXIT_CODES.md) is preserved field for field;
+                # the model adds SchemaVersion and the per-status counts to it.
+                Format-WuuResultJson -Result $commandResult
             } else {
                 Write-WuuStatusTable -Store $stateStore
                 Write-WuuStatusLine -Store $stateStore
