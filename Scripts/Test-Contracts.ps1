@@ -279,7 +279,7 @@ if (-not $navAstForLeak) {
         $el = $cmd.Parent
         $isPiped = ($el -is [System.Management.Automation.Language.PipelineAst]) -and (@($el.PipelineElements).Count -gt 1)
         $text = $cmd.Extent.Text
-        if (-not $isPiped -and $text -match '^\s*&\s*\$Ctx\.Actions\[.+\]\s*$') {
+        if (-not $isPiped -and $text -match '^\s*&\s*(\$Ctx\.Actions\[.+\]|\$[A-Za-z_]\w*\.Run\b.*)\s*$') {
             $unpiped += "line $($cmd.Extent.StartLineNumber): $text"
         }
     }

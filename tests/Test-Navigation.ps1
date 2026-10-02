@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS Guided interactive workflow test (docs/INTERACTIVE_UI_SPEC.md).
 .DESCRIPTION
@@ -789,5 +789,24 @@ if ($navSource -notmatch '\$state -isnot \[string\]') {
     Fail 'the workflow loop does not validate the state type - a screen returning an object would be reported as an unknown state, naming the symptom and hiding the cause'
 } else { Pass 'the workflow loop validates that a screen handed it a state name' }
 
+# 4. Show-WuuAdvancedScreen must not leak non-mutating action output into its return value.
+# A handler that emits objects (e.g. $GetErrors returning error objects) must not turn
+# the screen's return value into an array, which would corrupt the workflow loop.
+$advActions = [hashtable]::Synchronized(@{})
+$advActions['GetErrors'] = {
+    [PSCustomObject]@{ Timestamp = Get-Date; Type = 'Error'; Message = 'sample error' }
+}
+$advCtx = [pscustomobject]@{ Set = (New-WuuComputerSet -Store (New-WuuStateStore)); Store = (New-WuuStateStore); Actions = $advActions; AuditHook = $null; DenialHook = $null }
+Initialize-WuuInputMode -NonInteractive -Answers @('e')
+$advState = Show-WuuAdvancedScreen -Ctx $advCtx
+if (@($advState).Count -ne 1) {
+    Fail "Show-WuuAdvancedScreen leaked action output and returned $((@($advState) | ForEach-Object { $_.GetType().Name }) -join ' + ') instead of one string"
+} elseif ($advState -isnot [string]) {
+    Fail "Show-WuuAdvancedScreen returned $($advState.GetType().Name), not a string"
+} elseif ($advState -ne 'ADVANCED') {
+    Fail "Show-WuuAdvancedScreen returned '$advState', not 'ADVANCED'"
+} else { Pass 'Show-WuuAdvancedScreen discards action output and returns strictly [string]''ADVANCED''' }
+
 if ($fail) { Write-Host 'SOME CHECKS FAILED' -ForegroundColor Red; exit 1 }
 else { Write-Host 'ALL PASS' -ForegroundColor Cyan }
+

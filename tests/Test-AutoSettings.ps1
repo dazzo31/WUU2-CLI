@@ -1,4 +1,4 @@
-# Test: the console AUTO settings actually gate worker behaviour (hardening brief SS2).
+﻿# Test: the console AUTO settings actually gate worker behaviour (hardening brief SS2).
 #
 # WHY THIS SUITE EXISTS
 # ---------------------

@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .DESCRIPTION
 Guided interactive workflow for WUU2-CLI.
@@ -877,8 +877,10 @@ function Show-WuuAdvancedScreen {
 
     foreach ($a in (Get-WuuMenuActions)) {
         if ($a.Key -eq $sel) {
-            if ($a.Mutating) { Invoke-WuuGuidedHandler -Ctx $Ctx -Handler $a.Handler -Mutating $true }
-            else { & $a.Run $Ctx.Actions }
+            # Out-Null is load-bearing: leaking dispatch output turns the return
+            # value into an array and corrupts workflow state (instructions SS8 / bug 3e346ad).
+            if ($a.Mutating) { Invoke-WuuGuidedHandler -Ctx $Ctx -Handler $a.Handler -Mutating $true | Out-Null }
+            else { & $a.Run $Ctx.Actions | Out-Null }
             return 'ADVANCED'
         }
     }
