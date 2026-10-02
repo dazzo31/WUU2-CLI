@@ -2277,31 +2277,80 @@ $eventSaveComputerList = {
     }
 }
 
-# Save encrypted computer list
+# Save encrypted computer list (one NAMED list inside the shared config file)
 $eventSaveConfig = {
     If ($stateStore.Rows.Count -gt 0) {
         try {
             # Suspend background processing to prevent interference with password dialog
             Suspend-BackgroundProcessing -Reason "encrypted computer list save"
-            
+
             # Prompt for password using GUI dialog
             $securePassword = Show-PasswordPrompt -Title "Encrypt Computer List" -Message "Enter a password to encrypt the computer list configuration:"
-            
+
             if ($securePassword -eq $null) {
                 # User cancelled the password prompt
                 Update-Status 'Save operation cancelled by user.'
                 return
             }
-            
+
             # Default path for config
             $configPath = Join-Path $WuuRoot 'ComputerList.config'
-            
-            $saveResult = Save-ComputerListConfig -ComputerList (Get-WuuComputerRow -Store $stateStore) -ConfigPath $configPath -Password $securePassword
-            
+
+            # SS: several lists live in ONE encrypted file, so saving adds to a file that may already
+            # hold others. Read it FIRST and stop if the passphrase will not open it: a file that
+            # cannot be decrypted cannot be added to, and writing over it on a typo would destroy
+            # every list in it. Reported as a passphrase problem, never as "nothing there yet".
+            $existingNames = @()
+            if (Test-Path -LiteralPath $configPath) {
+                $pre = Read-WuuConfigFile -ConfigPath $configPath -Password $securePassword
+                if (-not $pre.Success) {
+                    if ($pre.WrongPassword) {
+                        Write-Host ''
+                        Write-Host '  That password does not open the existing configuration file.' -ForegroundColor Red
+                        Write-Host '  Nothing was saved and the lists already in it are unchanged.' -ForegroundColor Red
+                        Write-Host '  Re-run the save with the password the file was created with.' -ForegroundColor Yellow
+                        Update-Status 'Save cancelled - the existing configuration could not be decrypted.'
+                    } else {
+                        Write-Host ''
+                        Write-Host "  Cannot read the existing configuration file: $($pre.Error)" -ForegroundColor Red
+                        Write-Host '  Nothing was saved and the file is unchanged.' -ForegroundColor Red
+                        Update-Status 'Save cancelled - the existing configuration file could not be read.'
+                    }
+                    return
+                }
+                $existingNames = @($pre.Lists | ForEach-Object { [string]$_.Name })
+                if ($existingNames.Count -gt 0) {
+                    Write-Host ''
+                    Write-Host ("  This file already holds: {0}" -f ($existingNames -join ', ')) -ForegroundColor DarkGray
+                }
+            }
+
+            # Name this list. A blank answer means the default name, which is what a single-list
+            # operator has always had - they can keep pressing Enter and never see this feature.
+            $listName = [string](Read-WuuAnswer -Prompt '  Name for this list (Enter to use the default name)' -Default '')
+
+            $saveResult = Save-ComputerListConfig -ComputerList (Get-WuuComputerRow -Store $stateStore) `
+                -ConfigPath $configPath -Password $securePassword -ListName $listName
+
+            # A same-named list is REFUSED, not silently replaced, unless the operator confirms here.
+            # The engine owns the rule and this owns the question, so neither can drift.
+            if (-not $saveResult.Success -and $saveResult.Exists) {
+                Write-Host ''
+                Write-Host ("  {0}" -f $saveResult.Error) -ForegroundColor Yellow
+                if (Read-WuuYesNo -Prompt "  Replace it?" -Default $false) {
+                    $saveResult = Save-ComputerListConfig -ComputerList (Get-WuuComputerRow -Store $stateStore) `
+                        -ConfigPath $configPath -Password $securePassword -ListName $listName -AllowOverwrite
+                }
+            }
+
             if ($saveResult.Success) {
-                Update-Status "Encrypted computer list saved to $configPath"
-            } else {
+                if ($saveResult.Note) { Write-Host ("  {0}" -f $saveResult.Note) -ForegroundColor DarkGray }
+                $verb = if ($saveResult.Replaced) { 'replaced' } else { 'saved' }
+                Update-Status "List '$($saveResult.ListName)' $verb in $configPath ($($saveResult.ListCount) list(s) in the file)"
+            } elseif (-not $saveResult.Exists) {
                 Update-Status "Failed to save encrypted computer list: $($saveResult.Error)"
+            } else {
+                Update-Status 'Save cancelled - the existing list was not replaced.'
             }
         } finally {
             # Always resume background processing
@@ -2329,11 +2378,37 @@ $eventLoadConfig = {
         
         # Default path for config
         $configPath = Join-Path $WuuRoot 'ComputerList.config'
-        
-        $loadResult = Import-ComputerListConfig -ConfigPath $configPath -Password $securePassword
+
+        # SS: the file may hold several lists, so ASK WHICH ONE. The password has to come first - the
+        # ciphertext is a single unit and the names are inside it, so there is nothing to choose from
+        # until it is open. A wrong passphrase is reported as such rather than as "no lists here",
+        # because an empty menu and an unreadable file look identical and mean opposite things.
+        $names = @(Get-WuuComputerListNames -ConfigPath $configPath -Password $securePassword)
+        if ($names.Count -eq 0) {
+            $probe = Read-WuuConfigFile -ConfigPath $configPath -Password $securePassword
+            if (-not $probe.Success -and $probe.WrongPassword) {
+                Write-Host ''
+                Write-Host 'Failed to load the encrypted computer list. This is usually caused by an incorrect password.' -ForegroundColor Red
+                Write-Host 'Please try again with the correct password.' -ForegroundColor Red
+                Update-Status 'Failed to load encrypted computer list: incorrect password.'
+                return
+            }
+            Update-Status "No saved computer lists found in $configPath"
+            Write-Host ("  Nothing to load: {0}" -f $(if ($probe.Error) { $probe.Error } else { 'the file holds no lists yet.' })) -ForegroundColor Yellow
+            return
+        }
+
+        $chosenList = New-WuuComputerListPrompt -Names $names
+        if ([string]::IsNullOrWhiteSpace($chosenList)) {
+            Update-Status 'Load operation cancelled.'
+            return
+        }
+
+        $loadResult = Import-ComputerListConfig -ConfigPath $configPath -Password $securePassword -ListName $chosenList
 
         if ($loadResult.Success) {
             $loadedComputers = $loadResult.Config.Computers
+            if ($loadResult.Note) { Write-Host ("  {0}" -f $loadResult.Note) -ForegroundColor DarkGray }
 
             # SS6: compare the credential mode this list was SAVED with against the running session.
             # The saved block used to be ignored entirely, so loading a list into a session with a
@@ -2383,7 +2458,7 @@ $eventLoadConfig = {
             }
             
             # Worker runspaces are created on demand (New-ComputerRunspace) when an operation is requested
-            Update-Status "Encrypted computer list loaded from $configPath"
+            Update-Status "List '$chosenList' loaded from $configPath"
         } else {
             # Console edition: report the failure without a modal dialog.
             $errorMessage = $loadResult.Error
@@ -3073,12 +3148,26 @@ try {
             # Load the saved computer list first when one exists, so `wuu check -All` works
             # against the operator's list without an interactive load step. Without this a
             # scripted `-All` would find an empty store and silently do nothing.
+            #
+            # SS: the file can hold several named lists. There is no operator here to ask, so the
+            # choice is made by rule, not by prompt: `-ListName` if given, else the default-named
+            # list when one exists (which is what a single-list file always is, so the previous
+            # behaviour is exactly preserved), else the first list in the file.
             if ((Test-Path $startupConfig) -and $parsed.Verb -ne 'add' -and $parsed.Verb -ne 'add-file') {
                 try {
                     $credForLoad = $null
                     if ($parsed.Options['Password']) { $credForLoad = $parsed.Options['Password'] }
-                    if ($parsed.Options['Computer']) { }   # no-op guard (readability)
-                    $loadRes = Import-ComputerListConfig -ConfigPath $startupConfig -Password $credForLoad
+                    $wantedList = [string]$parsed.Options['ListName']
+                    if ([string]::IsNullOrWhiteSpace($wantedList)) {
+                        $avail = @(Get-WuuComputerListNames -ConfigPath $startupConfig -Password $credForLoad)
+                        if ($avail -contains $script:WuuDefaultListName) { $wantedList = $script:WuuDefaultListName }
+                        elseif ($avail.Count -gt 0) {
+                            $wantedList = $avail[0]
+                            Write-Host ("  '{0}' holds {1} lists ({2}); loading '{3}'. Use -ListName to pick another." -f
+                                $startupConfig, $avail.Count, ($avail -join ', '), $wantedList) -ForegroundColor DarkGray
+                        }
+                    }
+                    $loadRes = Import-ComputerListConfig -ConfigPath $startupConfig -Password $credForLoad -ListName $wantedList
                     if ($loadRes.Success) {
                         foreach ($compData in $loadRes.Config.Computers) {
                             $existing = Get-WuuComputerRow -Store $stateStore -Computer $compData.Computer
@@ -3116,6 +3205,7 @@ try {
                 -Set $(if ($parsed.Options['Set']) { [int]$parsed.Options['Set'] } else { 0 }) `
                 -ServiceAction $(if ($parsed.Verb -eq 'service') { [string]$parsed.SubVerb } else { '' }) `
                 -SubVerb $parsed.SubVerb -Reason $parsed.Options['Reason'] `
+                -ListName $wantedList `
                 -Json:$parsed.Options['Json'] -WhatIf:$parsed.Options['WhatIf'] -Async:$parsed.Options['Async']
 
             # Give queued background work a bounded chance to run, then report state. A one-shot

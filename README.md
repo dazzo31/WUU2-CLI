@@ -154,13 +154,14 @@ wuu <verb> [options]         run one operation and exit
 | `remove` / `clear` / `prune` | Remove named computers, clear the list, or prune offline ones |
 | `phase` | Assign computers to a deployment phase |
 | `credentials` | Configure alternate remote credentials |
-| `config` | `save` \| `load` — encrypted computer-list config |
+| `config` | `save` \| `load` — encrypted computer-list config (one file, several named lists) |
 | `export` | Export the computer list to a file |
 | `logs` | View a target's Windows Update log |
 | `audit` | `wsus` (audit a target) \| `verify` \| `show` \| `export` (the local audit trail) |
 
 Common options: `-Computer`, `-All`, `-Reason`, `-Path`, `-LogPath`, `-Json`, `-WhatIf`, `-Async`,
-`-Help`. `-Reason` is **required** for verbs that change remote state — see the audit trail below.
+`-ListName`, `-Help`. `-Reason` is **required** for verbs that change remote state — see the audit
+trail below.
 
 `-WhatIf` on a mutating verb prints a **per-computer plan**, not one sentence: what each computer
 would do (`run` / `queue` / `skip` / `noop`), why, and any name that resolved to nothing. It changes
@@ -219,6 +220,27 @@ worse, does not).
 
 Save and load computer lists — including phase assignments — protected by a password-derived AES
 key, replacing the original tool's plain-text export.
+
+**One file holds several named lists.** `wuu config save -ListName prod` adds a list called `prod`,
+or replaces it with `-ListName prod` again; the other lists in the file are untouched. Names are
+free text. `wuu config load` shows a numbered menu and takes a number, a name, or an unambiguous
+prefix; in the console, saving asks for a name (press Enter for the default) and loading shows the
+same menu.
+
+Three things this design guarantees, because each is a way an operator could otherwise lose work:
+
+* **A wrong passphrase is reported as a wrong passphrase.** The file is encrypted as a unit, so a
+*typo* cannot add a list. It is never mistaken for "no lists saved yet" — the two look identical at
+a prompt and mean opposite things. Nothing is written, and every list already in the file survives.
+* **A same-named list is not silently replaced.** Saving over an existing name is refused unless you
+confirm (interactively) or pass `-AllowOverwrite`.
+* **An older single-list file still works, and is not modified by reading it.** It is read as a list
+named `default` and is upgraded the next time you save. Merely opening the tool never rewrites your
+only copy.
+
+For scripts, `wuu config load -ListName prod` skips the menu entirely. With no `-ListName`, an
+automatic load (e.g. `wuu check -All`) prefers the list named `default` and otherwise takes the first
+one in the file, printing which list it chose — a scripted run is never left waiting at a prompt.
 
 ### Hang protection, and timeouts that distinguish slow from stuck
 

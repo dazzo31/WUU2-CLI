@@ -215,6 +215,22 @@ encryption/security semantics.
 `Save/Import-ComputerListConfig`) *is* the saved computer set. There is no separate "saved set
 registry" — named sets are that file plus the export/import path. Do not invent a second store.
 
+**One file, several named sets.** The config holds a list of named lists
+(`{ Schema = 'wuu.computerlist.v2'; Lists = [ { Name; Computers; ... }, … ] }`), so "list saved sets by
+name" is a read of `Lists[].Name`. Saving adds or replaces **one** named list and leaves the others
+alone; `Import-ComputerListConfig -ListName <name>` selects one. Loading from the console shows the
+numbered chooser; there is no prompt when the file holds a single list, because there is no decision.
+
+Two rules exist because breaking either loses an operator's work. **A same-named save is refused, not
+silently replaced** (confirm, or pass `AllowOverwrite`). **A failed decryption is reported as a wrong
+passphrase, never as an empty file** — the ciphertext is one unit, so a typo cannot add a list, and
+treating "could not decrypt" as "no lists saved yet" would overwrite every list in the file.
+
+A v1 file (the legacy single-list shape) reads as **one** list named `default` and is **not rewritten
+by reading it** — merely opening the tool must not modify the operator's only copy. It is upgraded on
+the next save. Automatic loads (`wuu check -All`) prefer the `default` list, else the first, and say
+which they chose, so a scripted run is never left at a prompt.
+
 ## 22. Session state model
 
 ```

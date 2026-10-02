@@ -4,6 +4,11 @@
 Credential handling: DPAPI helpers, dialogs, cache/probe, encrypted computer-list config.
 #>
 
+# The name a computer list has when the operator did not choose one. A config file holds several named
+# lists; a v1 (legacy single-list) file is read AS this name, so "my list" keeps working with no
+# migration step and no surprise for an operator who never asked for multiple lists.
+$script:WuuDefaultListName = 'default'
+
 function Protect-Credential {
     param([System.Security.SecureString]$SecurePassword)
     
@@ -537,84 +542,323 @@ function Unprotect-ComputerListData {
 }
 
 function Save-ComputerListConfig {
+    <#
+    .SYNOPSIS
+    Saves ONE NAMED computer list into the shared encrypted config file.
+    .DESCRIPTION
+    THE FILE HOLDS MANY LISTS; THIS CALL WRITES ONE OF THEM.
+
+    WHY THE WHOLE FILE IS DECRYPTED TO ADD A LIST. Lists share a single file, and the file is encrypted
+    as a unit, so adding or replacing one list means reading the others out and writing them back. That
+    has a consequence the caller must be told about rather than surprised by: EVERY LIST IN THE FILE
+    SHARES ONE PASSPHRASE, because there is only one ciphertext. A passphrase that cannot open the file
+    cannot add to it, and that is reported (`WrongPassword`) instead of being treated as "no lists yet" -
+    silently overwriting five lists because the operator mistyped one character would be the worst
+    failure this feature could have.
+
+    BACKWARD COMPATIBLE IN BOTH DIRECTIONS. A v1 file (the legacy single-list shape) is read as a list
+    whose name is the default, and the next save writes v2. Nothing is migrated ahead of time, nothing is
+    renamed, and the operator's only copy is never rewritten by merely opening the tool.
+
+    Returns a hashtable, never a bare boolean, because "saved", "wrong passphrase" and "unreadable" are
+    three different things and the caller reports each differently.
+    #>
     param(
         [array]$ComputerList,
         [string]$ConfigPath,
-        [SecureString]$Password
+        [SecureString]$Password,
+        [string]$ListName = '',
+        [switch]$AllowOverwrite
     )
-    
+
+    $resolvedName = if ([string]::IsNullOrWhiteSpace($ListName)) { $script:WuuDefaultListName } else { $ListName.Trim() }
+
     try {
-        # Create configuration object
-        $config = @{
-            SavedDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-            ComputerCount = $ComputerList.Count
-            Computers = $ComputerList | ForEach-Object {
-                @{
-                    Computer = $_.Computer
-                    Phase = if ($_.Phase) { $_.Phase } else { "Phase 1" }
-                    # Only save computer name and phase - all other status data is temporary
-                }
+        # Read what is already there, so the other lists survive this write.
+        $existingLists = New-Object System.Collections.ArrayList
+        $readNote = ''
+        if (Test-Path -LiteralPath $ConfigPath) {
+            $read = Read-WuuConfigFile -ConfigPath $ConfigPath -Password $Password
+            if (-not $read.Success) {
+                return @{ Success = $false; WrongPassword = [bool]$read.WrongPassword; Error = $read.Error }
             }
-            # Record the credential MODE this list was saved under (SS6). This block used to be written
-            # from $global:CredentialConfig.Username/.Domain - a variable assigned exactly ONCE in the
-            # codebase (its initialiser), so every config ever saved carried Username='' and Domain=''
-            # while the real name sat in $global:CustomCredentials.UserName. Verified by probe.
-            #
-            # What is recorded is IDENTITY ONLY - a username and a mode word. No password, no token, and
-            # nothing derived from one: the list itself is already encrypted with the operator's
-            # passphrase, and adding reversible credential material to it would widen the blast radius of
-            # a weak passphrase.
+            foreach ($l in $read.Lists) { [void]$existingLists.Add($l) }
+            $readNote = $read.Note
+        }
+
+        # Refuse to replace a different list of the same name unless asked. An operator saving "prod"
+        # twice should be told they are replacing it, not discover it later.
+        $collision = $null
+        foreach ($l in $existingLists) { if ([string]$l.Name -ceq $resolvedName) { $collision = $l } }
+        if ($collision -and -not $AllowOverwrite) {
+            return @{ Success = $false; WrongPassword = $false; Exists = $true
+                Error = "a list named '$resolvedName' already exists in this file ($(@($collision.Computers).Count) computer(s)); pass -AllowOverwrite to replace it"
+            }
+        }
+
+        # Build the replacement list, keeping the order the operator had.
+        $newList = @{
+            Name         = $resolvedName
+            SavedDate    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            ComputerCount = @($ComputerList).Count
+            Computers    = @($ComputerList | ForEach-Object {
+                    @{
+                        Computer = $_.Computer
+                        Phase    = if ($_.Phase) { $_.Phase } else { 'Phase 1' }
+                        # Only the name and the phase are saved - every other column is transient.
+                    }
+                })
+            # Record the credential MODE this list was saved under (SS6). Identity ONLY - a username and
+            # a mode word. No password and nothing derived from one: the file is already encrypted with the
+            # operator's passphrase, and adding reversible credential material would widen the blast
+            # radius of a weak one.
             CredentialConfig = Get-WuuCredentialStateSignature
         }
-        
-        # Convert to JSON
-        $jsonData = $config | ConvertTo-Json -Depth 4
-        
-        # Encrypt the data
-        $encryptResult = Protect-ComputerListData -Data $jsonData -Password $Password
-        
-        if (-not $encryptResult.Success) {
-            throw "Encryption failed: $($encryptResult.Error)"
+
+        $merged = New-Object System.Collections.ArrayList
+        foreach ($l in $existingLists) {
+            if ([string]$l.Name -ceq $resolvedName) { [void]$merged.Add($newList) } else { [void]$merged.Add($l) }
         }
-        
-        # Save to file
-        $encryptResult.Data | Out-File -FilePath $ConfigPath -Encoding UTF8 -Force
-        
+        $replaced = $false
+        foreach ($l in $existingLists) { if ([string]$l.Name -ceq $resolvedName) { $replaced = $true } }
+        if (-not $replaced) { [void]$merged.Add($newList) }
+
+        $config = @{
+            Schema    = 'wuu.computerlist.v2'
+            SavedDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            Lists     = @($merged)
+        }
+
+        $write = Write-WuuConfigFile -ConfigPath $ConfigPath -Config $config -Password $Password
+        if (-not $write.Success) { return @{ Success = $false; WrongPassword = $false; Error = $write.Error } }
+
+        return @{ Success = $true; WrongPassword = $false; ListName = $resolvedName; Replaced = $replaced
+            ListCount = @($merged).Count; Note = $readNote; Error = $null }
+    } catch {
+        return @{ Success = $false; WrongPassword = $false; Error = $_.Exception.Message }
+    }
+}
+
+function Write-WuuConfigFile {
+    <#
+    .SYNOPSIS Encrypts and writes a config document (SS: computer-list storage). Shared by every writer.
+    .DESCRIPTION One place, so the file's encryption and encoding cannot differ between the paths that
+    write it. UTF8 WITHOUT a BOM: the payload is a base64-ish encrypted string, and a BOM becomes part of
+    the first line a reader must strip.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][hashtable]$Config,
+        [Parameter(Mandatory)][SecureString]$Password
+    )
+    try {
+        $dir = Split-Path -Parent $ConfigPath
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop }
+        $jsonData = $Config | ConvertTo-Json -Depth 6
+        $encryptResult = Protect-ComputerListData -Data $jsonData -Password $Password
+        if (-not $encryptResult.Success) { throw "Encryption failed: $($encryptResult.Error)" }
+        [System.IO.File]::WriteAllText($ConfigPath, $encryptResult.Data, (New-Object System.Text.UTF8Encoding($false)))
         return @{ Success = $true; Error = $null }
     } catch {
         return @{ Success = $false; Error = $_.Exception.Message }
     }
 }
 
-function Import-ComputerListConfig {
+function Read-WuuConfigFile {
+    <#
+    .SYNOPSIS Decrypts a config document and returns its LISTS, whatever schema version it is.
+    .DESCRIPTION
+    ONE READER FOR BOTH SHAPES, so no caller has to know which it is holding:
+
+      v2  { Schema = 'wuu.computerlist.v2'; Lists = [ { Name; Computers; ... }, ... ] }
+      v1  { SavedDate; ComputerCount; Computers = [ ... ]; CredentialConfig }   <- the legacy single list
+
+    A v1 file becomes ONE list named `$script:WuuDefaultListName`, which is what the operator has always
+    called it in practice ("my list"). It is NOT rewritten on read: merely opening the tool must never
+    modify the operator's only copy, and a v1 file is upgraded only when they next save.
+
+    Distinguishes a WRONG PASSPHRASE from an unreadable file, because the first is a typo an operator
+    fixes and the second is a problem. The underlying decrypt error is the only signal available, so it
+    is pattern-matched once, here, rather than at every call site.
+    #>
     param(
-        [string]$ConfigPath,
-        [SecureString]$Password
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][AllowNull()][SecureString]$Password
     )
-    
+
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        return @{ Success = $false; Lists = @(); WrongPassword = $false
+            Error = "configuration file not found: $ConfigPath"; Note = '' }
+    }
+
     try {
-        if (-not (Test-Path -Path $ConfigPath)) {
-            throw "Configuration file not found: $ConfigPath"
-        }
-        
-        # Read encrypted data
-        $encryptedData = Get-Content -Path $ConfigPath -Raw
-        
-        # Decrypt the data
+        $encryptedData = [System.IO.File]::ReadAllText($ConfigPath)
         $decryptResult = Unprotect-ComputerListData -EncryptedData $encryptedData -Password $Password
-        
         if (-not $decryptResult.Success) {
-            throw "Decryption failed: $($decryptResult.Error)"
+            $msg = [string]$decryptResult.Error
+            # The AES/SecureString layer reports a bad key as an invalid padding/format error. Naming it
+            # "wrong passphrase" is what lets the caller say something actionable instead of relaying a
+            # cryptographic message to an operator who only mistyped.
+            $wrong = ($msg -match 'padding|invalid|corrupt|key|length|format') -and
+                ($msg -notmatch 'file not found|being used by another process')
+            return @{ Success = $false; Lists = @(); WrongPassword = $wrong; Error = "decryption failed: $msg"; Note = '' }
         }
-        
-        # Parse JSON
+
         $config = $decryptResult.Data | ConvertFrom-Json
-        
-        return @{ Success = $true; Config = $config; Error = $null }
+        $lists = New-Object System.Collections.ArrayList
+        $note = ''
+
+        $isV2 = ($config.PSObject.Properties['Lists'])
+        if ($isV2) {
+            foreach ($l in @($config.Lists)) {
+                if ($null -eq $l) { continue }
+                [void]$lists.Add([pscustomobject]@{
+                        Name             = $(if ($l.PSObject.Properties['Name'] -and $l.Name) { [string]$l.Name } else { $script:WuuDefaultListName })
+                        SavedDate        = $(if ($l.PSObject.Properties['SavedDate']) { [string]$l.SavedDate } else { '' })
+                        ComputerCount    = @($l.Computers).Count
+                        Computers        = @($l.Computers)
+                        CredentialConfig = $(if ($l.PSObject.Properties['CredentialConfig']) { $l.CredentialConfig } else { $null })
+                    })
+            }
+            if ($lists.Count -eq 0) { $note = 'the configuration file holds no lists yet'; }
+        } else {
+            # v1: the legacy single list. Treated as a list named for the default, and NOT rewritten.
+            [void]$lists.Add([pscustomobject]@{
+                    Name             = $script:WuuDefaultListName
+                    SavedDate        = $(if ($config.PSObject.Properties['SavedDate']) { [string]$config.SavedDate } else { '' })
+                    ComputerCount    = @($config.Computers).Count
+                    Computers        = @($config.Computers)
+                    CredentialConfig = $(if ($config.PSObject.Properties['CredentialConfig']) { $config.CredentialConfig } else { $null })
+                })
+            $note = "this file uses the older single-list format; it is read as the '$($script:WuuDefaultListName)' list and will be upgraded the next time you save"
+        }
+
+        return @{ Success = $true; Lists = @($lists.ToArray()); WrongPassword = $false; Error = $null; Note = $note
+            IsLegacy = (-not $isV2)
+        }
     } catch {
-        return @{ Success = $false; Config = $null; Error = $_.Exception.Message }
+        return @{ Success = $false; Lists = @(); WrongPassword = $false; Error = $_.Exception.Message; Note = '' }
     }
 }
 
-Export-ModuleMember -Function @('Protect-Credential', 'Unprotect-Credential', 'Get-RemoteCredentials', 'Resolve-WuuOperationCredential', 'Update-WuuCredentialEpoch', 'Show-PasswordPrompt', 'Show-CustomCredentialDialog', 'Show-CredentialConfigDialog', 'Protect-ComputerListData', 'Unprotect-ComputerListData', 'Save-ComputerListConfig', 'Import-ComputerListConfig', 'Get-WuuCredentialStateSignature', 'Test-WuuCredentialStateMatches')
+function Get-WuuComputerListNames {
+    <#
+    .SYNOPSIS The list names held in a config file, for an onscreen chooser. Never throws.
+    .DESCRIPTION
+    Returns @() when the file is missing or the passphrase will not open it, so a caller can present
+    "nothing to load" rather than an error. Never throws: this drives a menu, and a menu that crashes on
+    a stale file is worse than one that reports an empty result.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][AllowNull()][SecureString]$Password
+    )
+    $read = Read-WuuConfigFile -ConfigPath $ConfigPath -Password $Password
+    if (-not $read.Success) { return @() }
+    return @($read.Lists | ForEach-Object { [string]$_.Name })
+}
+
+function Import-ComputerListConfig {
+    <#
+    .SYNOPSIS
+    Reads a config file and returns the lists it holds - all of them, or one named one.
+    .DESCRIPTION
+    Returns the LISTS rather than a flat computer array, because a file can now hold several and the
+    caller has to choose. `-ListName` selects one; omitting it returns every list, and callers that only
+    ever wanted the single legacy list still get it (as the default-named list) without knowing which
+    format they are reading.
+
+    `$Config` is kept as a FLAT VIEW of the selected list (SavedDate, ComputerCount, Computers,
+    CredentialConfig) so existing callers keep working unchanged - the multi-list support is additive.
+    When no name is given and several lists exist, `$Config` reflects the FIRST, and `$Lists` carries them
+    all so a caller can prompt.
+    #>
+    param(
+        [string]$ConfigPath,
+        [SecureString]$Password,
+        [string]$ListName = ''
+    )
+
+    $read = Read-WuuConfigFile -ConfigPath $ConfigPath -Password $Password
+    if (-not $read.Success) {
+        return @{ Success = $false; Config = $null; Lists = @(); WrongPassword = [bool]$read.WrongPassword; Error = $read.Error }
+    }
+
+    $selected = $read.Lists
+    if (-not [string]::IsNullOrWhiteSpace($ListName)) {
+        $wanted = $ListName.Trim()
+        $hits = @($read.Lists | Where-Object { [string]$_.Name -ceq $wanted })
+        if ($hits.Count -eq 0) {
+            $available = @($read.Lists | ForEach-Object { [string]$_.Name }) -join ', '
+            return @{ Success = $false; Config = $null; Lists = @(); WrongPassword = $false
+                Error = "no list named '$wanted' in this file (it holds: $available)"
+            }
+        }
+        $selected = @($hits[0])
+    }
+
+    $first = if (@($selected).Count -gt 0) { @($selected)[0] } else { $null }
+    return @{
+        Success       = $true
+        Config        = $first
+        Lists         = @($read.Lists)
+        IsLegacy      = [bool]$read.IsLegacy
+        Note          = $read.Note
+        WrongPassword = $false
+        Error         = $null
+    }
+}
+
+function New-WuuComputerListPrompt {
+    <#
+    .SYNOPSIS Presents a numbered menu of list names and returns the chosen name (console edition).
+    .DESCRIPTION
+    THE ONSCREEN CHOOSER. Given the names in a file, it renders them and returns the operator's choice.
+    Returns '' when they cancel, and the SINGLE name without asking when only one exists - a prompt with
+    one option is friction with no decision in it.
+
+    All input goes through Read-WuuAnswer (the project's single choke point), so this works in a scripted
+    run: with -NonInteractive the queued answer or the -Default is used, and there is no way for it to
+    block. A number, an exact name, or an unambiguous prefix are all accepted, because an operator
+    reading a menu will type whichever of the three is in their head.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Names
+    )
+
+    $list = @($Names | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($list.Count -eq 0) { return '' }
+    if ($list.Count -eq 1) {
+        Write-Host ("  Only one list in this file: {0}" -f $list[0]) -ForegroundColor DarkGray
+        return $list[0]
+    }
+
+    Write-Host ''
+    Write-Host '  Saved computer lists:' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        Write-Host ("    [{0}] {1}" -f ($i + 1), $list[$i])
+    }
+    $ans = Read-WuuAnswer -Prompt '  Load which list? (number or name, Enter to cancel)' -Default ''
+    if ([string]::IsNullOrWhiteSpace($ans)) { return '' }
+    $ans = ([string]$ans).Trim()
+
+    if ($ans -match '^\d+$') {
+        $idx = [int]$ans
+        if ($idx -ge 1 -and $idx -le $list.Count) { return $list[$idx - 1] }
+        Write-Host ("  No list numbered '{0}'." -f $ans) -ForegroundColor Yellow
+        return ''
+    }
+
+    foreach ($n in $list) { if ($n -ceq $ans) { return $n } }
+    $prefix = @($list | Where-Object { $_ -like "$ans*" })
+    if ($prefix.Count -eq 1) { return $prefix[0] }
+    if ($prefix.Count -gt 1) {
+        Write-Host ("  '{0}' is ambiguous: {1}" -f $ans, ($prefix -join ', ')) -ForegroundColor Yellow
+    } else {
+        Write-Host ("  No list named '{0}'." -f $ans) -ForegroundColor Yellow
+    }
+    return ''
+}
+
+Export-ModuleMember -Function @('Protect-Credential', 'Unprotect-Credential', 'Get-RemoteCredentials', 'Resolve-WuuOperationCredential', 'Update-WuuCredentialEpoch', 'Show-PasswordPrompt', 'Show-CustomCredentialDialog', 'Show-CredentialConfigDialog', 'Protect-ComputerListData', 'Unprotect-ComputerListData', 'Save-ComputerListConfig', 'Import-ComputerListConfig', 'Get-WuuComputerListNames', 'Read-WuuConfigFile', 'Write-WuuConfigFile', 'New-WuuComputerListPrompt', 'Get-WuuCredentialStateSignature', 'Test-WuuCredentialStateMatches')
 

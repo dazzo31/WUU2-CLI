@@ -624,8 +624,12 @@ function Get-WuuCommandTable {
         }
         'config' = @{
             Action = $null; Mutating = $false   # sub-dispatched (save/load)
-            Answers = { param($p) @() }
-            Help = 'Config:  wuu config save | wuu config load'
+            # SS: the save and load handlers each ask for a list name exactly once. Answering from the
+            # option (twice - once for the name, once for a same-name confirmation that the default
+            # declines) keeps an explicit -ListName from silently becoming the default name, and keeps
+            # an omitted one from blocking on a prompt that no script can answer.
+            Answers = { param($p) @($p.ListName, $p.ListName) }
+            Help = 'Config:  wuu config save [-ListName <name>] | wuu config load [-ListName <name>]'
         }
         'credentials' = @{
             Action = 'EventSetDomainCredentials'; Mutating = $false
@@ -718,6 +722,9 @@ function Invoke-WuuCommand {
         [ValidateRange(0, 5)][int]$Set = 0,
         [ValidateSet('', 'start', 'stop', 'restart')][string]$ServiceAction,
         [string]$SubVerb,
+        # SS: which list inside the encrypted config file to save into or load from. Empty means the
+        # default name on save, and the default-named list (else the first) on load.
+        [string]$ListName = '',
         # The audit log to inspect/export, for `audit verify|show|export`. Distinct from -Path,
         # which is ambiguous (a log for verify/show, an output destination for export).
         [string]$LogPath,
@@ -855,6 +862,7 @@ function Invoke-WuuCommand {
         Set           = if ($Set -gt 0) { $Set } else { $null }
         ServiceAction = if ($ServiceAction) { $ServiceAction.Substring(0, 1) } else { $null }
         Json          = [bool]$Json
+        ListName      = $ListName
     }
 
     $answers = if ($entry.Answers) { @(& $entry.Answers $p) } else { @() }
@@ -953,6 +961,9 @@ function ConvertTo-WuuCommandLine {
         '-path' = 'Path'; '-column' = 'Column'; '-set' = 'Set'; '-help' = 'Help'
         '-reason' = 'Reason'; '-logpath' = 'LogPath'
         '-eventlog' = 'EventLog'
+        # SS: names which of the lists in the encrypted config file to save into or load from.
+        # Omitted, a save uses the default name and a load prefers the default-named list.
+        '-listname' = 'ListName'
         # Declare "queue and return" as the DESIRED outcome (SS10). Without it, a command whose
         # bounded wait expires with work still outstanding exits 3 (timeout) instead of 0, because
         # success must mean completed, not accepted.
