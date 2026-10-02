@@ -537,7 +537,7 @@ Do not silently discard pending work.
 
 Any replacement must be observable.
 
-For future improvements, prefer semantic operation precedence over blindly using newest-wins.
+Semantic operation precedence is used rather than blindly applying newest-wins.
 
 Recommended conceptual ordering:
 
@@ -561,8 +561,18 @@ result = Install
 
 rather than downgrading the pending request.
 
-> **Current:** newest wins, and `Set-WuuPendingOperation` returns the displaced value so the caller reports
-> it. Semantic precedence is **NOT IMPLEMENTED**.
+> **Current:** semantic precedence **IS IMPLEMENTED**. `Set-WuuPendingOperation` consults
+> `Get-WuuPendingOpRank` (also exported): `Check`(1) < `Download`(2) < `Install`/`InstallAndRecheck`(3)
+> < `Restart`/`AutoFlow`(4). An UPGRADE replaces and reports the displaced request; a DOWNGRADE is
+> DECLINED, the higher request is KEPT, and the decline is reported (`Refused` + `Existing` + `Reason`).
+> Equal ranks replace, so arrival order settles the genuine ambiguity. An UNKNOWN operation ranks 0,
+> so it is declined in favour of anything already queued rather than silently displacing real work.
+>
+> Refusing a DOWNGRADE loses nothing: the higher request still runs and is still what the operator
+> asked for. The note above about refusing a second request applies to an UPGRADE, which is why an
+> upgrade still replaces. The returned hashtable is ADDITIVE (SS34): `Set`/`Op`/`Replaced` keep their
+> former meaning, and `Refused`/`Existing` are new. Gate (aj) drives every ordered pair of the rank
+> table, because the behaviour that was wrong is a single cell of that matrix.
 
 However, do NOT implement this merely by changing one comparison.
 
@@ -1427,7 +1437,8 @@ for per-invariant evidence.
 1. Formalise command result model. — **NOT IMPLEMENTED**.
 2. Make JSON output a versioned API. — **NOT IMPLEMENTED** (read verbs only, no `schemaVersion`).
 3. Implement/remove unreachable exit code contracts. — **DONE**: all of `0`–`7` have producers.
-4. Improve pending-operation precedence. — **NOT IMPLEMENTED** (newest wins, replacement reported).
+4. Improve pending-operation precedence. — **DONE**: semantic precedence in `Set-WuuPendingOperation`
+   via `Get-WuuPendingOpRank` (SS16); a downgrade is declined and reported, an upgrade replaces.
 
 ## P2
 
@@ -1524,7 +1535,7 @@ the invariant regresses. Status is verified against the source, not the document
 | 8.4 | Terminal operations stay terminal | **ENFORCED** | One ordered declaration (`Error` > `Timeout` > `Complete`) read by guard, classifier and checker; gate (ay); `Test-TerminalStates` |
 | 8.5 | All per-computer remote execution goes through one submission point | **ENFORCED (narrow)** | `Start-UpdateCheckJob`; gate (x). The scheduler tick and direct handler calls both admit through it |
 | 8.6 | Concurrency limits are absolute | **ENFORCED** | `Test-WuuConcurrencyAvailable` at the submission point and the scheduler tick; atomic reservation under the submission lock; pool ≥ cap; gates (ai), (ao), (ax); `Test-ConcurrencyCap`, `Test-SubmissionAtomicity`, `Test-PoolCompatibility` |
-| 8.7 | Pending work is not silently discarded | **ENFORCED** | `Set-WuuPendingOperation`: one slot, newest wins, replacement returned and reported; gate (aj); `Test-PendingPolicy` |
+| 8.7 | Pending work is not silently discarded | **ENFORCED** | `Set-WuuPendingOperation`: one slot, semantic precedence via `Get-WuuPendingOpRank` (SS16) - an upgrade replaces and reports, a downgrade is declined and the higher request kept; gate (aj); `Test-PendingPolicy` |
 | 8.8 | Credential identity is deterministic | **ENFORCED** | `Resolve-WuuOperationCredential`, no fallback on either resolver; gate (ad); `Test-CredentialDeterminism`, `Test-CredentialPropagation` |
 | 8.9 | `WhatIf` causes no remote mutation | **ENFORCED** | returns before any handler and writes no audit record; gate (ae); `Test-WhatIfPlan`, `Test-AuditTrail` |
 | 8.10 | Connectivity failure does not delete inventory | **ENFORCED** | consecutive-failure threshold, reset on success; gate (z); `Test-ConnectivityClassification` |

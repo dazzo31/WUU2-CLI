@@ -2804,17 +2804,17 @@ $consoleActions.EventToggleSettings = {
 $consoleActions.EventGetUpdates = {
     $rows = @(Read-WuuSelection -Store $stateStore -Prompt 'Check which computers? ("all" for every row, Enter to cancel)')
     if ($rows.Count -eq 0) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
-    $started = 0; $deferred = 0; $skipped = 0; $replaced = @()
+    $started = 0; $deferred = 0; $skipped = 0; $replaced = @(); $declined = @()
     foreach ($r in $rows) {
         # One operation per computer (SS3): a computer already working is left queued, NOT submitted
         # to. Set Pending so the scheduler starts it as soon as the current operation finishes -
         # a plain skip would lose the operator's request.
         if (Test-WuuComputerBusy -Row $r) {
-            # SS7: the slot holds ONE request, so a second one replaces the first. -OnlyIfEmpty keeps
-            # this a REQUEST rather than a queue: an existing operator request is never displaced by
-            # a plain re-check, so nothing is lost here.
+            # SS7/SS16: the slot holds ONE request. -OnlyIfEmpty keeps this a REQUEST rather than a
+            # queue, so a re-check never displaces an operator's queued work and nothing is lost.
             $pendingResult = Set-WuuPendingOperation -Row $r -Op 'Check' -OnlyIfEmpty
             if ($pendingResult.Replaced) { $replaced += ($r.Computer + ' (' + $pendingResult.Replaced + ')') }
+            if ($pendingResult.Refused) { $declined += ($r.Computer + ' (' + $pendingResult.Existing + ')') }
             $deferred++
             continue
         }
@@ -2828,6 +2828,9 @@ $consoleActions.EventGetUpdates = {
     if ($replaced.Count) {
         Write-Host ("  {0} had a queued request NOT replaced (the existing request is kept): {1}" -f $replaced.Count, ($replaced -join ', ')) -ForegroundColor DarkGray
     }
+    if ($declined.Count) {
+        Write-Host ("  {0} had a higher-priority request already queued, which is KEPT: {1}" -f $declined.Count, ($declined -join ', ')) -ForegroundColor DarkGray
+    }
     if ($skipped) { Write-Host ("  {0} could not be submitted (see the error log)." -f $skipped) -ForegroundColor Red }
 }
 
@@ -2837,7 +2840,7 @@ $consoleActions.EventDownloadUpdates = {
     if (-not (Read-WuuYesNo -Prompt "Download updates to $($rows.Count) computer(s)?" -Default $true)) {
         Write-Host '  Cancelled.' -ForegroundColor Yellow; return
     }
-    $started = 0; $deferred = 0; $uptodate = 0; $replaced = @()
+    $started = 0; $deferred = 0; $uptodate = 0; $replaced = @(); $declined = @()
     foreach ($r in $rows) {
         # Nothing to do - answer immediately rather than queuing an operation that will no-op.
         if ($r.Available -eq $r.Downloaded) {
@@ -2846,11 +2849,13 @@ $consoleActions.EventDownloadUpdates = {
             continue
         }
         if (Test-WuuComputerBusy -Row $r) {
-            # SS7: this DISPLACES any queued request, and a displacement is reported. `install` then
-            # `download` on a busy computer used to replace the install with a download silently, so
-            # an operator who asked for MORE got less with no indication. See Set-WuuPendingOperation.
+            # SS7/SS16: an UPGRADE replaces and is reported; a DOWNGRADE is DECLINED and the higher
+            # request already queued is KEPT. `install` then `download` on a busy computer used to
+            # replace the install with a download, so an operator who asked for MORE got less with
+            # no indication. See Set-WuuPendingOperation.
             $pendingResult = Set-WuuPendingOperation -Row $r -Op 'Download'
             if ($pendingResult.Replaced) { $replaced += ($r.Computer + ' (' + $pendingResult.Replaced + ' -> Download)') }
+            if ($pendingResult.Refused) { $declined += ($r.Computer + ' (' + $pendingResult.Existing + ')') }
             $deferred++
             continue
         }
@@ -2862,7 +2867,10 @@ $consoleActions.EventDownloadUpdates = {
     Write-Host ("  Download started for {0} computer(s)." -f $started) -ForegroundColor Green
     if ($deferred) { Write-Host ("  {0} already busy - queued to run when they finish." -f $deferred) -ForegroundColor Yellow }
     if ($replaced.Count) {
-        Write-Host ("  {0} had a queued request REPLACED by this one (one request per computer): {1}" -f $replaced.Count, ($replaced -join ', ')) -ForegroundColor Yellow
+        Write-Host ("  {0} had a queued request REPLACED by this one (it does the same work and more): {1}" -f $replaced.Count, ($replaced -join ', ')) -ForegroundColor Yellow
+    }
+    if ($declined.Count) {
+        Write-Host ("  {0} had a higher-priority request already queued, which is KEPT - a download would do LESS than was asked: {1}" -f $declined.Count, ($declined -join ', ')) -ForegroundColor Yellow
     }
     if ($uptodate) { Write-Host ("  {0} had nothing to download." -f $uptodate) -ForegroundColor DarkGray }
 }
@@ -2873,13 +2881,14 @@ $consoleActions.EventInstallUpdates = {
     if (-not (Read-WuuYesNo -Prompt "Install updates on $($rows.Count) computer(s)?" -Default $false)) {
         Write-Host '  Cancelled.' -ForegroundColor Yellow; return
     }
-    $started = 0; $deferred = 0; $replaced = @()
+    $started = 0; $deferred = 0; $replaced = @(); $declined = @()
     foreach ($r in $rows) {
         if (Test-WuuComputerBusy -Row $r) {
-            # SS7: displaces any queued request - including a queued DOWNLOAD, which this upgrade of
-            # it would have destroyed silently before. A replacement is reported below.
+            # SS7/SS16: install ranks above a queued download, so this UPGRADES and replaces it; the
+            # replacement is reported. Nothing ranks above install, so it can never be declined here.
             $pendingResult = Set-WuuPendingOperation -Row $r -Op 'InstallAndRecheck'
             if ($pendingResult.Replaced) { $replaced += ($r.Computer + ' (' + $pendingResult.Replaced + ' -> InstallAndRecheck)') }
+            if ($pendingResult.Refused) { $declined += ($r.Computer + ' (' + $pendingResult.Existing + ')') }
             $deferred++
             continue
         }
@@ -2891,7 +2900,10 @@ $consoleActions.EventInstallUpdates = {
     Write-Host ("  Install started for {0} computer(s)." -f $started) -ForegroundColor Green
     if ($deferred) { Write-Host ("  {0} already busy - queued to run when they finish." -f $deferred) -ForegroundColor Yellow }
     if ($replaced.Count) {
-        Write-Host ("  {0} had a queued request REPLACED by this one (one request per computer): {1}" -f $replaced.Count, ($replaced -join ', ')) -ForegroundColor Yellow
+        Write-Host ("  {0} had a queued request REPLACED by this one (it does the same work and more): {1}" -f $replaced.Count, ($replaced -join ', ')) -ForegroundColor Yellow
+    }
+    if ($declined.Count) {
+        Write-Host ("  {0} had a higher-priority request already queued, which is KEPT: {1}" -f $declined.Count, ($declined -join ', ')) -ForegroundColor Yellow
     }
 }
 

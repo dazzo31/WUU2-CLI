@@ -1392,38 +1392,85 @@ function Test-WuuOperationCurrent {
     return ($rowId -ceq $OperationId)
 }
 
+function Get-WuuPendingOpRank {
+    <#
+    .SYNOPSIS
+    The SEMANTIC rank of a queued operation, for pending-request precedence (SS16).
+    .DESCRIPTION
+    WHY A RANK AND NOT NEWEST-WINS. Newest-wins is a plausible rule that loses work in the direction
+    that is easiest to miss: `install` then `download` on a busy computer replaced the install with a
+    download, so an operator who asked for MORE got LESS. Reporting the displacement made it visible
+    but still did it.
+
+    The ordering is the one SS16 recommends - each rank SUBSUMES the work of the one below it, which
+    is what makes replacing upward safe and replacing downward a loss:
+
+        Check  <  Download  <  InstallAndRecheck  <  Restart
+
+    AutoFlow ranks WITH Restart: it is the full download + install + reboot chain, so it is the widest
+    request there is. `InstallAndRecheck` is the install handler's verb and ranks with Install.
+
+    AN UNKNOWN OPERATION RANKS 0. Refusing an unrecognised request in favour of one this function
+    cannot compare would make a typo in a new caller look like a policy decision, so the unknown value
+    ranks lowest and is therefore DECLINED whenever anything is already queued - which is the safe
+    direction: nothing that was asked for is abandoned.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()][string]$Op = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Op)) { return 0 }
+    switch -Regex ($Op.Trim()) {
+        '^Check$'               { return 1 }
+        '^Download$'            { return 2 }
+        '^Install(AndRecheck)?$' { return 3 }
+        '^(Restart|AutoFlow)$'  { return 4 }
+        default                 { return 0 }
+    }
+}
+
 function Set-WuuPendingOperation {
     <#
     .SYNOPSIS
-    Sets a row's queued follow-up OPERATION, applying the pending-request policy (SS7).
+    Sets a row's queued follow-up OPERATION, applying the pending-request policy (SS7/SS16).
     .DESCRIPTION
-    POLICY: ONE SLOT, NEWEST REQUEST WINS, AND A REPLACEMENT IS ALWAYS REPORTED.
+    POLICY: ONE SLOT, SEMANTIC PRECEDENCE, AND EVERY DECISION IS REPORTED.
 
-    A row has a single PendingOp slot, so a busy computer cannot hold two outstanding
-    requests. A second request must therefore be refused or replace the first. Refusing
-    would make `download` then `install` on a busy computer silently do NOTHING, which is
-    worse than doing the newer thing - so the slot is newest-wins. The caller receives the
-    replaced value and MUST report it.
+    A row has a single PendingOp slot, so a busy computer cannot hold two outstanding requests. A
+    second request must therefore be refused or replace the first. Which one it is, is the policy.
 
-    THE DEFECT WAS THE SILENCE, NOT THE OVERWRITE. `download` followed by `install` left
-    `Download` destroyed while the operator was told only "queued to run when they finish".
-    Note the direction that is easy to miss: a LATER LOWER request is a DOWNGRADE.
-    `install` then `download` replaced the install with a download, so an operator who asked
-    for more got less, with no indication at all.
+    WHY PRECEDENCE AND NOT NEWEST-WINS. See Get-WuuPendingOpRank for the ordering and the reasoning.
+    In short: an UPGRADE still replaces (the higher request performs the lower one), but a DOWNGRADE
+    is DECLINED and the higher request is KEPT. Equal ranks are genuinely ambiguous, so the newer
+    request wins within its rank.
 
-    -OnlyIfEmpty is for INTERNAL callers. An automatic follow-up queued by the
-    download/check payloads is not an operator request, so it must never displace one: if
-    the slot is already held the follow-up is skipped (Set = $false) and NOT reported, because
-    nothing was lost. The payloads INLINE this rule rather than calling here - they run in an
-    isolated worker runspace where no module function resolves (see the note at the top of
-    this file) - so tests\Test-PendingPolicy.ps1 asserts both copies agree.
+    WHY DECLINING A DOWNGRADE LOSES NOTHING. An earlier note here warned that "refusing a second
+    request would make `download` then `install` silently do nothing". That is true of an UPGRADE and
+    is exactly why R3 still replaces. It is NOT true of a DOWNGRADE: the queued download is still
+    going to run and is still what the operator asked for. The defect was never the overwrite alone -
+    it was doing LESS than asked while implying MORE.
 
-    RETURNS a hashtable, never a bare boolean, because the caller needs three facts:
-      Set      [bool]   whether the slot was changed
-      Op       [string] the operation now queued ($null when nothing was set)
-      Replaced [string] the request that was displaced ($null when nothing was lost)
-    A caller that ignores Replaced reproduces the original defect; the tests assert that a
-    replacement is surfaced, not merely performed.
+    -OnlyIfEmpty is for INTERNAL callers. An automatic follow-up queued by the download/check payloads
+    is not an operator request, so it must never displace one: if the slot is already held the
+    follow-up is skipped (Set = $false, and Refused stays $false because nothing was lost). The
+    payloads INLINE this rule rather than calling here - they run in an isolated worker runspace where
+    no module function resolves (see the note at the top of this file) - so
+    tests\Test-PendingPolicy.ps1 asserts both copies agree.
+
+    RETURNS a hashtable, never a bare boolean, because the caller must distinguish three outcomes that
+    all leave the row without the request it just made:
+      Set      [bool]   whether the slot was CHANGED.
+      Refused  [bool]   the request was DECLINED in favour of the higher-ranked request already queued.
+                        Not the same as Set=$false with Refused=$false, which means an internal
+                        follow-up stood aside (nothing was lost) or the call was a degenerate no-op.
+      Op       [string] the operation now queued ($null when nothing is queued).
+      Replaced [string] the request this call DISPLACED ($null when nothing was lost).
+      Existing [string] what the slot held, so a caller can report what was KEPT without re-reading.
+      Reason   [string] why the request was not accepted.
+    ADDITIVE ONLY (SS34): Set/Op/Replaced keep their former meaning exactly, so a caller that reads
+    only them is unaffected. A caller that ignores Replaced still reproduces the original silence
+    defect, so the tests assert that a replacement is SURFACED, not merely performed.
     #>
     param(
         [Parameter(Mandatory = $false)][AllowNull()]$Row,
@@ -1431,7 +1478,7 @@ function Set-WuuPendingOperation {
         [switch]$OnlyIfEmpty
     )
 
-    $noChange = @{ Set = $false; Op = $null; Replaced = $null }
+    $noChange = @{ Set = $false; Refused = $false; Op = $null; Replaced = $null; Existing = $null; Reason = '' }
 
     if ($null -eq $Row) { return $noChange }
     if ([string]::IsNullOrWhiteSpace($Op)) { return $noChange }
@@ -1441,7 +1488,7 @@ function Set-WuuPendingOperation {
     # request would be a promise about a finished row, and its display state is what the outcome and
     # phase accounting read. Refused with a reason, so the caller can say why nothing was queued.
     if ($Row.PSObject.Properties['State'] -and (@(Get-WuuTerminalStates) -contains [string]$Row.State)) {
-        return @{ Set = $false; Op = $null; Replaced = $null; Reason = "the row has settled ('$($Row.State)') - there is no operation for a follow-up to follow" }
+        return @{ Set = $false; Refused = $false; Op = $null; Replaced = $null; Existing = $null; Reason = "the row has settled ('$($Row.State)') - there is no operation for a follow-up to follow" }
     }
 
     $existing = ''
@@ -1453,7 +1500,17 @@ function Set-WuuPendingOperation {
     # Same request again: refresh Pending (it may have been cleared) but nothing is replaced.
     if ($existing -ceq $Op) {
         if ($Row.PSObject.Properties['Pending']) { $Row.Pending = $true }
-        return @{ Set = $true; Op = $Op; Replaced = $null }
+        return @{ Set = $true; Refused = $false; Op = $Op; Replaced = $null; Existing = $existing; Reason = '' }
+    }
+
+    # SEMANTIC PRECEDENCE (SS16). A request ranking BELOW what is already queued is DECLINED and the
+    # higher request is kept, so the operator never ends up doing less than they asked for. Equal
+    # ranks replace - the ambiguity is settled by arrival order, which is the newest-wins behaviour
+    # and is why an upgrade below still replaces.
+    if ($existing -ne '' -and (Get-WuuPendingOpRank -Op $Op) -lt (Get-WuuPendingOpRank -Op $existing)) {
+        return @{ Set = $false; Refused = $true; Op = $null; Replaced = $null; Existing = $existing
+            Reason = "'$Op' ranks below the '$existing' already queued for $($Row.Computer) - the queued request is kept, or the computer would do less than was asked of it"
+        }
     }
 
     $Row.PendingOp = $Op
@@ -1461,7 +1518,7 @@ function Set-WuuPendingOperation {
 
     $replaced = $null
     if ($existing -ne '') { $replaced = $existing }
-    return @{ Set = $true; Op = $Op; Replaced = $replaced }
+    return @{ Set = $true; Refused = $false; Op = $Op; Replaced = $replaced; Existing = $existing; Reason = '' }
 }
 
 function Resolve-WuuVersion {
@@ -2003,6 +2060,10 @@ Export-ModuleMember -Function @(
     # the reporting of a replacement, while the policy itself must live in one place; and because
     # the payloads inline the -OnlyIfEmpty half, which tests assert against this function.
     'Set-WuuPendingOperation'
+    # SS16: the semantic precedence that policy consults. Exported so a caller can explain a decision
+    # ("that ranks below what is already queued") without restating the table, and so the gate and the
+    # tests can drive the ordering rather than matching it as text.
+    'Get-WuuPendingOpRank'
     # SS18: the authoritative version. Exported so the release gate can assert tag == embedded ==
     # package, and so a test can drive the precedence without starting the application.
     'Resolve-WuuVersion'

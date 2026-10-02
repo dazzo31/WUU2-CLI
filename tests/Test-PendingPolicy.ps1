@@ -55,14 +55,80 @@ Assert-Equal $r.Pending $true '1. queueing sets Pending (or the scheduler never 
 
 # UPGRADE: download -> install. The download IS replaced, and that must be REPORTED.
 $res = Set-WuuPendingOperation -Row $r -Op 'InstallAndRecheck'
-Assert-Equal $res.Set $true '1. a second request is accepted (refusing would silently do nothing)'
+Assert-Equal $res.Set $true '1. an UPGRADE is accepted (refusing it would silently do nothing)'
+Assert-Equal $res.Refused $false '1. an UPGRADE is not a refusal'
 Assert-Equal $res.Replaced 'Download' '1. the displaced request is RETURNED to the caller (this is what makes it reportable)'
-Assert-Equal $r.PendingOp 'InstallAndRecheck' '1. newest request wins'
+Assert-Equal $r.PendingOp 'InstallAndRecheck' '1. an UPGRADE replaces the queued request (it does the same work and more)'
 
-# DOWNGRADE: install -> download. The install is destroyed - the case the report did not mention.
+# DOWNGRADE: install -> download. The install is KEPT - the case the report did not mention. SS16
+# replaced newest-wins here: the operator asked for MORE, so honouring the later, smaller request
+# would do less than they asked while leaving the slot describing the smaller thing.
 $res = Set-WuuPendingOperation -Row $r -Op 'Download'
-Assert-Equal $res.Replaced 'InstallAndRecheck' '1. DOWNGRADE: install -> download reports the install as replaced (asked for more, got less)'
-Assert-Equal $r.PendingOp 'Download' '1. DOWNGRADE: the newer, lower request wins the single slot'
+Assert-Equal $res.Set $false '1. DOWNGRADE: the lower request is DECLINED'
+Assert-Equal $res.Refused $true '1. DOWNGRADE: the decline is REPORTED - a silent no-op is the defect class'
+Assert-Equal $res.Existing 'InstallAndRecheck' '1. DOWNGRADE: the caller is told what was KEPT, so the decision can be explained'
+Assert-True ([bool]$res.Reason) '1. DOWNGRADE: the decline carries a reason'
+Assert-Equal "$($res.Replaced)" '' '1. DOWNGRADE: nothing was displaced, so nothing is reported as replaced'
+Assert-Equal $r.PendingOp 'InstallAndRecheck' '1. DOWNGRADE: the higher request STAYS queued (asked for more, still getting more)'
+
+# ---------------------------------------------------------------------------------------
+# 1b. SEMANTIC PRECEDENCE (SS16). The rank table, and the rule that a LOWER request never displaces a
+#     HIGHER one. Driven from the table itself so a re-ranked operation cannot pass by accident.
+# ---------------------------------------------------------------------------------------
+# Check < Download < Install < Restart. AutoFlow is the full chain, so it ranks with Restart.
+$rankCases = @(
+    @{ Op = 'Check'; Rank = 1 }, @{ Op = 'Download'; Rank = 2 },
+    @{ Op = 'InstallAndRecheck'; Rank = 3 }, @{ Op = 'Install'; Rank = 3 },
+    @{ Op = 'Restart'; Rank = 4 }, @{ Op = 'AutoFlow'; Rank = 4 },
+    # An unrecognised operation ranks 0: declining it in favour of anything already queued is the
+    # safe direction, because nothing the operator asked for is abandoned.
+    @{ Op = 'SomethingNew'; Rank = 0 }
+)
+foreach ($c in $rankCases) {
+    Assert-Equal (Get-WuuPendingOpRank -Op $c.Op) $c.Rank "1b. rank('$($c.Op)') is $($c.Rank)"
+}
+Assert-Equal (Get-WuuPendingOpRank -Op '') 0 '1b. a blank op ranks 0 (degenerate input never throws)'
+
+# Every ordered PAIR from the table: a lower request must be declined and leave the slot alone; a
+# higher one must replace. This is the whole policy in one loop, so the direction that used to be
+# missed (install then download) is asserted for every combination rather than the two we thought of.
+foreach ($existing in @('Check', 'Download', 'InstallAndRecheck', 'Restart')) {
+    foreach ($requested in @('Check', 'Download', 'InstallAndRecheck', 'Restart')) {
+        $pairRow = New-WuuComputerRow -Computer 'PAIR'
+        $pairRow.OpState = 'Running'
+        $pairRow.PendingOp = $existing
+        $pairRes = Set-WuuPendingOperation -Row $pairRow -Op $requested
+        $eRank = Get-WuuPendingOpRank -Op $existing
+        $rRank = Get-WuuPendingOpRank -Op $requested
+        if ($rRank -lt $eRank) {
+            Assert-Equal $pairRes.Refused $true "1b. $existing -> $requested is DECLINED (a lower request must not displace a higher one)"
+            Assert-Equal $pairRow.PendingOp $existing "1b. $existing -> $requested leaves the higher request queued"
+        } elseif ($rRank -gt $eRank) {
+            Assert-Equal $pairRes.Set $true "1b. $existing -> $requested is accepted (an upgrade loses nothing)"
+            Assert-Equal $pairRes.Replaced $existing "1b. $existing -> $requested reports the displaced request"
+            Assert-Equal $pairRow.PendingOp $requested "1b. $existing -> $requested queues the upgrade"
+        }
+    }
+}
+
+# EQUAL rank is genuinely ambiguous, so the newer request wins within its rank - and that IS a
+# replacement, so it is reported exactly like any other.
+$sameRow = New-WuuComputerRow -Computer 'SAME'
+$sameRow.OpState = 'Running'
+$null = Set-WuuPendingOperation -Row $sameRow -Op 'Install'
+$sameRes = Set-WuuPendingOperation -Row $sameRow -Op 'InstallAndRecheck'
+Assert-Equal $sameRes.Set $true '1b. an equal-rank request replaces (the ambiguity is settled by arrival order)'
+Assert-Equal $sameRes.Replaced 'Install' '1b. an equal-rank replacement is REPORTED, not silent'
+Assert-Equal $sameRes.Refused $false '1b. an equal-rank replacement is not a refusal'
+
+# A DOWNGRADE that is DECLINED must leave Pending alone as well as PendingOp: the queued higher
+# request still has to be picked up by the scheduler.
+$keepRow = New-WuuComputerRow -Computer 'KEEP'
+$keepRow.OpState = 'Running'
+$keepRow.Pending = $true
+$keepRow.PendingOp = 'Restart'
+$null = Set-WuuPendingOperation -Row $keepRow -Op 'Check'
+Assert-Equal $keepRow.Pending $true '1b. a declined request leaves the higher one still marked Pending (or it would never run)'
 
 # Re-queueing the SAME op is not a replacement - nothing was lost, so nothing is reported.
 $r.PendingOp = 'Download'

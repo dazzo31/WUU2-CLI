@@ -224,14 +224,17 @@ if ($submitBodyI -notmatch '\$MaxConcurrentJobs = \$ctx\.MaxConcurrentJobs') {
     Pass 'both admission paths read the cap from the same context value (SS4)'
 }
 
-# (aj) PENDING-REQUEST POLICY (brief SS7 / invariant 8.7). A row has ONE PendingOp slot, so a second
-#      request to a busy computer silently destroyed the first: `download` then `install` left the
-#      Download gone while the operator was told only "queued to run when they finish". The direction
-#      that is easy to miss is the DOWNGRADE - `install` then `download` destroyed the install, so an
-#      operator who asked for more got less with no indication at all.
+# (aj) PENDING-REQUEST POLICY (brief SS7/SS16 / invariant 8.7). A row has ONE PendingOp slot, so a
+#      second request to a busy computer silently destroyed the first: `download` then `install` left
+#      the Download gone while the operator was told only "queued to run when they finish". The
+#      direction that is easy to miss is the DOWNGRADE - `install` then `download` destroyed the
+#      install, so an operator who asked for more got less with no indication at all.
 #
-#      THE POLICY: one slot, newest request wins, and a replacement is ALWAYS REPORTED. Refusing a
-#      second request outright would make `download` then `install` silently do nothing.
+#      THE POLICY: one slot, SEMANTIC PRECEDENCE (Check < Download < Install < Restart), and every
+#      decision reported. An UPGRADE replaces (it does the same work and more) and is reported. A
+#      DOWNGRADE is DECLINED and the higher request is KEPT, which is the SS16 change: refusing an
+#      UPGRADE outright would make `download` then `install` silently do nothing, but declining a
+#      DOWNGRADE loses nothing, because the higher request still runs.
 $stateRawJ = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
 $coreRawJ = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Core.psm1') -Raw
 
@@ -256,6 +259,57 @@ if ($pendingBodyJ -notmatch "if \(\`$OnlyIfEmpty -and \`$existing -ne ''\) \{ re
     Fail 'Set-WuuPendingOperation lost its -OnlyIfEmpty GUARD - an internal follow-up could displace an operator request (SS7)'
 } else {
     Pass 'the policy captures the displaced request and guards -OnlyIfEmpty (SS7)'
+}
+
+# SS16: the precedence itself, DRIVEN rather than matched. Source text cannot show that a downgrade is
+# actually declined, and a presence check on `Get-WuuPendingOpRank` would pass a mutant that computed a
+# rank and then ignored it. The table AND both directions of every ordered pair are exercised, because
+# the behaviour that was wrong (install then download) is a single cell of that matrix.
+if ($pendingBodyJ -notmatch 'Get-WuuPendingOpRank') {
+    Fail 'Set-WuuPendingOperation does not consult Get-WuuPendingOpRank - the slot is back to blind newest-wins, so a later lower request can still replace a higher one (SS16)'
+} elseif (-not (Get-Command Get-WuuPendingOpRank -ErrorAction SilentlyContinue)) {
+    Fail 'Get-WuuPendingOpRank is not resolvable - the precedence table cannot be driven, so SS16 is asserted by text only (SS16)'
+} else {
+    try {
+        $rankExpectedJ = @{ 'Check' = 1; 'Download' = 2; 'InstallAndRecheck' = 3; 'Install' = 3; 'Restart' = 4; 'AutoFlow' = 4 }
+        $rankWrongJ = @()
+        foreach ($k in $rankExpectedJ.Keys) {
+            if ((Get-WuuPendingOpRank -Op $k) -ne $rankExpectedJ[$k]) { $rankWrongJ += $k }
+        }
+        # An unrecognised operation must rank LOWEST, so it is declined rather than displacing real work.
+        if ((Get-WuuPendingOpRank -Op 'NoSuchOperation') -ge 1) { $rankWrongJ += 'NoSuchOperation(not lowest)' }
+
+        $precedenceWrongJ = @()
+        foreach ($existingJ in @('Check', 'Download', 'InstallAndRecheck', 'Restart')) {
+            foreach ($requestedJ in @('Check', 'Download', 'InstallAndRecheck', 'Restart')) {
+                $rowJ = New-WuuComputerRow -Computer 'GATE-PRECEDENCE'
+                $rowJ.OpState = 'Running'
+                $rowJ.PendingOp = $existingJ
+                $resJ = Set-WuuPendingOperation -Row $rowJ -Op $requestedJ
+                $eJ = Get-WuuPendingOpRank -Op $existingJ
+                $rJ = Get-WuuPendingOpRank -Op $requestedJ
+                if ($rJ -lt $eJ) {
+                    # DECLINED: the higher request must survive AND still be flagged Pending.
+                    if (-not $resJ.Refused -or [string]$rowJ.PendingOp -ne $existingJ) {
+                        $precedenceWrongJ += "$existingJ->$requestedJ (should keep $existingJ)"
+                    }
+                } elseif ($rJ -gt $eJ) {
+                    if (-not $resJ.Set -or [string]$rowJ.PendingOp -ne $requestedJ -or [string]$resJ.Replaced -ne $existingJ) {
+                        $precedenceWrongJ += "$existingJ->$requestedJ (should replace and report)"
+                    }
+                }
+            }
+        }
+        if ($rankWrongJ.Count) {
+            Fail ('the pending precedence table is wrong for: ' + ($rankWrongJ -join ', ') + ' - the ordering is Check < Download < Install < Restart with AutoFlow at the top (SS16)')
+        } elseif ($precedenceWrongJ.Count) {
+            Fail ('semantic precedence is not enforced: ' + ($precedenceWrongJ -join '; ') + ' (SS16)')
+        } else {
+            Pass 'semantic precedence holds for every ordered pair of queued requests, and an unknown operation ranks lowest (SS16)'
+        }
+    } catch {
+        Fail "driving the pending precedence threw instead of reporting: $($_.Exception.Message) (SS16)"
+    }
 }
 
 # No operator-facing handler may assign PendingOp directly. That bare assignment IS the defect.
