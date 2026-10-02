@@ -248,6 +248,11 @@ if ($gateCode -match '@\(\s*\$script:WuuGateVerdicts\s*\)') {
 #      Dot-sourced HERE, where the blocks were, so their verdicts keep their position in the list.
 #      A fragment may be dot-sourced ONCE.
 . (Join-Path $PSScriptRoot 'Test-EngineHealth.ps1')
+# DOC CONSISTENCY (SS40/SS45). Dot-sourced LAST: it measures the tree against the document, so it must
+# run after every other block has had its say. Extracted to its own file rather than appended to
+# Test-EngineHealth.ps1, because that fragment is already dot-sourced above and a fragment may be
+# dot-sourced ONCE.
+. (Join-Path $PSScriptRoot 'Test-DocConsistency.ps1')
 # --- JSON REPORT (P4), written LAST --------------------------------------------------------------
 # THE PLACEMENT IS THE POINT. The call was originally placed just after the report function was
 # defined, which is ~140 lines BEFORE the final blocks - so the report was written without them. It

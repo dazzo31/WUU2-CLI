@@ -175,60 +175,41 @@ Business logic belongs in `src/*.psm1`.
 # 7. Module responsibility
 Respect module boundaries.
 
-At a minimum, maintain these conceptual responsibilities:
+## Inventory
+Every shipped module, with the responsibility it owns. **This table is the canonical module set**:
+`Scripts/Test-DocConsistency.ps1` fails if a module is missing from it, if it names a module that does
+not exist, or if the two disagree in either direction. Add the row before adding the module.
 
-### Wuu.State
-Own:
+<!-- module-inventory:start -->
+| Module | Owns |
+|---|---|
+| `Wuu.Core` | Startup, orchestration, the console action layer, and the worker payloads that cannot move |
+| `Wuu.State` | Computer/operation state, the mutation funnel, the row contract, invariant checks |
+| `Wuu.WindowsUpdate` | Update search/download/install/recheck, the submission point, the scheduler tick |
+| `Wuu.Scheduler` | Worker-runspace construction for the scheduling and cleanup machinery |
+| `Wuu.Workers` | Worker-pool lifecycle, abandoned-worker handling, the job-cleanup payload |
+| `Wuu.Remote` | Remote execution: endpoint probe, CIM/service invocation with timeout, task dispatch |
+| `Wuu.Network` | Bounded pooled execution (replaced one child process per call) |
+| `Wuu.Credentials` | Credential resolution and DPAPI protection |
+| `Wuu.Audit` | Audit records: canonical JSON, hash chaining, verification, transcript capture |
+| `Wuu.Logging` | Fault-tolerant log append; never throws into the caller |
+| `Wuu.Models` | Collections shared between the console thread and worker runspaces |
+| `Wuu.Session` | Computer-name parsing and computer sets |
+| `Wuu.Console` | Console presentation: colours, table/status rendering, the menu |
+| `Wuu.Presentation` | Presentation helpers shared by the display paths |
+| `Wuu.Actions.Display` | The display/table actions |
+| `Wuu.Navigate` | The navigation tree |
+| `Wuu.Configuration` | Paths and `$global:*` settings, resolved from `$WuuRoot` |
+| `Wuu.Command` | The `wuu` verb surface: parse, dispatch, exit codes, JSON for read verbs |
+| `Wuu.Result` | The command result model and its JSON rendering |
+<!-- module-inventory:end -->
 
-- computer state;
-- operation state;
-- state transitions;
-- OperationId validation;
-- revision handling;
-- pending operation state;
-- timeout/deadline state.
-
-### Wuu.WindowsUpdate
-Own:
-
-- Windows Update-specific operations;
-- update search;
-- download;
-- installation;
-- recheck;
-- reboot/update workflows.
-
+## Boundaries that matter
+### `Wuu.WindowsUpdate`
 Do not turn it into a general-purpose scheduler.
 
-### Wuu.Workers
-Own:
-
-- runspace/pool lifecycle;
-- worker execution;
-- worker cleanup;
-- abandoned worker handling.
-
-### Wuu.Remote
-Own:
-
-- remote management;
-- remote connectivity;
-- credentials;
-- remote calls.
-
-### Wuu.Audit
-Own:
-
-- audit records;
-- canonicalisation;
-- hash chaining;
-- audit verification;
-- audit locking.
-
 ### Scheduler
-Where practical, scheduler responsibilities should be isolated from Windows Update operation logic.
-
-Scheduler responsibilities are:
+Where practical, scheduler responsibilities should be isolated from Windows Update operation logic:
 
 - admission;
 - concurrency;
@@ -240,8 +221,8 @@ Scheduler responsibilities are:
 
 Do not add new scheduler functionality to an unrelated module merely because it is convenient.
 
-> **Current:** `Wuu.Scheduler.psm1` exists but owns only the worker-helper surface. Admission still lives
-> at the submission point `Start-UpdateCheckJob` in `Wuu.WindowsUpdate`, and the cleanup loop lives in
+> **Current:** `Wuu.Scheduler.psm1` owns only the worker-helper surface. Admission still lives at the
+> submission point `Start-UpdateCheckJob` in `Wuu.WindowsUpdate`, and the cleanup loop lives in
 > `Wuu.Core`. **PARTIAL.**
 
 ---
