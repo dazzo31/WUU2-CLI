@@ -154,7 +154,7 @@ function Get-WuuMenuActions {
         @{ Key = 'g';  Label = 'View Windows Update log';     Mutating = $false; Handler = 'EventViewUpdateLog';                Run = { param($ctx) & $ctx.EventViewUpdateLog } }
         @{ Key = 'w';  Label = 'Windows Update service';      Mutating = $true;  Handler = 'EventWUServiceActionInteractive';   Run = { param($ctx) & $ctx.EventWUServiceActionInteractive } }
         @{ Key = 'n';  Label = 'Add computers from Active Directory'; Mutating = $false; Handler = 'EventAddAD';                 Run = { param($ctx) & $ctx.EventAddAD } }
-        @{ Key = 't';  Label = 'Toggle auto download/install/reboot'; Mutating = $false; Handler = 'EventToggleSettings';        Run = { param($ctx) & $ctx.EventToggleSettings } }
+        @{ Key = 't';  Label = 'Toggle ALL automation (download/install/reboot)'; Mutating = $false; Handler = 'EventToggleSettings';        Run = { param($ctx) & $ctx.EventToggleSettings } }
         @{ Key = '?';  Label = 'Help';                        Mutating = $false; Handler = 'ShowHelp';                         Run = { param($ctx) & $ctx.ShowHelp } }
         @{ Key = 'q';  Label = 'Quit';                        Mutating = $false; Handler = '';                                 Run = { param($ctx) $ctx.Quit = $true } }
     )

@@ -2821,20 +2821,55 @@ $consoleActions.ShowHelp = {
     Write-Host '  a comma-separated list, or an unambiguous name prefix.' -ForegroundColor Gray
     Write-Host ''
     Write-Host '  Auto download/install/reboot apply to checks and downloads started from' -ForegroundColor Gray
-    Write-Host '  here; press [t] to toggle them.' -ForegroundColor Gray
+    Write-Host '  here. Press [t] to switch ALL of them on or off together - the toggle is a' -ForegroundColor Gray
+    Write-Host '  master control: any state that is not "all on" becomes "all on".' -ForegroundColor Gray
     Write-Host ''
 }
 
 $consoleActions.EventToggleSettings = {
+    <#
+    .SYNOPSIS The MASTER automation toggle: an absolute rule, not three independent inversions.
+    .DESCRIPTION
+    Previously this inverted each setting independently. From `Download ON / Install OFF /
+    Reboot OFF` that produced `OFF / ON / OFF` - a state the operator cannot predict, and one that
+    briefly ENABLES auto-install while they were aiming for "turn everything off". The instruction
+    set forbids that explicitly, and the reason is practical: the master control is pressed
+    precisely when the operator is unsure of the current state, so it is the worst possible place
+    to make the result depend on it.
+
+        ALL ON         -> all OFF
+        anything else  -> all ON      (so ALL OFF -> all ON, and MIXED -> all ON)
+
+    MIXED resolving to ALL ON is deliberate, and is the rule the instruction set specifies. The
+    direction is chosen for safety of INTENT rather than of effect: pressing the master control
+    never leaves a partially-enabled pipeline, and the state it leaves is the one the operator can
+    then switch off in a single further press.
+    #>
     $s = $stateStore.Settings
-    $s.AutoDownload = -not $s.AutoDownload
-    $s.AutoInstall  = -not $s.AutoInstall
-    $s.AutoReboot   = -not $s.AutoReboot
-    Update-Status ("Auto download {0}, auto install {1}, auto reboot {2}" -f `
-        $(if ($s.AutoDownload) { 'ON' } else { 'off' }), `
-        $(if ($s.AutoInstall) { 'ON' } else { 'off' }), `
-        $(if ($s.AutoReboot) { 'ON' } else { 'off' }))
-    Write-Host '  Settings updated.' -ForegroundColor Green
+
+    $allOn = ([bool]$s.AutoDownload) -and ([bool]$s.AutoInstall) -and ([bool]$s.AutoReboot)
+    $target = -not $allOn
+
+    # Through the settings funnel. Set-WuuSetting is the one place the setting names are validated,
+    # and this block used to bypass it with direct assignments - which is how the invert rule stayed
+    # invisible to the gate that checks the names.
+    Set-WuuSetting -Store $stateStore -Name 'AutoDownload' -Value $target | Out-Null
+    Set-WuuSetting -Store $stateStore -Name 'AutoInstall' -Value $target | Out-Null
+    Set-WuuSetting -Store $stateStore -Name 'AutoReboot' -Value $target | Out-Null
+
+    $state = if ($target) { 'ON' } else { 'off' }
+    Update-Status ("Auto download {0}, auto install {1}, auto reboot {2}{3}" -f `
+        $state, $state, $state, $(if ($target) { '' } else { ' (automation disabled)' }))
+    Write-Host '' 
+    Write-Host ("  Automation {0} for download, install and reboot." -f $(if ($target) { 'ENABLED ' } else { 'DISABLED' })) -ForegroundColor $(if ($target) { 'Yellow' } else { 'Green' })
+    # State the CONSEQUENCE, not just the change: this control decides whether a check can roll
+    # forward into downloads, installs and reboots unattended.
+    if ($target) {
+        Write-Host '  A check will now continue into download, install and reboot without asking.' -ForegroundColor Yellow
+    } else {
+        Write-Host '  Operations will stop after each step and wait for you.' -ForegroundColor Green
+    }
+    Write-Host '  (Nothing has been started - this only changes how FUTURE operations behave.)' -ForegroundColor DarkGray
 }
 
 # --- selection-driven action adapters ---------------------------------------------------
@@ -3339,7 +3374,7 @@ try {
     else {
         Write-Host ''
         Write-Host '  WUU2-CLI - Windows Update Utility (console edition)' -ForegroundColor White
-        Write-Host '  Press ? for help, t to toggle auto download/install/reboot, q to quit.' -ForegroundColor DarkGray
+        Write-Host '  Press ? for help, t to toggle ALL automation on/off, q to quit.' -ForegroundColor DarkGray
         Write-Host '  Run with -Help for scriptable commands (wuu check -All, wuu install -Computer X).' -ForegroundColor DarkGray
 
         # The interactive menu is audited too: mutating actions ask for a reason and go through

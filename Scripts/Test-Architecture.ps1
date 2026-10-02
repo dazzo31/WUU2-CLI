@@ -47,6 +47,78 @@ foreach ($setting in @('AutoDownload', 'AutoInstall', 'AutoReboot')) {
 }
 if (-not $failed) { Pass 'all three automatic behaviours are gated on $stateStore.Settings' }
 
+# (t2) The MASTER automation toggle must be deterministic, not three independent inversions.
+#
+#      `$s.AutoX = -not $s.AutoX` for each setting looks symmetrical and is what a "toggle" is
+#      usually assumed to mean - but from a MIXED state it produces a different mixture, so the
+#      operator cannot predict the result of the control they press precisely when unsure of the
+#      current state. From `ON / OFF / OFF` it yields `OFF / ON / OFF`: auto-install is ENABLED while
+#      the operator was aiming to turn everything off.
+#
+#      The specified rule is absolute: ALL ON -> all off; anything else -> all on.
+#
+#      Matched on the AST's assignment nodes, so a comment explaining the old behaviour (as this one
+#      does) cannot match itself - the false-positive class recorded at (r) and gate 2.
+$coreAstA = $null
+try { $coreAstA = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'src\Wuu.Core.psm1'), [ref]$null, [ref]$null) } catch { $coreAstA = $null }
+if (-not $coreAstA) {
+    Fail 'could not parse Wuu.Core.psm1, so the master-toggle check would pass vacuously'
+} else {
+    $settingNames = @('AutoDownload', 'AutoInstall', 'AutoReboot')
+    $inverting = @()
+    foreach ($assign in $coreAstA.FindAll({
+                $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $args[0].Left -is [System.Management.Automation.Language.MemberExpressionAst]
+            }, $true)) {
+        # The member name must be read from the AST node it actually is. `$s.AutoX` parses as
+        # MemberExpressionAst whose Member is a StringConstantExpressionAst - which has NO
+        # .VariablePath (that is on VariableExpressionAst). Reading .VariablePath anyway yields
+        # $null in PS 5.1 rather than throwing, so the name compared as $null, the loop skipped every
+        # assignment, and this check PASSED against the pre-fix code. Found by mutation-testing the
+        # gate itself; the first version of this block was vacuous.
+        $memberName = ''
+        if ($assign.Left.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            $memberName = [string]$assign.Left.Member.Value
+        } elseif ($assign.Left.Member -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            $memberName = [string]$assign.Left.Member.VariablePath.UserPath
+        }
+        if ($settingNames -notcontains $memberName) { continue }
+        # -not applied to the SAME setting is the inverting shape. The regex is built from the name so
+        # `-not $other.AutoDownload` cannot satisfy a check for AutoInstall.
+        if ($assign.Right.Extent.Text -match ('-not\s+\$\w*\.?' + [regex]::Escape($memberName) + '\b')) {
+            $inverting += "line $($assign.Extent.StartLineNumber): $($assign.Extent.Text.Trim())"
+        }
+    }
+
+    # POSITIVE CONTROL, and it has to assert the RIGHT thing. Requiring N member-assignments would be
+    # wrong: the corrected handler has ZERO, because it routes through the settings funnel. The
+    # invariant is therefore two-sided -
+    #   * the handler must not invert (checked above), and
+    #   * it must SET through the funnel, so a revert to direct assignments is caught rather than
+    #     reading as "nothing to see here".
+    # Counting the funnel calls also proves this check is looking at the handler at all, which is what
+    # the first attempted control was reaching for.
+    $toggleHandler = $coreAstA.FindAll({
+            $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $args[0].Extent.Text -match '^\s*\$consoleActions\.EventToggleSettings'
+        }, $true) | Select-Object -First 1
+    $funnelCalls = 0
+    if ($toggleHandler) {
+        foreach ($call in $toggleHandler.Right.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+            if ($call.GetCommandName() -eq 'Set-WuuSetting') { $funnelCalls++ }
+        }
+    }
+    if (-not $toggleHandler) {
+        Fail 'the master toggle handler could not be located, so the inversion check could not run'
+    } elseif ($inverting.Count -gt 0) {
+        Fail ("automation setting(s) are INVERTED rather than set to an explicit value, so the master toggle is not deterministic (ALL ON -> all off, anything else -> all on): " + ($inverting -join '; '))
+    } elseif ($funnelCalls -lt 3) {
+        Fail "the master toggle makes only $funnelCalls call(s) to Set-WuuSetting - it must set all three settings through the settings funnel, not assign them directly"
+    } else {
+        Pass "the master automation toggle sets all three settings through the funnel and never inverts ($funnelCalls funnel call(s))"
+    }
+}
+
 # (u) ONE ACTIVE OPERATION PER COMPUTER (brief SS3 / invariant 8.1). The gate must be consulted at the
 #     submission point, the row must be marked Running so the gate can ever say "busy", and the claim
 #     must use the sanctioned adoption path if it goes through the mutation funnel. Appendix A cites

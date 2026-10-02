@@ -188,6 +188,67 @@ Import-Module (Join-Path $root 'src\Wuu.State.psm1') -Force -ErrorAction Stop
 $store = New-WuuStateStore
 Assert-Equal $store.Settings.AutoDownload $false 'new store defaults AutoDownload to $false (safe default)'
 
+# --- 9. MASTER TOGGLE SEMANTICS (instructions SS16) --------------------------------------------
+#
+# The toggle used to INVERT each setting independently. From `Download ON / Install OFF / Reboot OFF`
+# that yields `OFF / ON / OFF` - a state the operator cannot predict, and one that briefly ENABLES
+# auto-install when they meant "turn everything off". The rule is now explicit and absolute:
+#
+#     ALL ON         -> OFF, OFF, OFF
+#     anything else  -> ON,  ON,  ON      (so ALL OFF -> ALL ON, and MIXED -> ALL ON)
+#
+# MIXED resolving to ALL ON is deliberate: pressing the master control while unsure of the current
+# state gives a defined answer instead of an inverted surprise.
+#
+# Driven against the REAL handler, extracted from the shipped source - not a copy of the rule. A
+# re-implementation here would pass while the product kept inverting, which is the blindness this
+# suite's header warns about.
+#
+# Read from $corePath, not a hardcoded src\ path, so the suite's documented -CorePath mechanism
+# (point it at a PRE-FIX copy to prove the assertions have teeth) still works for this section too.
+$coreSource = Get-Content -LiteralPath $corePath -Raw
+$toggleBlock = [regex]::Match($coreSource, "(?s)\`$consoleActions\.EventToggleSettings\s*=\s*\{(.*?)\n\}")
+if (-not $toggleBlock.Success) {
+    $failures += 'EventToggleSettings was not found in Wuu.Core.psm1'
+    Write-Host 'FAIL: the master toggle handler could not be located' -ForegroundColor Red
+} else {
+    # The handler writes settings and calls Update-Status / Write-Host. Update-Status is a Core
+    # function unavailable here, so it is stubbed; the SETTINGS WRITES are what is under test.
+    function Update-Status { param([string]$Message) }
+    $syntheticStore = New-WuuStateStore
+    $toggleAction = [scriptblock]::Create("param(`$stateStore) $($toggleBlock.Groups[1].Value)")
+
+    $toggleTable = @(
+        @{ Name = 'ALL OFF  -> ALL ON';    Start = @($false, $false, $false); Want = @($true, $true, $true) }
+        @{ Name = 'ALL ON   -> ALL OFF';   Start = @($true, $true, $true);     Want = @($false, $false, $false) }
+        @{ Name = 'MIXED 1  -> ALL ON';    Start = @($true, $false, $false);  Want = @($true, $true, $true) }
+        @{ Name = 'MIXED 2  -> ALL ON';    Start = @($false, $true, $false);  Want = @($true, $true, $true) }
+        @{ Name = 'MIXED 3  -> ALL ON';    Start = @($false, $false, $true);  Want = @($true, $true, $true) }
+    )
+    foreach ($case in $toggleTable) {
+        $st = $syntheticStore.Settings
+        $st.AutoDownload = $case.Start[0]; $st.AutoInstall = $case.Start[1]; $st.AutoReboot = $case.Start[2]
+        try { & $toggleAction $syntheticStore } catch {
+            $failures += "master toggle threw for $($case.Name): $($_.Exception.Message)"
+            Write-Host ("FAIL: master toggle threw for {0}: {1}" -f $case.Name, $_.Exception.Message) -ForegroundColor Red
+            continue
+        }
+        $got = @($st.AutoDownload, $st.AutoInstall, $st.AutoReboot)
+        Assert-Equal ($got -join '/') ($case.Want -join '/') "master toggle: $($case.Name)"
+    }
+
+    # An inverting write is what made the mixed state unpredictable; re-introducing one anywhere
+    # would restore the defect silently.
+    $inverts = @([regex]::Matches($coreSource, '=\s*-not\s+\$\w*\.?(AutoDownload|AutoInstall|AutoReboot)'))
+    Assert-Equal $inverts.Count 0 'no automation setting is INVERTED (the toggle computes an explicit value)'
+}
+
+# The toggle must go through the settings funnel. Set-WuuSetting exists and is exported, so a
+# direct `$s.AutoX = ...` bypasses the one place that validates setting names.
+$stateRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.State.psm1') -Raw
+Assert-Equal ([bool]($stateRaw -match 'function Set-WuuSetting')) $true 'the settings funnel (Set-WuuSetting) exists'
+Assert-Equal ([bool]($stateRaw -match "'Set-WuuSetting'")) $true 'the settings funnel (Set-WuuSetting) is exported'
+
 Write-Host ''
 if ($failures.Count) {
     Write-Host ("SOME CHECKS FAILED ({0}): {1}" -f $failures.Count, ($failures -join '; ')) -ForegroundColor Red
