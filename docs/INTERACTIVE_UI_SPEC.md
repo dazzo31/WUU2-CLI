@@ -226,6 +226,28 @@ silently replaced** (confirm, or pass `AllowOverwrite`). **A failed decryption i
 passphrase, never as an empty file** — the ciphertext is one unit, so a typo cannot add a list, and
 treating "could not decrypt" as "no lists saved yet" would overwrite every list in the file.
 
+**The exported list is a compatibility boundary, not a state dump.** `wuu export` (menu key `x`, and
+the guided workflow) writes a plain-text file that an operator may hand-edit and another build must
+read. Its invariants, asserted by `tests/Test-ComputerListPersistence.ps1`:
+
+* it carries **membership only** — one computer name per line and nothing else. Transient runtime
+  state (`OperationId`, `OpState`, `PendingOp`, `Revision`, worker and timeout fields) must never
+  reach it. A row holds 35 properties, so this holds **because the export selects the name**, not
+  because the others happen to be empty; the test asserts the select for that reason;
+* it is **version-independent** — it holds no version marker and no schema tag, so any build reads it
+  identically in either direction. This is what makes the file usable as a hand-off between versions;
+  adding a marker would break that property and needs its own decision;
+* **it does not record ordering semantics beyond the file's own order** — the file is a sequence of
+  names, written in the store's append order, and read back in file order. Do not assign meaning to
+  the order that the file cannot carry;
+* **duplicates collapse case-insensitively, first spelling wins**, and blank lines are skipped;
+* **every text door applies one rule.** Names separate on commas, spaces, semicolons, tabs and new
+  lines — at the manual-entry prompt, at the file import, and in the guided workflow alike. A door
+  with its own parsing rule is how `SRV01 SRV02` became a single computer with that literal name.
+
+`.txt` (one hostname per line, spaces also separating) is the canonical raw list format; `.csv` is an
+accepted import format. Both are read by the same rule above.
+
 A v1 file (the legacy single-list shape) reads as **one** list named `default` and is **not rewritten
 by reading it** — merely opening the tool must not modify the operator's only copy. It is upgraded on
 the next save. Automatic loads (`wuu check -All`) prefer the `default` list, else the first, and say

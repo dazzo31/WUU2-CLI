@@ -3059,9 +3059,12 @@ $consoleActions.ClearComputerList = { & $clearComputerList }
 $consoleActions.EventAddAD = { & $eventAddAD }
 
 $consoleActions.EventAddComputer = {
-    $ans = Read-WuuAnswer -Prompt '  Computer name(s), comma or semicolon separated' -Default ''
+    $ans = Read-WuuAnswer -Prompt '  Computer name(s), separated by comma, semicolon or space' -Default ''
     if ([string]::IsNullOrWhiteSpace($ans)) { Write-Host '  Cancelled.' -ForegroundColor Yellow; return }
-    $names = @($ans -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    # Spec 4.1 promises commas, spaces OR new lines. This split on commas and semicolons only, so
+    # "SRV01 SRV02" was added as ONE computer named "SRV01 SRV02". Reading through the shared parser
+    # makes every input door agree; the prompt above now describes what is actually accepted.
+    $names = @(Split-WuuComputerNames -Text $ans)
     & $AddEntry $names
     Write-Host "  Added $($names.Count) computer(s)." -ForegroundColor Green
 }
@@ -3082,7 +3085,13 @@ $consoleActions.EventAddFile = {
         if ($cols -notcontains $col) { Write-Host '  No such column.' -ForegroundColor Red; return }
         $names = @($csv | ForEach-Object { ([string]$_.$col).Trim() } | Where-Object { $_ })
     } else {
-        $names = @(Get-Content -Path $path | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        # Spec 4.1: "You can enter multiple names separated by commas, spaces, or new lines."
+        # This branch used to keep one name per line, so "SRV01 SRV02" imported as a SINGLE computer
+        # called "SRV01 SRV02" - added successfully, listed, and unable to connect. The guided
+        # workflow's importer splits on whitespace/comma/semicolon/tab, so the same file meant
+        # different things depending on which menu opened it. Reading through the shared parser is
+        # the fix; a file with one name per line behaves exactly as before.
+        $names = @(Get-Content -Path $path | ForEach-Object { Split-WuuComputerNames -Text $_ } | Where-Object { $_ })
     }
     & $AddEntry $names
     Write-Host "  Imported $($names.Count) computer(s)." -ForegroundColor Green
