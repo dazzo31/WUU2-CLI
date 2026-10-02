@@ -7,7 +7,10 @@ Synchronized state collections and the error-suggestion catalog.
 function New-WuuState {
     # Synchronized collections shared between the UI thread and worker runspaces.
     @{
-        UiHash               = [hashtable]::Synchronized(@{})
+        # UiHash REMOVED: it was the GUI ListView and its checkbox members, created empty in this
+        # edition and read by nothing - the console renders from the state store. Dead wiring implies a
+        # dependency that does not exist, so it is not merely unused, it is misleading. (Grep every
+        # $uiHash site before adding one back: they are all comments or assignments.)
         Jobs                 = [system.collections.arraylist]::Synchronized((New-Object System.Collections.ArrayList))
         JobCleanup           = [hashtable]::Synchronized(@{})
         UpdatesHash          = [hashtable]::Synchronized(@{})

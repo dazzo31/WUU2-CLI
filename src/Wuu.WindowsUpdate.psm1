@@ -18,7 +18,7 @@ function Initialize-WuuWindowsUpdateContext {
 function New-ComputerRunspace {
     param($ComputerItem)
     $ctx = $script:WuuCtx
-    $uiHash = $ctx.UiHash; $updatesHash = $ctx.UpdatesHash; $performanceHash = $ctx.PerformanceHash
+    $updatesHash = $ctx.UpdatesHash; $performanceHash = $ctx.PerformanceHash
     $errorSuggestionsHash = $ctx.ErrorSuggestions; $path = $ctx.Path
     $PerformanceThreshold = $ctx.PerformanceThreshold
     $searchTimeout = $ctx.SearchTimeout; $sessionTimeout = $ctx.SessionTimeout
@@ -31,7 +31,9 @@ function New-ComputerRunspace {
             $newRunspace.ApartmentState = "STA"
             $newRunspace.Open()
             Write-InfoLog "Runspace opened successfully for: $($ComputerItem.Computer)"
-        $newRunspace.SessionStateProxy.SetVariable("uiHash",$uiHash)
+        # $uiHash is NOT injected: the console edition replaced every member a payload needed with the
+        # state store, and nothing in this module reads it (verified by grepping every $uiHash site -
+        # all assignments or comments). Injecting it implied a dependency that does not exist.
         # Console edition: worker payloads report progress through the synchronized state
         # store instead of WPF. `stateStore` is a raw synchronized hashtable with a Touch()
         # script method, so workers can use it without module-function access.
@@ -535,7 +537,7 @@ function Start-UpdateCheckJob {
     $ctx = $script:WuuCtx
     # $MaxConcurrentJobs comes from the context, not the global, so the submission point and the
     # scheduler tick read the SAME value even if a caller (or a test) rewires one of them.
-    $GetUpdates = $ctx.GetUpdates; $jobs = $ctx.Jobs; $uiHash = $ctx.UiHash
+    $GetUpdates = $ctx.GetUpdates; $jobs = $ctx.Jobs
     $MaxConcurrentJobs = $ctx.MaxConcurrentJobs
     $PowerShell = $null
     
@@ -858,8 +860,9 @@ function Start-PendingUpdateCheck {
     .DESCRIPTION
     Reads the queue from the STATE STORE, not from a GUI control.
 
-    This function previously iterated `$uiHash.Listview.Items`. In this edition `$uiHash` is an
-    empty synchronized hashtable (Wuu.Core.psm1: `$global:uiHash = [hashtable]::Synchronized(@{})`)
+    This function previously iterated `$uiHash.Listview.Items`. In this edition the store is the only
+    render source, and $uiHash has been REMOVED entirely (it was created, passed around and injected
+    while nothing read it - see Wuu.Core's Synchronized collections region).
     and NOTHING in src/ ever assigns a ListView to it - the only assignments in the repository are in
     tests, which hand-built a fake one. So `@($null)` was empty on every tick and this function did
     NOTHING in production. Consequences, all silent:

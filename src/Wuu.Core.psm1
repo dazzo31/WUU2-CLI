@@ -83,7 +83,10 @@ Initialize-WuuConfiguration -WuuRoot $WuuRoot
 #endregion Configuration
 
 #region Synchronized collections
-$global:uiHash = [hashtable]::Synchronized(@{})
+# $global:uiHash (the GUI ListView and its checkbox members) is GONE: the console edition renders from the
+# state store, so it was created here, passed into every worker context and injected into two runspaces
+# while nothing ever read it. Dead wiring is worse than absent wiring - it suggests a dependency that
+# does not exist. (Wuu.Models still declares a UiHash context field; see the note there.)
 $global:jobs = [system.collections.arraylist]::Synchronized((New-Object System.Collections.ArrayList))
 $global:jobCleanup = [hashtable]::Synchronized(@{})
 $global:updatesHash = [hashtable]::Synchronized(@{})
@@ -2079,8 +2082,10 @@ $newRunspace.ThreadOptions = 'ReuseThread'
 $newRunspace.Open()
 $newRunspace.SessionStateProxy.SetVariable('jobCleanup',$jobCleanup)
 $newRunspace.SessionStateProxy.SetVariable('jobs',$jobs)
-$newRunspace.SessionStateProxy.SetVariable('uiHash',$uiHash)
-# Console edition: the cleanup loop writes timeout state into the store, not the ListView.
+# Console edition: the cleanup loop writes timeout state into the store, not the ListView. $uiHash is NOT
+# injected here: it is a GUI-era collection (the ListView and the checkbox members) that this edition
+# replaced with the store, and nothing reads it - verified by grepping every $uiHash site, which are all
+# assignments or comments. Injecting it taught the reader that it mattered.
 $newRunspace.SessionStateProxy.SetVariable('stateStore',$stateStore)
 $newRunspace.SessionStateProxy.SetVariable('LogPath',$global:LogPath)
 $newRunspace.SessionStateProxy.SetVariable('LogLock',$global:LogLock)
@@ -3030,7 +3035,6 @@ $consoleActions.EventWUServiceActionInteractive = {
 # stay stuck at "Initializing...". Must run AFTER the payload closures exist and BEFORE
 # the first timer tick.
 $wuuContext = @{
-    UiHash                     = $global:uiHash
     Jobs                       = $global:jobs
     UpdatesHash                = $global:updatesHash
     PerformanceHash            = $global:performanceHash

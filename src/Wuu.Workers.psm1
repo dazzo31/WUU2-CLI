@@ -422,7 +422,7 @@ function Get-WuuJobCleanupPayload {
     so the module is NOT imported there and no module function is callable - which is why the rest
     of this file's worker logic is duplicated or inlined rather than shared. This body happens to
     satisfy that contract: it reads ONLY variables injected with SessionStateProxy.SetVariable
-    (jobCleanup, jobs, uiHash, stateStore, LogPath, LogLock, backgroundProcessing,
+    (jobCleanup, jobs, stateStore, LogPath, LogLock, backgroundProcessing,
     OperationTimeoutSeconds, OperationHeartbeatSeconds, WriteLogFileScript) and calls only the
     built-in Get-Date, Out-Null and Start-Sleep. Verified by AST analysis, not assumed.
 
