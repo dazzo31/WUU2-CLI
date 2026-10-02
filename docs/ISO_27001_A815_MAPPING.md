@@ -189,16 +189,39 @@ Stating these plainly is part of the control, not a caveat against it.
    whole file produces a file that verifies.
 
    The standard mitigation is a non-repudiation anchor: mirror a periodic digest to a destination
-   the operator cannot rewrite (Windows Event Log, or a remote sink). This is **designed but not
-   implemented** (`CLI_AUDIT_PLAN.md` §5.6) and was consciously deferred in favour of breadth of
-   event collection. Until it exists, treat the trail as evidence of *what was recorded*, not as
-   proof that *nothing else happened*.
+   the operator cannot rewrite (Windows Event Log, or a remote sink). This is **implemented** - two
+   sinks, both reachable from the command surface (`CLI_AUDIT_PLAN.md` SS5.6):
 
-2. **No cross-day chain linkage.** As above, each daily file restarts the chain, so deleting
-   whole days is not detectable *by the chain alone*.
+   * `wuu audit anchor` writes a chain-head anchor **file**. Written and compared by
+     `New-WuuAuditAnchor` / `Test-WuuAuditAnchor`, which refuse an anchor in the log's own directory
+     (it would offer no separation from what it anchors). Its strength depends on the holder's
+     discipline: it must live where the audited operator cannot write.
+   * `wuu audit anchor -EventLog` mirrors the head into the **Windows Event Log**, which needs no such
+     discipline - it is written through a different mechanism, by a different service, and an
+     unprivileged account cannot rewrite it. The first write on a machine needs a one-time elevated
+     source registration.
 
-3. **Trailing-record truncation is undetectable** within a file: cutting the last N lines leaves
-   a chain that still verifies (there is no external record of the expected length).
+   `wuu audit verify` compares the chain against the anchor and reports `consistent`, `REWRITTEN`, or
+   `unavailable`. A rebuilt chain that hash verification accepts is caught by this comparison, which is
+   the whole point: the chain alone cannot see it.
+
+   **What this does NOT establish.** A local administrator can still clear the event log and can still
+   rewrite both the log and the anchor file. The cost of hiding a rewrite rises from "edit the log" to
+   "edit the log, the anchor file, and the event log" - and any copy a third party already holds still
+   catches it. That is a higher price for tampering, **not** non-repudiation, and the anchor artifacts
+   record that boundary in their own `Claim` field so it need not be inferred from this document.
+
+2. **No cross-day chain linkage.** Each daily file restarts the chain, so deleting whole days is not
+   detectable *by the chain alone*. An anchor is per-log and names the log it describes, so a day's
+   anchor still shows that a log was expected even after the file is removed - but only for days that
+   were actually anchored, and only while the anchor itself survives.
+
+3. **Trailing-record truncation is undetectable UNLESS the log was anchored.** Cutting the last N lines
+   leaves a chain that still verifies, because there is no record of the expected length inside the
+   file. An anchor supplies exactly that: it records the sequence number and head hash the log had when
+   it was anchored, so a log that is now SHORTER is reported as `REWRITTEN`. Without an anchor taken
+   before the truncation, this remains undetectable - which is why anchoring is a control an operator
+   must actually exercise, not a property of the trail.
 
 4. **The transcript is not integrity-protected at all.** It is a plain text console capture,
    written best-effort, and is not hashed. It is a debugging and context aid for the JSONL

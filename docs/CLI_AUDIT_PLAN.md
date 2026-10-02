@@ -173,9 +173,30 @@ console equivalent by design.
 Hash-chaining makes **silent edits detectable**, not impossible — anyone with write access
 to the log and the code can recompute the chain. Real non-repudiation needs the chain head
 written somewhere append-only (Windows Event Log via `Write-EventLog`, or a
-`certutil`-signed daily digest). Plan: implement the chain first, then add **one of**
-(a) Event Log mirroring of each run's terminal hash, or (b) optional signing of the daily
-digest with a certificate. Choose at Phase 5.
+`certutil`-signed daily digest).
+
+**Decided: option (a), and implemented.** The chain head is anchored outside the log in two
+ways, both reachable from the command surface:
+
+| Sink | Written by | Depends on |
+| :--- | :--- | :--- |
+| Anchor file | `wuu audit anchor` | a POLICY — the file must be held where the audited operator cannot write (another volume, a protected share, source control). Default `%PROGRAMDATA%\WUU2\anchors`, a sibling of the audit directory, because an anchor in the log's own directory is refused for offering no separation. |
+| Windows Event Log | `wuu audit anchor -EventLog` (opt-in) | nothing beyond a one-time elevated source registration. Written through a different mechanism, by a different service, and an unprivileged account cannot rewrite it. |
+
+`wuu audit verify` compares the chain against the anchor and reports `consistent`, `REWRITTEN`,
+or `unavailable` — never silence, because "unanchored" and "verified" must not look alike. Use
+`-AnchorPath` when the anchor is held elsewhere. `Test-WuuAuditAnchor` detects a rebuilt chain
+that hash verification accepts, a same-length replacement, and a truncation.
+
+**Option (b), a signed daily digest, is deliberately NOT implemented.** It needs a certificate
+and a signing step, which a tool that must run unattended with no external service cannot
+depend on. It remains the stronger choice where a certificate authority already exists.
+
+**The boundary this does NOT cross:** a local administrator can still clear the event log, and
+can still rewrite both files. The cost of hiding a rewrite rises from "edit the log" to "edit
+the log, the anchor file, and the event log" — and any copy a third party already holds still
+catches it. That is tamper-evidence with a higher price, **not** non-repudiation, and the
+anchor artifacts state as much in their own `Claim` field.
 
 ---
 
