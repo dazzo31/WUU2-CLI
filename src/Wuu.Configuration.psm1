@@ -163,6 +163,15 @@ $global:ConfigPaths = @{
     LogDirectory = $WuuRoot
 }
 
+# SS26/P3: where the audit CHAIN HEAD is anchored. Deliberately NOT under the audit directory: an anchor
+# beside the log is written through the same access path as the log, so it offers no separation and
+# New-WuuAuditAnchor REFUSES it. A default inside the log dir would therefore make anchoring unusable
+# out of the box, so the default sits in a sibling tree. Overriding it only moves the file - the real
+# control is holding it somewhere the audited operator cannot write, and an event-log mirror
+# (Write-WuuAuditEventLogAnchor) is the mechanism that does not depend on that discipline.
+$global:AuditAnchorDirectory = Join-Path $env:ProgramData 'WUU2\anchors'
+$global:EnableAuditEventLogAnchor = $false
+
 # Validation of required external files
 $requiredFiles = @('Scripts\Download-Patches.ps1', 'Scripts\Install-Patches.ps1')
 foreach ($file in $requiredFiles) {

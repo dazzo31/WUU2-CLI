@@ -830,10 +830,28 @@ Do not "solve" this with another local hash.
 
 The proper long-term solution is an external anchor or immutable storage.
 
-> **Current — PARTIAL:** `New-WuuAuditAnchor` / `Test-WuuAuditAnchor` write and compare a chain-head anchor
-> file, refuse an anchor in the log's own directory, and detect a rewritten or truncated chain. The anchor
-> is only as strong as wherever it is stored: it is tamper-evident, **not** WORM storage and **not**
-> non-repudiation. No daily digest, Event Log, SIEM or signed external digest exists.
+> **Current — WIRED.** Two sinks now exist, and both are reachable from the command surface.
+>
+> 1. **File anchor** - `New-WuuAuditAnchor` / `Test-WuuAuditAnchor` write and compare a chain-head anchor
+>    file, refuse an anchor in the log's own directory, and detect a rewritten or truncated chain. Written
+>    by `wuu audit anchor`, defaulting to `$global:AuditAnchorDirectory` (`%PROGRAMDATA%\WUU2\anchors`) -
+>    deliberately a SIBLING of the audit directory, since a default inside it would be refused by the
+>    same-directory rule and make anchoring unusable out of the box.
+> 2. **Event Log mirror** - `Write-WuuAuditEventLogAnchor` / `Get-WuuAuditEventLogAnchor` mirror the chain
+>    head into the Windows Event Log, which needs no operator discipline: it is written through a
+>    different mechanism, by a different service, and an unprivileged account cannot rewrite it. Opt in
+>    with `-EventLog`; the first write on a machine needs a one-time elevated source registration, and an
+>    unusable sink is REPORTED rather than thrown (a control must not fail the operation it audits).
+>
+> `wuu audit verify` compares against the anchor when one exists and reports `consistent`, `REWRITTEN`, or
+> `unavailable` - never silence, because "unanchored" and "verified" must not look the same. Use
+> `-AnchorPath` when the anchor is held somewhere other than the default.
+>
+> **Still not non-repudiation, and the artifacts say so.** A local administrator can clear the event log
+> and can rewrite both files. The honest claim is that the cost rises from "edit the log" to "edit the
+> log, the anchor file, and the event log" - and any copy a third party already holds still catches it.
+> A trusted timestamp or a signature by a key the operator does not hold would be needed for more, and
+> both were deliberately ruled out for a tool that must run unattended with no external service.
 
 Potential mechanisms include:
 
@@ -1452,7 +1470,9 @@ Appendix A for per-invariant evidence.
 
 ## P3
 
-1. External audit anchoring. — **PARTIAL** (file-based anchor; no immutable/external store).
+1. External audit anchoring. — **DONE (two sinks)**: a file anchor written by `wuu audit anchor`, plus an
+   Event Log mirror (`-EventLog`) that does not depend on operator discipline. `wuu audit verify` reports
+   the comparison. Still not non-repudiation; SS26 states the boundary and why.
 2. Better worker-pool diagnostics. — **IMPLEMENTED** (gate (at)).
 3. More complete operation-deadline propagation. — **PARTIAL** (CIM and service probes only).
 

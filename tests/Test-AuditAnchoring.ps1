@@ -134,6 +134,66 @@ Assert-False $missingVerdict.Available 'a missing anchor is unavailable'
 Assert-False $missingVerdict.Consistent 'and is NOT reported as consistent'
 Assert-True ($missingVerdict.Reason -like '*undetectable*') "and says what that means ($($missingVerdict.Reason))"
 
+'=== 7. the EVENT LOG mirror (SS26/P3) ==='
+# A file anchor depends on a POLICY - hold it beyond the operator's reach. The Event Log needs no such
+# discipline, which is why SS26 names it. It must (a) write, (b) be readable back, and (c) NEVER throw
+# even when the source cannot be registered, because registration needs elevation and this runs
+# unattended.
+if (-not (Get-Command Write-WuuAuditEventLogAnchor -ErrorAction SilentlyContinue)) {
+    Assert-True $false 'Write-WuuAuditEventLogAnchor exists (SS26)'
+} elseif (-not (Get-Command Get-WuuAuditEventLogAnchor -ErrorAction SilentlyContinue)) {
+    Assert-True $false 'Get-WuuAuditEventLogAnchor exists - a write-only sink is a log, not a control (SS26)'
+} else {
+    # (c) DEGRADATION FIRST: an unregisterable source must report, not throw. This is the case a
+    # non-elevated CI agent or a locked-down host will actually hit.
+    $degrade = $null
+    $threw = $false
+    try {
+        $degrade = Write-WuuAuditEventLogAnchor -HeadHash 'ABC' -Seq 1 -Source 'WUU2-NoSuchSource-Test' -LogName 'NoSuchLog-Test'
+    } catch { $threw = $true }
+    Assert-False $threw 'an unwritable event log is REPORTED, not thrown (it must never fail the operation it audits)'
+    if (-not $threw) {
+        Assert-False $degrade.Written 'an unregisterable source reports Written=$false'
+        Assert-True ([bool]$degrade.Reason) "and says why ($($degrade.Reason))"
+    }
+
+    # Degenerate inputs are refusals, not throws. A [Parameter(Mandatory)] string would have THROWN at
+    # binding time on ''. Measured - that is why the parameter is optional with an in-body guard.
+    $emptyHead = Write-WuuAuditEventLogAnchor -HeadHash '' -Seq 5
+    Assert-False $emptyHead.Written 'an empty head hash is a reported refusal, not a binding error'
+    $zeroSeq = Write-WuuAuditEventLogAnchor -HeadHash 'ABC' -Seq 0
+    Assert-False $zeroSeq.Written 'seq 0 is a reported refusal (nothing has been written yet)'
+
+    # (a)+(b) ROUND TRIP. Writing needs a REGISTERED source, which needs one-time elevation. If a source
+    # is already registered use it; otherwise register one when elevated, and skip the round trip
+    # otherwise - a skip is honest, a false pass is not.
+    $testSource = 'WUU2-CLI-Audit-Test'
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $haveSource = $false
+    try { $haveSource = [System.Diagnostics.EventLog]::SourceExists($testSource) } catch { $haveSource = $false }
+    if (-not $haveSource -and $elevated) {
+        try { [System.Diagnostics.EventLog]::CreateEventSource($testSource, 'Application'); $haveSource = $true } catch { }
+    }
+    if (-not $haveSource) {
+        Write-Host '  SKIP: no registered event source and not elevated - the round trip needs a one-time elevated registration (the degradation path above is still asserted)' -ForegroundColor Yellow
+    } else {
+        $marker = ([guid]::NewGuid().ToString('N').Substring(0, 8)).ToUpper()
+        $wrote = Write-WuuAuditEventLogAnchor -HeadHash $marker -Seq 99 -LogPath $logPath -Operator 'ANCHOR-TEST' -Source $testSource
+        Assert-True $wrote.Written "the chain head is mirrored to the event log ($($wrote.Reason))"
+        if ($wrote.Written) {
+            $readBack = Get-WuuAuditEventLogAnchor -Source $testSource
+            Assert-True ($null -ne $readBack) 'the mirrored anchor is readable back (a write-only sink is a log, not a control)'
+            if ($readBack) {
+                Assert-Equal $readBack.HeadHash $marker 'the head hash round-trips exactly'
+                Assert-Equal $readBack.Seq 99 'the sequence number round-trips'
+            }
+            # An event log with no anchor events from that source must be $null, not an error.
+            $none = Get-WuuAuditEventLogAnchor -Source 'VBScriptDeprecationAlert'
+            Assert-True ($null -eq $none) 'a source with no anchor events returns nothing rather than throwing'
+        }
+    }
+}
+
 try { Remove-Item $base -Recurse -Force -ErrorAction SilentlyContinue } catch { }
 
 ''

@@ -817,6 +817,179 @@ function Test-WuuAuditAnchor {
     return $verdict
 }
 
+function Write-WuuAuditEventLogAnchor {
+    <#
+    .SYNOPSIS
+    Mirrors a chain head into the Windows Event Log - a store the log's editor does not own (P3/SS26).
+    .DESCRIPTION
+    WHY A SECOND STORE. `New-WuuAuditAnchor` writes a file, and a file is only as strong as wherever it
+    is kept: the note on every anchor says to hold it beyond the audited operator's reach, which in
+    practice is a policy the operator must follow rather than a property of the artifact. The Event Log
+    needs no such discipline - it is written through a different mechanism, by a different service, and
+    an unprivileged account cannot rewrite it. SS26 names this mechanism by name, and it is the one the
+    application can use unattended.
+
+    WHAT IT ADDS, ACCURATELY. It raises the cost of hiding a rewrite from "edit the log" to "edit the
+    log, edit the anchor file, AND clear the event log" - and a copy of any of those held by a third
+    party still catches it. It is NOT non-repudiation: a local administrator can still clear the event
+    log. The event it writes says so, so nobody has to infer the boundary from documentation.
+
+    IT MUST NEVER THROW OR FAIL THE OPERATION IT AUDITS. Registering an event source requires elevation,
+    and this runs unattended on machines where the source was never registered - so every failure is
+    turned into Written=$false with a Reason and returned. A control that can fail the audited operation
+    is worse than the gap it closes, and the caller decides whether absence is fatal.
+
+    THE SOURCE IS DEREGISTERED BY NOBODY, DELIBERATELY. An event source is a machine-wide registration
+    and removing it would break the audit trail of every earlier run. Re-registering an existing source
+    throws, and that is treated as success: the source already being present is the normal steady state.
+    #>
+    [CmdletBinding()]
+    param(
+        # NOT [Parameter(Mandatory)]: a Mandatory [string] rejects an EMPTY string at BINDING time, so the
+        # guard below never ran and the function THREW - violating its own "never throws" contract.
+        # Measured. Optional + AllowEmptyString moves the decision into the body where it is reportable.
+        [Parameter(Mandatory = $false)][AllowEmptyString()][string]$HeadHash = '',
+        [Parameter(Mandatory = $false)][int]$Seq = 0,
+        [Parameter(Mandatory = $false)][string]$LogPath = '',
+        [Parameter(Mandatory = $false)][string]$Operator = '',
+        [Parameter(Mandatory = $false)][string]$LogName = 'Application',
+        [Parameter(Mandatory = $false)][string]$Source = 'WUU2-CLI-Audit',
+        [datetime]$Now
+    )
+
+    $result = @{ Written = $false; Reason = ''; LogName = ''; Source = '' }
+    # A LOCAL, not the $Now parameter: reassigning a parameter is banned in this codebase (a gated rule -
+    # type coercion on reassignment can throw). Resolved once, then used.
+    $stamp = if ($Now) { $Now } else { Get-Date }
+
+    if ([string]::IsNullOrWhiteSpace($HeadHash)) {
+        $result.Reason = 'no chain head supplied - there is nothing to anchor'
+        return $result
+    }
+    if ($Seq -le 0) {
+        $result.Reason = 'the chain has no records yet (seq 0) - nothing to anchor'
+        return $result
+    }
+
+    # The cmdlets are Windows-only. A non-Windows or constrained host reports rather than throwing, so a
+    # cross-platform caller can treat an unavailable sink the same way it treats an unwritable one.
+    if (-not (Get-Command -Name 'Write-EventLog' -ErrorAction SilentlyContinue)) {
+        $result.Reason = 'the Windows Event Log is not available on this host (Write-EventLog not found)'
+        return $result
+    }
+
+    # Registration is best-effort: an already-registered source throws, which is the steady state and
+    # must not be reported as a failure. A registration that fails for another reason (no elevation) is
+    # not fatal either - Write-EventLog below is the real test and will report the true cause.
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists($Source)) {
+            [System.Diagnostics.EventLog]::CreateEventSource($Source, $LogName)
+        }
+    } catch {
+        # DELIBERATELY BEST-EFFORT (SS27). Registration needs elevation and an already-registered
+        # source throws, so both outcomes are normal here and neither is actionable at this point.
+        # The Write-EventLog below is the real test and reports the true cause if the source is
+        # genuinely unusable - swallowing this cannot turn a fault into apparent success.
+    }
+
+    try {
+        $payload = [ordered]@{
+            Schema      = 'wuu.audit.anchor.eventlog.v1'
+            AnchoredUtc = $stamp.ToUniversalTime().ToString('o')
+            Seq         = $Seq
+            HeadHash    = $HeadHash
+            LogPath     = $LogPath
+            Operator    = $Operator
+            Claim       = 'chain head held in a store the log editor does not own; tamper-evident, NOT non-repudiation (a local administrator can clear this log)'
+        }
+        # -RawData would be more faithful (a byte-for-byte copy), but it is only readable back by a tool
+        # that knows its encoding, and the value here is a HUMAN and machine readable head hash that any
+        # operator can compare with `wuu audit verify`. The message therefore states the hash in full.
+        $message = ($payload | ConvertTo-Json -Compress -Depth 4)
+        Write-EventLog -LogName $LogName -Source $Source -EventId 5100 `
+            -EntryType Information -Message $message -ErrorAction Stop
+        $result.Written = $true
+        $result.LogName = $LogName
+        $result.Source = $Source
+        $result.Reason = "mirrored seq $Seq to the '$LogName' event log as source '$Source'"
+    } catch {
+        # NAME THE REAL CAUSE. Registering an event source needs elevation, and without it the platform
+        # reports only "The source was not found, but some or all event logs could not be searched" - a
+        # message that sends an operator looking for a missing source when the actual requirement is an
+        # elevated registration. The sink is still reported as unwritten; only the explanation changes.
+        $exMsg = $_.Exception.Message
+        if ($exMsg -match 'could not be searched|Inaccessible logs|source was not found') {
+            $result.Reason = "event log write failed: source '$Source' is not registered and it could not be registered without elevation (register it once from an elevated prompt with New-EventLog -LogName $LogName -Source $Source). Underlying error: $exMsg"
+        } else {
+            $result.Reason = "event log write failed: $exMsg"
+        }
+    }
+
+    return $result
+}
+
+function Get-WuuAuditEventLogAnchor {
+    <#
+    .SYNOPSIS
+    Reads back the most recent chain-head event a given source wrote, or $null (P3/SS26).
+    .DESCRIPTION
+    The other half of the Event Log mirror: an anchor that is written and never read back is a log, not
+    a control. Returns the newest event from the source that parses as an anchor, so a caller can compare
+    it against the file anchor and the chain.
+
+    Returns $null - never throws - when the log is unavailable or holds no anchor event. A missing sink
+    is a finding the caller reports, not an error that stops a verification run.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)][string]$LogName = 'Application',
+        [Parameter(Mandatory = $false)][string]$Source = 'WUU2-CLI-Audit'
+    )
+
+    if (-not (Get-Command -Name 'Get-WinEvent' -ErrorAction SilentlyContinue)) { return $null }
+
+    try {
+        $ev = Get-WinEvent -FilterHashtable @{ LogName = $LogName; ProviderName = $Source } `
+            -MaxEvents 25 -ErrorAction Stop
+    } catch {
+        # No events from that provider is the ordinary "never anchored here" case, not a fault.
+        return $null
+    }
+
+    foreach ($e in @($ev)) {
+        # READ Properties[0], NOT Message. For an event written with a GENERIC id (the only kind a
+        # custom source can write without a registered message DLL), Windows has no message template,
+        # so Message comes back EMPTY and the text lands in Properties[0]. Reading Message alone made
+        # this function return nothing for events this module had just written - measured: the write
+        # succeeded, Get-WinEvent returned the event, and Message was []. A sink that cannot be read
+        # back is a log, not a control. Message is still tried first so a future template-based event
+        # would also work.
+        $text = [string]$e.Message
+        if ([string]::IsNullOrWhiteSpace($text) -and $e.Properties.Count -gt 0) {
+            $text = [string]$e.Properties[0].Value
+        }
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        try {
+            $obj = $text | ConvertFrom-Json
+        } catch {
+            continue
+        }
+        if ($obj.PSObject.Properties['HeadHash'] -and $obj.PSObject.Properties['Seq']) {
+            return [pscustomobject]@{
+                AnchoredUtc = [string]$obj.AnchoredUtc
+                Seq         = [int]$obj.Seq
+                HeadHash    = [string]$obj.HeadHash
+                LogPath     = [string]$obj.LogPath
+                Operator    = [string]$obj.Operator
+                LogName     = $LogName
+                Source      = $Source
+            }
+        }
+    }
+
+    return $null
+}
+
 function Get-WuuAuditRecordAtSeq {
     <#
     .SYNOPSIS The recorded Hash of the record with a given sequence number, or $null (P3).
@@ -1034,6 +1207,8 @@ Export-ModuleMember -Function @(
     # The separation is the control, so the functions cannot be private to this module.
     'New-WuuAuditAnchor'
     'Test-WuuAuditAnchor'
+    'Write-WuuAuditEventLogAnchor'
+    'Get-WuuAuditEventLogAnchor'
     'Get-WuuAuditRecordAtSeq'
     'Invoke-WuuAuditedAction'
     'Write-WuuAuditDenial'

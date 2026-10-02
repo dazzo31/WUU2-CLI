@@ -311,3 +311,82 @@ if ((Get-Command New-WuuAuditAnchor -ErrorAction SilentlyContinue) -and (Get-Com
 } else {
     Fail 'the audit anchoring functions could not be resolved, so nothing was driven (P3)'
 }
+
+# (aw, continued) THE EVENT LOG MIRROR (SS26). A FILE anchor depends on a policy - hold it beyond the
+# audited operator's reach - so the control is only as strong as the operator's discipline. SS26 names
+# the Event Log by name because it needs no such discipline: it is written through a different mechanism,
+# by a different service, and an unprivileged account cannot rewrite it.
+#
+# TWO PROPERTIES, and the first is the one a gate usually omits. The sink MUST WRITE, and it must NEVER
+# THROW: registering an event source needs elevation, so on an unprivileged or locked-down host the
+# expected outcome is a reported failure. A control that can fail the operation it audits is worse than
+# the gap it closes, so the degradation path is driven BEFORE the happy path.
+foreach ($fnName in 'Write-WuuAuditEventLogAnchor', 'Get-WuuAuditEventLogAnchor') {
+    if ($auditCodeAW -notmatch "function\s+$fnName\b") {
+        Fail "$fnName is missing - the chain head cannot be mirrored to a store the log's editor does not own, so a rewritten chain remains undetectable (P3/SS26)"
+    }
+}
+foreach ($fnName in 'Write-WuuAuditEventLogAnchor', 'Get-WuuAuditEventLogAnchor') {
+    if ($auditExportAW.Success -and -not $auditExportAW.Value.Contains($fnName)) {
+        Fail "$fnName is not exported - an anchor that cannot be written and read back by a caller is not a control (P3/SS26)"
+    }
+}
+# A sink that is WRITTEN and never READ is a log, not a control. Both halves must exist, and the reader
+# must not rely on the event Message alone: a generic event id has no message template, so the text
+# lands in Properties[0] and Message comes back EMPTY (measured - the first version of the reader
+# returned nothing for events this module had just written).
+$evtReadBodyAW = Get-WuuFunctionBody -Text $auditCodeAW -Name 'Get-WuuAuditEventLogAnchor'
+if ([string]::IsNullOrWhiteSpace($evtReadBodyAW)) {
+    Fail 'Get-WuuFunctionBody could not extract Get-WuuAuditEventLogAnchor, so the read-back is unverified (P3/SS26)'
+} else {
+    if ($evtReadBodyAW -notmatch 'Get-WinEvent') {
+        Fail 'Get-WuuAuditEventLogAnchor does not read the event log - the mirror would be write-only (P3/SS26)'
+    } elseif ($evtReadBodyAW -notmatch 'Properties') {
+        Fail 'Get-WuuAuditEventLogAnchor reads only the event Message - a generic event id gives an EMPTY Message, so every event this module writes would be invisible to it (measured) (P3/SS26)'
+    } elseif ($evtReadBodyAW -match '\(\s*\$false\b') {
+        # THE NEGATIVE HALF, and the reason it is here: matching the word 'Properties' alone PASSED a
+        # mutant that rewrote the condition to `if ($false -and $e.Properties.Count -gt 0)` - the word
+        # survived while the read was disabled. Presence of text is not the enabled condition, which is
+        # the same class of gate defect this repository has recorded six times.
+        Fail 'Get-WuuAuditEventLogAnchor has a DISABLED condition (a literal $false guard), so the Properties read it appears to perform cannot be reached - the mirror would be write-only (P3/SS26)'
+    } else {
+        Pass 'the event-log anchor reads back through Properties as well as Message, and the read is not disabled (P3/SS26)'
+    }
+}
+if ($auditCodeAW -notmatch 'Write-EventLog') {
+    Fail 'Write-WuuAuditEventLogAnchor does not write to the event log (P3/SS26)'
+}
+
+# DRIVE THE DEGRADATION PATH. An unregisterable source is the case an unprivileged host actually hits,
+# and it must report rather than throw.
+if ((Get-Command Write-WuuAuditEventLogAnchor -ErrorAction SilentlyContinue) -and
+    (Get-Command Get-WuuAuditEventLogAnchor -ErrorAction SilentlyContinue)) {
+    try {
+        $threwAW = $false
+        $degradedAW = $null
+        try {
+            $degradedAW = Write-WuuAuditEventLogAnchor -HeadHash 'GATE' -Seq 1 -Source 'WUU2-GateNoSuchSource' -LogName 'WUU2-GateNoSuchLog'
+        } catch { $threwAW = $true }
+        if ($threwAW) {
+            Fail 'the event-log anchor THREW on an unusable sink - it must report and never fail the operation it audits (P3/SS26)'
+        } elseif ($degradedAW.Written) {
+            Fail 'the event-log anchor reported success for a source that cannot be registered - a false positive on a security control is worse than a missed one (P3/SS26)'
+        } elseif (-not $degradedAW.Reason) {
+            Fail 'the event-log anchor failed without a reason, so an operator cannot tell "not elevated" from "no such log" (P3/SS26)'
+        } else {
+            Pass "an unusable event-log sink is reported, not thrown, with a reason ($($degradedAW.Reason.Substring(0, [Math]::Min(60, $degradedAW.Reason.Length)))...) (P3/SS26)"
+        }
+        # Degenerate inputs must be refusals, not binding errors. A Mandatory [string] parameter THROWS
+        # on '' before the body runs, which is how the first version broke its own never-throws contract.
+        $emptyAW = Write-WuuAuditEventLogAnchor -HeadHash '' -Seq 3
+        if ($emptyAW.Written) {
+            Fail 'an empty chain head was reported as anchored - there was nothing to anchor (P3/SS26)'
+        } else {
+            Pass 'an empty chain head is a reported refusal rather than a binding error (P3/SS26)'
+        }
+    } catch {
+        Fail "driving the event-log anchor threw instead of reporting: $($_.Exception.Message) (P3/SS26)"
+    }
+} else {
+    Fail 'the event-log anchoring functions could not be resolved, so the degradation path was never driven (P3/SS26)'
+}

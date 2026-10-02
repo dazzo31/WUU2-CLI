@@ -44,25 +44,35 @@ VERB MAP (mirrors the menu in Wuu.Console.psm1 Get-WuuMenuActions 1:1)
 
 function Invoke-WuuAuditCommand {
     <#
-    .SYNOPSIS The local audit-trail verbs: verify / show / export.
+    .SYNOPSIS The local audit-trail verbs: verify / show / export / anchor.
     .DESCRIPTION
     These inspect the audit log itself (Phase 4), not a target's WSUS state (that is
-    `audit wsus`). verify exits non-zero on a broken chain so CI can gate on it.
+    `audit wsus`). verify exits non-zero on a broken chain so CI can gate on it. anchor writes the
+    chain head outside the log's own write path, which is the only thing that can detect a REWRITTEN
+    chain - a forged chain verifies cleanly on its own terms (SS26).
 
     -Path means different things per subverb and that is deliberate, but it used to be
     accidental: verify/show read it as the log to INSPECT, export writes it as the
-    DESTINATION. Because -Path was blindly assigned to $logPath first, `audit export -Path D:\out`
-    tried to copy a log from D:\out and threw ItemNotFoundException, surfacing as a
-    "CRITICAL ERROR - console shell failed" for what is just an output path. Use -LogPath to
-    name the log explicitly for any subverb.
+    DESTINATION, and anchor writes it as the anchor DIRECTORY. Because -Path was blindly assigned to
+    $logPath first, `audit export -Path D:\out` tried to copy a log from D:\out and threw
+    ItemNotFoundException, surfacing as a "CRITICAL ERROR - console shell failed" for what is just an
+    output path. Use -LogPath to name the log explicitly for any subverb.
     #>
     param(
-        [Parameter(Mandatory)][ValidateSet('verify', 'show', 'export')][string]$SubVerb,
-        # For verify/show: the log file to inspect. For export: the output destination.
+        [Parameter(Mandatory)][ValidateSet('verify', 'show', 'export', 'anchor')][string]$SubVerb,
+        # For verify/show: the log file to inspect. For export: the output destination. For anchor: the
+        # DIRECTORY to write the anchor into.
         [string]$Path,
         # Explicit log to inspect/export. Overrides the default "newest daily log" resolution
         # and is unambiguous regardless of subverb.
         [string]$LogPath,
+        # anchor: also mirror the chain head into the Windows Event Log (needs a one-time elevated
+        # registration of the event source the first time on a machine).
+        [switch]$EventLog,
+        # verify: compare against an anchor held at THIS path rather than the default location. An
+        # operator who anchored to a protected share or another volume would otherwise always see
+        # "unavailable" and could reasonably conclude the control was not working.
+        [string]$AnchorPath,
         [switch]$Json
     )
 
@@ -109,7 +119,31 @@ function Invoke-WuuAuditCommand {
             # The old code set $script:CommandExitCode here, which is THIS module's script scope -
             # not the caller's - so the value never reached the exit path. Classification travels on
             # the result object instead, which crosses the scope boundary correctly.
-            return [pscustomobject]@{ Ok = $v.Ok; Verb = 'audit'; SubVerb = $SubVerb; Checked = $v.Checked; FirstBreak = $v.FirstBreak; Result = $(if ($v.Ok) { 'Success' } else { 'AuditFailure' }) }
+            #
+            # Look for the anchor the `anchor` subverb would have written for THIS log. `Join-Path`
+            # THROWS on a null base, and $global:AuditAnchorDirectory only exists once startup has run
+            # ($WuuRoot is not in scope for a module loaded alone, e.g. by a test) - so the directory is
+            # resolved defensively and an absent setting means "no anchor to look for", not a crash.
+            $anchorVerdict = $null
+            $anchorDirResolved = $global:AuditAnchorDirectory
+            if (-not $anchorDirResolved) { $anchorDirResolved = Join-Path $env:ProgramData 'WUU2\anchors' }
+            $anchorFileToCompare = $AnchorPath
+            if (-not $anchorFileToCompare -and $anchorDirResolved) {
+                $anchorFileToCompare = Join-Path $anchorDirResolved (([System.IO.Path]::GetFileNameWithoutExtension($resolvedLog)) + '.anchor.json')
+            }
+            if ($anchorFileToCompare) {
+                $anchorVerdict = Test-WuuAuditAnchor -LogPath $resolvedLog -AnchorPath $anchorFileToCompare
+            }
+            if (-not $Json -and $v.Ok -and $anchorVerdict) {
+                if ($anchorVerdict.Consistent) {
+                    Write-Host ("  External anchor: consistent ({0})" -f $anchorVerdict.Reason) -ForegroundColor Green
+                } elseif ($anchorVerdict.Rewritten) {
+                    Write-Host ("  External anchor: REWRITTEN - {0}" -f $anchorVerdict.Reason) -ForegroundColor Red
+                } else {
+                    Write-Host ("  External anchor: unavailable - {0}" -f $anchorVerdict.Reason) -ForegroundColor DarkYellow
+                }
+            }
+            return [pscustomobject]@{ Ok = $v.Ok; Verb = 'audit'; SubVerb = $SubVerb; Checked = $v.Checked; FirstBreak = $v.FirstBreak; AnchorConsistent = $anchorVerdict.Consistent; AnchorRewritten = $anchorVerdict.Rewritten; AnchorReason = $anchorVerdict.Reason; Result = $(if ($v.Ok) { 'Success' } else { 'AuditFailure' }) }
         }
         'show' {
             $recs = @(Get-Content -LiteralPath $resolvedLog | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
@@ -179,6 +213,53 @@ function Invoke-WuuAuditCommand {
             Write-Host '  NOTE: the bundle carries the hash chain but NO external anchor, so it is' -ForegroundColor DarkGray
             Write-Host '        tamper-EVIDENT, not non-repudiable. See docs/ISO_27001_A815_MAPPING.md 8.' -ForegroundColor DarkGray
             return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Path = $outPath; Entries = $entryCount; Result = 'Success' }
+        }
+        'anchor' {
+            # SS26/P3: write the CHAIN HEAD somewhere outside the log's own write path. This is the
+            # control that makes a REWRITTEN chain detectable - a forged chain verifies cleanly on its
+            # own terms, so only an external comparison can catch it. Operator-invoked rather than
+            # automatic: it is a control an operator chooses to hold, and firing it on every run would
+            # produce thousands of anchors nobody keeps.
+            $anchorDir = if ($Path) { $Path } elseif ($global:AuditAnchorDirectory) { $global:AuditAnchorDirectory } else { Join-Path (Split-Path $resolvedLog -Parent) '..\anchors' }
+            # One anchor PER LOG, named for it: a single shared file would be overwritten by every day's
+            # log, so yesterday's anchor - the only evidence yesterday happened - would be destroyed.
+            $anchorFile = Join-Path $anchorDir (([System.IO.Path]::GetFileNameWithoutExtension($resolvedLog)) + '.anchor.json')
+
+            $made = New-WuuAuditAnchor -LogPath $resolvedLog -AnchorPath $anchorFile -Operator ("{0}@{1}" -f [System.Environment]::UserName, [System.Environment]::MachineName)
+            if (-not $made.Written) {
+                Write-Host ("  Anchor NOT written: {0}" -f $made.Reason) -ForegroundColor Red
+                if ($Json) {
+                    Write-Host (Format-WuuJsonDocument -Command 'audit anchor' -Fields ([ordered]@{
+                                LogPath = $resolvedLog; AnchorPath = $anchorFile; Written = $false; Reason = $made.Reason
+                            }))
+                }
+                return [pscustomobject]@{ Ok = $false; Verb = 'audit'; SubVerb = $SubVerb; Error = $made.Reason; Result = 'AuditFailure' }
+            }
+
+            # The Event Log mirror. Off by default because it needs a ONE-TIME elevated registration of
+            # the event source; enabled with -EventLogFlag (the wrapper passes -EventLog through).
+            $evtResult = $null
+            if ($EventLog) {
+                $evtResult = Write-WuuAuditEventLogAnchor -HeadHash $made.Hash -Seq $made.Seq -LogPath $resolvedLog -Operator ("{0}@{1}" -f [System.Environment]::UserName, [System.Environment]::MachineName)
+            }
+
+            if ($Json) {
+                Write-Host (Format-WuuJsonDocument -Command 'audit anchor' -Fields ([ordered]@{
+                            LogPath = $resolvedLog; AnchorPath = $anchorFile; Written = $true
+                            Seq = $made.Seq; HeadHash = $made.Hash
+                            EventLog = [bool]($evtResult -and $evtResult.Written)
+                            EventLogReason = if ($evtResult) { $evtResult.Reason } else { '' }
+                        }))
+            } else {
+                Write-Host ("  Anchored seq {0} to {1}" -f $made.Seq, $anchorFile) -ForegroundColor Green
+                if ($evtResult) {
+                    if ($evtResult.Written) { Write-Host ("  Mirrored to the {0} event log." -f $evtResult.LogName) -ForegroundColor Green }
+                    else { Write-Host ("  Event Log mirror NOT written: {0}" -f $evtResult.Reason) -ForegroundColor Yellow }
+                }
+                Write-Host '  Hold this file where the audited operator cannot write. If the log and this' -ForegroundColor DarkGray
+                Write-Host '  file are both writable by the same account, the anchor proves nothing.' -ForegroundColor DarkGray
+            }
+            return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; AnchorPath = $anchorFile; Seq = $made.Seq; Hash = $made.Hash; Result = 'Success' }
         }
     }
 }
@@ -518,7 +599,7 @@ function Get-WuuCommandTable {
         'audit' = @{
             Action = 'EventAuditWSUSUpdates'; Mutating = $false
             Answers = { param($p) , $p.Computer }
-            Help = 'Audit:  wuu audit wsus [-Computer SRV01]  |  wuu audit verify|show|export'
+            Help = 'Audit:  wuu audit wsus [-Computer SRV01]  |  wuu audit verify|show|export|anchor'
         }
         'logs' = @{
             Action = 'EventViewUpdateLog'; Mutating = $false
@@ -602,6 +683,9 @@ function Get-WuuCommandHelp {
     Write-Host '    wuu audit verify                  check the hash chain; non-zero exit if broken'
     Write-Host '    wuu audit show [-Json]            list audit records'
     Write-Host '    wuu audit export                  bundle log + transcripts for handoff'
+    Write-Host '    wuu audit anchor [-Path <dir>] [-EventLog]'
+    Write-Host '                                      hold the chain head OUTSIDE the log, so a REWRITTEN'
+    Write-Host '                                      chain (which verifies cleanly on its own) is detectable'
     Write-Host '    wuu audit wsus -Computer SRV01    audit a TARGET host (not the local trail)'
     Write-Host ''
     Write-Host '  EXAMPLES' -ForegroundColor Cyan
@@ -642,6 +726,8 @@ function Invoke-WuuCommand {
         [string]$Reason = '',
         [switch]$Json,
         [switch]$WhatIf,
+        # anchor: mirror the chain head into the Windows Event Log as well as the anchor file.
+        [switch]$EventLog,
         # Declare that queued-and-returned is the DESIRED outcome (SS10). Without it, a command that
         # finished its bounded wait with work still outstanding is reported as a timeout, because a
         # script must never read "success" for an install that has not run.
@@ -680,11 +766,11 @@ function Invoke-WuuCommand {
         # 'wsus' audits a TARGET's WSUS state. verify/show/export inspect the LOCAL audit
         # trail itself (Phase 4) and are handled before the action lookup, since they are not
         # $consoleActions operations.
-        if ($SubVerb -in @('verify', 'show', 'export')) {
-            return Invoke-WuuAuditCommand -SubVerb $SubVerb -Path $Path -LogPath $LogPath -Json:$Json
+        if ($SubVerb -in @('verify', 'show', 'export', 'anchor')) {
+            return Invoke-WuuAuditCommand -SubVerb $SubVerb -Path $Path -LogPath $LogPath -Json:$Json -EventLog:$EventLog -AnchorPath $AnchorPath
         }
         if ($SubVerb -ne 'wsus') {
-            return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu audit needs one of: wsus, verify, show, export'; Result = 'UsageError' }
+            return [pscustomobject]@{ Ok = $false; Verb = $Verb; Error = 'wuu audit needs one of: wsus, verify, show, export, anchor'; Result = 'UsageError' }
         }
     }
 
@@ -866,6 +952,7 @@ function ConvertTo-WuuCommandLine {
         '-computer' = 'Computer'; '-all' = 'All'; '-json' = 'Json'; '-whatif' = 'WhatIf'
         '-path' = 'Path'; '-column' = 'Column'; '-set' = 'Set'; '-help' = 'Help'
         '-reason' = 'Reason'; '-logpath' = 'LogPath'
+        '-eventlog' = 'EventLog'
         # Declare "queue and return" as the DESIRED outcome (SS10). Without it, a command whose
         # bounded wait expires with work still outstanding exits 3 (timeout) instead of 0, because
         # success must mean completed, not accepted.
