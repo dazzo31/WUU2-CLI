@@ -190,13 +190,44 @@ if ($wiredActions.Count -lt 15) {
 } else { Pass "found $($wiredActions.Count) wired console actions in Core" }
 
 $allLeafMenus = @(
-    @{ Name = 'update management'; Items = @(Get-WuuUpdateManagementMenu) }
+    @{ Name = 'update management';  Items = @(Get-WuuUpdateManagementMenu) }
     @{ Name = 'computer management'; Items = @(Get-WuuComputerManagementMenu) }
-    @{ Name = 'deployment'; Items = @(Get-WuuDeploymentMenu) }
-    @{ Name = 'credentials'; Items = @(Get-WuuCredentialMenu) }
-    @{ Name = 'diagnostics'; Items = @(Get-WuuDiagnosticsMenu) }
-    @{ Name = 'reports'; Items = @(Get-WuuReportsMenu) }
+    @{ Name = 'deployment';         Items = @(Get-WuuDeploymentMenu) }
+    @{ Name = 'automation';         Items = @(Get-WuuAutomationMenu) }
+    @{ Name = 'credentials';        Items = @(Get-WuuCredentialMenu) }
+    @{ Name = 'diagnostics';        Items = @(Get-WuuDiagnosticsMenu) }
+    @{ Name = 'reports';            Items = @(Get-WuuReportsMenu) }
 )
+
+# The list above is written BY HAND, and it silently omitted `automation` - so the menu added most
+# recently was the one menu whose entries were never swept. Nothing failed, because a shorter list
+# catches fewer defects rather than reporting that it is shorter. Cross-check it against the tree:
+# every category the top-level navigation ROUTES to a category screen must appear in the list above,
+# so adding a menu without sweeping it is a FAILURE instead of a quiet loss of coverage.
+# Compared data-to-data (the list above against this map), not by re-parsing the list's own text,
+# which would be a test that reads its own source and can drift from what it actually sweeps.
+$categoryMenu = [ordered]@{
+    UPDATES     = @{ Fn = 'Get-WuuUpdateManagementMenu';     SweptAs = 'update management' }
+    COMPUTERS   = @{ Fn = 'Get-WuuComputerManagementMenu';   SweptAs = 'computer management' }
+    DEPLOYMENT  = @{ Fn = 'Get-WuuDeploymentMenu';           SweptAs = 'deployment' }
+    AUTOMATION  = @{ Fn = 'Get-WuuAutomationMenu';           SweptAs = 'automation' }
+    CREDENTIALS = @{ Fn = 'Get-WuuCredentialMenu';           SweptAs = 'credentials' }
+    DIAGNOSTICS = @{ Fn = 'Get-WuuDiagnosticsMenu';          SweptAs = 'diagnostics' }
+    REPORTS     = @{ Fn = 'Get-WuuReportsMenu';              SweptAs = 'reports' }
+}
+$navSourceForSweep = [string](Get-Content (Join-Path $root 'src\Wuu.Navigate.psm1') -Raw)
+$unswept = @()
+foreach ($state in $categoryMenu.Keys) {
+    $fn = $categoryMenu[$state].Fn
+    # (a) the category must actually be routed to a category screen by the workflow loop
+    if ($navSourceForSweep -notmatch ("'" + $state + "'\s*\{\s*\`$state = Show-WuuCategoryScreen")) { continue }
+    # (b) ...and its menu function must be one of the menus swept above
+    $swept = @($allLeafMenus | Where-Object { (& $fn).Count -gt 0 -and $categoryMenu[$state].SweptAs -eq $_.Name })
+    if (-not $swept.Count) { $unswept += "$state ($fn is routed but is not in the wiring sweep list)" }
+}
+if ($unswept.Count) { Fail "categor(ies) reachable from the top-level navigation are NOT swept for wiring, so their entries could point at nothing undetected: $($unswept -join '; ')" }
+else { Pass "every navigation category is covered by the wiring sweep ($($allLeafMenus.Count) menus)" }
+
 $unresolved = @()
 foreach ($menu in $allLeafMenus) {
     foreach ($item in $menu.Items) {
