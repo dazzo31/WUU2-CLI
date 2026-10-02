@@ -1006,9 +1006,11 @@ package/release metadata
 
 If these disagree, fix the release process rather than creating another manually maintained version string.
 
-> **Current:** the single literal is `$global:WuuVersion` in `Wuu.Core`; `Resolve-WuuVersion` and the gate
-> compare it against the git tag at HEAD. That check reports `SKIP` until the release tag exists, so take
-> published verification totals from the **tagged** tree.
+> **Current:** the single literal is `$global:WuuVersion` in `Wuu.Configuration`; `Resolve-WuuVersion`
+> (in `Wuu.State`) and the release gate compare it against the git tag at HEAD. Read the literal where
+> it lives - a reader sent to the wrong file finds no literal and concludes the version is not
+> single-sourced, which is the opposite of the truth. That check reports `SKIP` until the release tag
+> exists, so take published verification totals from the **tagged** tree.
 
 ---
 
@@ -1564,5 +1566,5 @@ the invariant regresses. Status is verified against the source, not the document
 | 8.10 | Connectivity failure does not delete inventory | **ENFORCED** | consecutive-failure threshold, reset on success; gate (z); `Test-ConnectivityClassification` |
 | — | Refusals are recorded, and a stalled refusal is diagnosed | **ENFORCED** | `Update-WuuRefusalRecord`, `Test-WuuRefusalStalled`; gate (ap); `Test-RefusalSemantics` |
 | — | Inner probes respect the remaining operation budget | **PARTIAL** | CIM and service probes only; gate (av); `Test-RemainingBudget` |
-| — | Audit chain head can be anchored outside the log | **PARTIAL** | file-based, tamper-evident only; gate (aw); `Test-AuditAnchoring` |
+| — | Audit chain head can be anchored outside the log | **PARTIAL** | two sinks: a per-log anchor file (`wuu audit anchor`, default `%PROGRAMDATA%\WUU2\anchors`) and an Event Log mirror (`-EventLog`) that does not depend on operator discipline; gate (aw); `Test-AuditAnchoring`. PARTIAL on the ASSURANCE axis, not the work axis: this is still not non-repudiation (SS26 states the boundary). SS45 marks the work item DONE - both are accurate, they measure different things |
 | — | Zero unauthorised module-scope operation-state writes | **PARTIAL** | 2 remain, both terminal-state writes the funnel correctly REFUSES (`settled -> Error` after a submission that never started; `settled -> Queued` for phase-wait bookkeeping). The scheduler's `PendingOp` clear routes through `Update-WuuOperationState -ClearPendingOp`. Gate (az) classifies by brace-matched payload RANGE, not by enclosing function, and fails if the count rises or an approved range stops resolving |

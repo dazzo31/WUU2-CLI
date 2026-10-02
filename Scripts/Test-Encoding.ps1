@@ -8,16 +8,20 @@
 # (af) SOURCE ENCODING. A shipped file that contains non-ASCII BYTES must carry a UTF-8 BOM.
 #
 #      This gate exists because I broke it while working on SS11: I rewrote Wuu.Core.psm1 with
-#      Set-Content, which under PS7 writes UTF8 WITHOUT a BOM, and the file (which contains 51
-#      non-ASCII bytes - the '-' ellipsis and friends) was corrupted by the encoding change. git showed
+#      Set-Content, which under PS7 writes UTF8 WITHOUT a BOM, and the file (which contains non-ASCII
+#      bytes - the '-' ellipsis and friends) was corrupted by the encoding change. git showed
 #      the first line as '´╗┐#Requires' - the BOM bytes reinterpreted. Nothing in the test suite noticed,
 #      because none of them check encoding.
 #
-#      The rule is verified against every shipped file, not assumed:
-#        * 4 files contain non-ASCII and ALL FOUR have a BOM (Command, Core, Session, Package-WUU2);
-#        * all 20 remaining files have zero non-ASCII bytes and no BOM.
-#      So the invariant is 'non-ASCII implies BOM', and it is checked in that direction only - a BOM on
+#      The invariant is 'non-ASCII implies BOM', and it is checked in that direction only - a BOM on
 #      an ASCII-only file is harmless and is not treated as a failure.
+#
+#      NO FILE COUNTS HERE. This comment used to name four BOM files and twenty clean ones, which was
+#      true when written and had become a quarter of the truth by the time it was read: the count of
+#      non-ASCII files grows every time a module gains an em-dash, and a stated number rots into a
+#      misleading claim about how much of the tree the check actually covers. The loop below measures
+#      every shipped file at run time, so the VERDICT is always current - state the rule, let the gate
+#      report the counts.
 $encodingFiles = @()
 $encodingFiles += @(Get-ChildItem -Path (Join-Path $root 'src') -Filter '*.psm1' -File)
 $encodingFiles += @(Get-ChildItem -Path $root -Filter '*.ps1' -File)
