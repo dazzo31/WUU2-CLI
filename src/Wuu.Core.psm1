@@ -67,7 +67,7 @@ The three things worth knowing before editing this file:
 
   3. THE HISTORY IS NOT HERE. Feature changelogs, the legacy author/date and the GUI-era feature list
      that used to be this header are preserved at `docs/CHANGELOG-history.md`. The edition's identity and
-     version are in `docs/RELEASE_NOTES_v1.5.0-beta.5-cli.md`. See `docs/CODE_COMMENT_POLICY.md` for what
+     version are in `docs/RELEASE_NOTES_v1.5.0-beta.7-cli.md`. See `docs/CODE_COMMENT_POLICY.md` for what
      stays inline and why.
 
 Microsoft restricts remote download/install of Windows Updates, so those steps run the patch scripts

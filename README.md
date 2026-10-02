@@ -109,10 +109,11 @@ bounded period. If work is still outstanding when that window closes, the comman
 actually want, and that becomes an explicit **`6`**. Gate on specific codes rather than `-ne 0`: a
 blanket "non-zero = retry" would retry a tampered audit log.
 
-`4` is **reserved but not produced**: with `-Computer A,B` the selection is resolved by one shared
-answer, so per-target outcomes are not observable from the command layer, and the honest answer today
-is `1`. See [`docs/EXIT_CODES.md`](docs/EXIT_CODES.md) for the full contract, including what JSON
-`-WhatIf` returns and how `-Async` interacts with the exit code.
+`4` means **some settled targets succeeded and some did not** — `-Computer A,B,C` where C failed. Work
+that has not settled is not a failure and is not counted, so a large estate working through its queue
+does not read as partial success; outstanding work is signalled by `3` (or `6` with `-Async`). Every
+settled target failing is `1`, not `4`. See [`docs/EXIT_CODES.md`](docs/EXIT_CODES.md) for the full
+contract, including what JSON `-WhatIf` returns and how `-Async` interacts with the exit code.
 
 **Tip** — create a `wuu.cmd` on your PATH to avoid typing the host:
 
@@ -338,10 +339,16 @@ administrator rights on the log host can delete a whole day's file, or a trailin
 and the remainder still verifies. Each daily file restarts its own chain, so a missing day is not
 detected by the chain alone.
 
-The standard control is a non-repudiation anchor — mirroring a periodic digest somewhere the
-operator cannot rewrite, such as the Windows Event Log. **That is designed but not implemented**,
-and it is the largest known gap. Full detail, including the other limitations (clock trust, the
-transcript has no integrity protection, scope):
+The standard control is a non-repudiation anchor — mirroring a periodic digest somewhere the operator
+cannot rewrite. This is implemented: `wuu audit anchor` writes a per-log chain-head anchor (it refuses
+an anchor placed in the log's own directory, which would offer no separation from what it anchors), and
+`-EventLog` additionally mirrors the head into the Windows Event Log, which does not depend on the
+operator's discipline about where the file lives. `wuu audit verify` compares the chain against the
+anchor and reports `consistent`, `REWRITTEN`, or `unavailable`.
+
+That raises the price of tampering — from "edit the log" to "edit the log, the anchor file, and the
+event log" — but it is **not** non-repudiation; the gap is smaller, not closed. Full detail, including
+the remaining limitations (clock trust, the transcript has no integrity protection, scope):
 
 - [`docs/ISO_27001_A815_MAPPING.md`](docs/ISO_27001_A815_MAPPING.md) — control-to-artefact map and limitations
 - [`docs/AUDIT_RETENTION.md`](docs/AUDIT_RETENTION.md) — retention policy and archival rules
@@ -486,8 +493,9 @@ Stated plainly, because they are real:
   auto-recovery go through `Invoke-Command`. Update checks, downloads and installs are WinRM-free.
 - **Download/install use a temporary SYSTEM scheduled task** on the target (no PsExec), reporting
   progress through `HKLM\SOFTWARE\WUU2\Jobs`. Requires Windows 8 / Server 2012+ on the target.
-- **Debug logging ships enabled** and writes large files — set `$global:EnableDebugLogging = $false`
-  in `src/Wuu.Core.psm1` for production use.
+- **Debug logging is OFF by default**, because an unattended run cannot act on a log size it was never
+  told about. Set `WUU_DEBUG=1` to enable it for a run; do not edit a shipped file, because a reinstall
+  silently reverts it and the change is invisible to anyone reading the configuration.
 - **Update search must run in-process.** WUA COM objects cannot cross a job/process boundary, so
   update-search concurrency is bounded by design.
 - **MSRT is not counted.** A WUA API limitation — Windows Settings may show one more pending update
