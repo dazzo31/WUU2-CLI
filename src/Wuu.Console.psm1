@@ -231,6 +231,13 @@ function Start-WuuConsoleLoop {
         # while waiting - this is the replacement for the GUI's DispatcherTimer.
         try { & $DrainScheduler } catch { Write-Warning "Scheduler tick failed: $($_.Exception.Message)" }
 
+        # Live progress, rendered HERE and nowhere else. This is the only place the loop is
+        # guaranteed to be between prompts: every menu action and helper below has already returned,
+        # so the line cannot overwrite a question the operator is part-way through answering.
+        # Observational only - it reads the store and prints; the drain above is still the only
+        # thing that moves work along.
+        try { Write-WuuProgressTicker -Store $Store | Out-Null } catch { }
+
         $pressed = $null
         try {
             # Honour non-interactive mode: without this the menu keypress is the ONLY menu input

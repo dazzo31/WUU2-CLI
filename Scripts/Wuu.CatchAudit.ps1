@@ -57,6 +57,11 @@ function Get-WuuSilentCatchAllowlist {
             Pattern = '^\s*\$[A-Za-z_][\w:]*\s*=\s*[^=]'
             Why     = 'assigns a probe result to a variable; the ABSENCE of a value is handled by the caller, so a failed probe is a normal branch'
         }
+        @{
+            Name    = 'observational status render'
+            Pattern = 'Write-WuuProgressTicker'
+            Why     = 'the ticker only reports; a failed redraw cannot affect the operation it describes, and the next tick renders again - surfacing it would turn a cosmetic fault into an operation error'
+        }
     )
 }
 
