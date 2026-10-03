@@ -100,6 +100,84 @@ if ((Get-WuuComputerSetCount -Set $set) -ne 3) { Fail "set has $(Get-WuuComputer
 else { Pass 'set contains exactly the valid, non-duplicate computers' }
 
 # ---------------------------------------------------------------------------------------
+# 3a. AddEntry unification onto Add-WuuComputerSetNames (WUU-OBS-02 / FLEET-ADD-UNIFICATION-01)
+# ---------------------------------------------------------------------------------------
+# Proves that:
+#   * $AddEntry in Wuu.Core.psm1 delegates directly to Add-WuuComputerSetNames.
+#   * The legacy Exempt.txt silent check is retired (hosts in Exempt.txt are added, not dropped).
+#   * Adding duplicate names reports them in .Duplicates and adds 0 rows.
+#   * Adding invalid names reports them in .Invalid and adds 0 rows.
+#   * Scalar string input, array input, empty array, and $null are all handled safely.
+$coreText = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Core.psm1'))
+$coreAst = [System.Management.Automation.Language.Parser]::ParseInput($coreText, [ref]$null, [ref]$null)
+$addEntryNode = $coreAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $node.Left.Extent.Text.Trim() -eq '$AddEntry'
+}, $true)
+
+if (-not $addEntryNode) {
+    Fail 'could not locate $AddEntry assignment in Wuu.Core.psm1'
+} else {
+    $addEntryBody = $addEntryNode.Right.Extent.Text
+    if ($addEntryBody -match 'Exempt\.txt') {
+        Fail 'legacy Exempt.txt check still present in $AddEntry implementation'
+    } else {
+        Pass 'legacy Exempt.txt check is retired from $AddEntry'
+    }
+
+    if ($addEntryBody -notmatch 'Add-WuuComputerSetNames') {
+        Fail '$AddEntry does not delegate to Add-WuuComputerSetNames'
+    } else {
+        Pass '$AddEntry delegates directly to Add-WuuComputerSetNames'
+    }
+
+    # Execute the actual extracted scriptblock with an active state store
+    $testStore = New-WuuStateStore
+    $addEntrySb = & ([scriptblock]::Create($addEntryBody))
+    $stateStore = $testStore
+
+    # 1. Scalar name
+    $r1 = & $addEntrySb 'SRV-TEST01'
+    if ($r1.AddedCount -ne 1 -or @(Get-WuuComputerRow -Store $testStore).Count -ne 1) {
+        Fail "scalar name was not added (AddedCount=$($r1.AddedCount))"
+    } else { Pass 'scalar string name is accepted and added' }
+
+    # 2. Exempt.txt retirement integration: write host to Exempt.txt and ensure it is still added
+    $exemptFile = Join-Path $root 'Exempt.txt'
+    $prevExemptBytes = if (Test-Path -LiteralPath $exemptFile) { [System.IO.File]::ReadAllBytes($exemptFile) } else { $null }
+    try {
+        Set-Content -LiteralPath $exemptFile -Value 'SRV-EXEMPT01' -Encoding UTF8
+        $rEx = & $addEntrySb 'SRV-EXEMPT01'
+        if ($rEx.AddedCount -ne 1 -or -not $testStore.ByName.ContainsKey('srv-exempt01')) {
+            Fail 'computer in Exempt.txt was skipped (legacy silent exclusion was not retired)'
+        } else { Pass 'computer listed in Exempt.txt is added rather than silently skipped' }
+    } finally {
+        if ($null -ne $prevExemptBytes) { [System.IO.File]::WriteAllBytes($exemptFile, $prevExemptBytes) }
+        else { Remove-Item -LiteralPath $exemptFile -Force -ErrorAction SilentlyContinue }
+    }
+
+    # 3. Duplicate detection
+    $rDup = & $addEntrySb @('SRV-TEST01', 'srv-test01')
+    if ($rDup.AddedCount -ne 0 -or @($rDup.Duplicates).Count -ne 2) {
+        Fail "duplicates were not detected by `$AddEntry (Duplicates=$(@($rDup.Duplicates).Count))"
+    } else { Pass 'duplicate names are detected and excluded by $AddEntry' }
+
+    # 4. Invalid names
+    $rInv = & $addEntrySb @('not a valid host!', 'another/bad')
+    if ($rInv.AddedCount -ne 0 -or @($rInv.Invalid).Count -lt 1) {
+        Fail "invalid names were not rejected by `$AddEntry (Invalid=$(@($rInv.Invalid).Count))"
+    } else { Pass 'invalid names are rejected and reported in .Invalid by $AddEntry' }
+
+    # 5. Null and empty array
+    $rNull = & $addEntrySb $null
+    $rEmpty = & $addEntrySb @()
+    if ($rNull.AddedCount -ne 0 -or $rEmpty.AddedCount -ne 0) {
+        Fail 'null or empty collection produced non-zero added count'
+    } else { Pass 'null and empty array input handled safely with 0 added' }
+}
+
+# ---------------------------------------------------------------------------------------
 # 4. Phase rollup (spec 8 / 13 - phases visible, including empty ones)
 # ---------------------------------------------------------------------------------------
 $phases = @(Get-WuuComputerSetPhases -Set $set)

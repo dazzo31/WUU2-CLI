@@ -577,64 +577,50 @@ function Update-WuuComputerRow {
 }
 
 #Add new computer(s) to list
+# WUU-OBS-02: Unified with Add-WuuComputerSetNames (Wuu.Session) so that all entry points
+# (flat menu, guided workflow, Active Directory import) share the same validation,
+# deduplication, and row-creation pipeline.
+# Legacy Exempt.txt bypass retired: host exclusion belongs in policy, not a silent local file check.
 $AddEntry = {
-    Param ($ComputerName)
-    Write-Verbose "Adding $ComputerName."
-    Write-InfoLog "AddEntry called with computers: $($ComputerName -join ', ')"
+    [CmdletBinding()]
+    Param (
+        [Parameter(Position = 0)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        $ComputerName
+    )
 
-    If (Test-Path Exempt.txt){
-        Write-Verbose 'Collecting systems from exempt list.'
-        Write-InfoLog "Loading exempt list from Exempt.txt"
-        [string[]]$exempt = Get-Content Exempt.txt
-    # Skip domain computer credential validation during AddEntry to prevent GUI crashes
-    # The credential handling will be done later in the runspace when operations are performed
-    Write-InfoLog "Skipping upfront domain computer credential validation to prevent GUI crashes"
-        Write-InfoLog "Exempt list contains $($exempt.Count) entries"
+    $names = @(
+        if ($ComputerName) {
+            foreach ($item in @($ComputerName)) {
+                if ($null -ne $item -and -not [string]::IsNullOrWhiteSpace([string]$item)) {
+                    [string]$item
+                }
+            }
+        }
+    )
+
+    Write-Verbose "Adding $($names -join ', ')."
+    Write-InfoLog "AddEntry called with computers: $($names -join ', ')"
+
+    # Add-WuuComputerSetNames expects a set object with a .Store property.
+    $set = [pscustomobject]@{
+        Name  = 'Fleet'
+        Store = $stateStore
     }
 
-    #Add to list
-    ForEach ($computer in $ComputerName){
-        $computer = $computer.Trim() #Remove any whitspace
-        Write-InfoLog "Processing computer: '$computer'"
-        
-        If ([System.String]::IsNullOrEmpty($computer)){
-            Write-InfoLog "Skipping empty computer name"
-            continue
-        }
-        
-        if($exempt -contains $computer){
-            Write-InfoLog "Skipping exempt computer: $computer"
-            continue
-        }
-        
-        # Console edition: existence check against the store (no ListView enumeration).
-        if ($stateStore.ByName.ContainsKey($computer.ToLowerInvariant())) {
-            Write-InfoLog "Skipping duplicate computer: $computer"
-            continue
-        }
-        
-        Write-InfoLog "Adding computer '$computer' to the state store - Thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
-        try {
-            # Console edition: no dispatcher, no thread-affinity check, no ObservableCollection,
-            # no ListView commit/refresh. The store is a synchronized hashtable, so this is a
-            # plain add that works from any thread. The GUI edition needed ~120 lines of
-            # pre-dispatch diagnostics + direct/dispatched branches here; the failures those
-            # guarded against (dispatcher shutdown, cross-thread invoke, stale ItemsSource,
-            # virtualized rows) cannot occur with a store.
-            $computerObject = New-WuuComputerRow -Computer $computer -StateSource 'AddEntry'
-            Add-WuuComputerRow -Store $stateStore -Row $computerObject | Out-Null
-            Write-InfoLog "Computer '$computer' added to the state store (count: $($stateStore.Rows.Count))"
-        } catch {
-            Write-ErrorLog "ERROR adding computer '$computer' to the state store: $($_.Exception.Message)"
-            Write-ErrorLog "Error type: $($_.Exception.GetType().FullName)"
-            Write-ErrorLog "Stack trace: $($_.ScriptStackTrace)"
-            # Don't throw - continue with other computers
-            Write-InfoLog "Continuing with other computers despite error for: $computer"
-        }
-    }
+    $result = Add-WuuComputerSetNames `
+        -Set $set `
+        -Names $names `
+        -Phase 'Phase 1' `
+        -StateSource 'AddEntry'
+
+    Write-InfoLog ("AddEntry summary: Added={0}; Duplicates={1}; Invalid={2}" -f `
+        $result.AddedCount, @($result.Duplicates).Count, @($result.Invalid).Count)
 
     # Runspace creation and job startup are handled by the job timer (Start-PendingUpdateCheck)
     # so the calling thread is never blocked waiting for job slots.
+    return $result
 }
 
 # Create and configure the persistent per-computer worker runspace
@@ -2226,8 +2212,14 @@ $eventAddAD = { #Add computers from Active Directory (console edition)
             Write-Host "  Cancelled." -ForegroundColor Yellow; return
         }
         $names = @($searchResults | ForEach-Object { [string]$_.Properties["name"][0] } | Where-Object { $_ })
-        & $AddEntry $names
-        Write-Host "  Added $($names.Count) computer(s) from Active Directory." -ForegroundColor Green
+        $res = & $AddEntry $names
+        Write-Host "  Added $($res.AddedCount) computer(s) from Active Directory." -ForegroundColor Green
+        if (@($res.Duplicates).Count -gt 0) {
+            Write-Host "  Skipped $(@($res.Duplicates).Count) duplicate computer(s)." -ForegroundColor Yellow
+        }
+        if (@($res.Invalid).Count -gt 0) {
+            Write-Host "  Skipped $(@($res.Invalid).Count) invalid computer name(s)." -ForegroundColor Yellow
+        }
     } catch [System.Runtime.InteropServices.COMException] {
         Write-ErrorLog "COM/RPC error querying AD: $($_.Exception.Message)"
         Write-Host "  Communication error with Active Directory: $($_.Exception.Message)" -ForegroundColor Red
@@ -3070,8 +3062,14 @@ $consoleActions.EventAddComputer = {
     # "SRV01 SRV02" was added as ONE computer named "SRV01 SRV02". Reading through the shared parser
     # makes every input door agree; the prompt above now describes what is actually accepted.
     $names = @(Split-WuuComputerNames -Text $ans)
-    & $AddEntry $names
-    Write-Host "  Added $($names.Count) computer(s)." -ForegroundColor Green
+    $res = & $AddEntry $names
+    Write-Host "  Added $($res.AddedCount) computer(s)." -ForegroundColor Green
+    if (@($res.Duplicates).Count -gt 0) {
+        Write-Host "  Skipped $(@($res.Duplicates).Count) duplicate computer(s)." -ForegroundColor Yellow
+    }
+    if (@($res.Invalid).Count -gt 0) {
+        Write-Host "  Skipped $(@($res.Invalid).Count) invalid computer name(s)." -ForegroundColor Yellow
+    }
 }
 
 $consoleActions.EventAddFile = {
@@ -3098,8 +3096,14 @@ $consoleActions.EventAddFile = {
         # the fix; a file with one name per line behaves exactly as before.
         $names = @(Get-Content -Path $path | ForEach-Object { Split-WuuComputerNames -Text $_ } | Where-Object { $_ })
     }
-    & $AddEntry $names
-    Write-Host "  Imported $($names.Count) computer(s)." -ForegroundColor Green
+    $res = & $AddEntry $names
+    Write-Host "  Imported $($res.AddedCount) computer(s)." -ForegroundColor Green
+    if (@($res.Duplicates).Count -gt 0) {
+        Write-Host "  Skipped $(@($res.Duplicates).Count) duplicate computer(s)." -ForegroundColor Yellow
+    }
+    if (@($res.Invalid).Count -gt 0) {
+        Write-Host "  Skipped $(@($res.Invalid).Count) invalid computer name(s)." -ForegroundColor Yellow
+    }
 }
 
 # Read-only actions delegate to the existing handlers, which read the store's rows.

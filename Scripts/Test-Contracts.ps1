@@ -1,4 +1,4 @@
-﻿# Release validation, CONSOLE CONTRACT group: guided navigation, handler resolution, reason gating, retry narrowing, offline handling. Extracted from Validate-Release.ps1 (instructions SS39).
+# Release validation, CONSOLE CONTRACT group: guided navigation, handler resolution, reason gating, retry narrowing, offline handling. Extracted from Validate-Release.ps1 (instructions SS39).
 #
 # DOT-SOURCED FRAGMENT - not a standalone script. Validate-Release.ps1 dot-sources it into its own
 # scope, which is what gives this file $root, the verdict helpers (Pass/Fail/Warn/Skip/Not-Implemented)
@@ -289,3 +289,35 @@ if (-not $navAstForLeak) {
         Pass "every guided handler invocation discards its output, so a screen's return value stays a state name"
     }
 }
+
+# (t) FLEET ADD UNIFICATION (WUU-OBS-02).
+#     $AddEntry must delegate to Add-WuuComputerSetNames so that flat and guided fleet operations
+#     share the same validation, deduplication and row creation. The legacy Exempt.txt silent bypass
+#     is retired and must not appear in Wuu.Core.psm1.
+$corePathForAdd = Join-Path $root 'src\Wuu.Core.psm1'
+$coreAstForAdd = $null
+try { $coreAstForAdd = [System.Management.Automation.Language.Parser]::ParseFile($corePathForAdd, [ref]$null, [ref]$null) } catch { $coreAstForAdd = $null }
+if (-not $coreAstForAdd) {
+    Fail 'could not parse Wuu.Core.psm1, so the AddEntry unification check would pass vacuously'
+} else {
+    $addNode = $coreAstForAdd.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left.Extent.Text.Trim() -eq '$AddEntry'
+    }, $true)
+    if (-not $addNode) {
+        Fail 'no $AddEntry assignment found in Wuu.Core.psm1 (WUU-OBS-02)'
+    } elseif ($addNode.Right.Extent.Text -notmatch 'Add-WuuComputerSetNames') {
+        Fail '$AddEntry does not delegate to Add-WuuComputerSetNames (WUU-OBS-02)'
+    } else {
+        Pass '$AddEntry delegates to Add-WuuComputerSetNames (unified fleet add pipeline, WUU-OBS-02)'
+    }
+
+    $coreCodeNoComm = Get-WuuCodeWithoutComments -Path $corePathForAdd
+    if ($coreCodeNoComm -match 'Exempt\.txt') {
+        Fail 'legacy Exempt.txt check still present in Wuu.Core.psm1 code (WUU-OBS-02)'
+    } else {
+        Pass 'legacy Exempt.txt bypass is retired from Wuu.Core.psm1 (WUU-OBS-02)'
+    }
+}
+
