@@ -43,20 +43,28 @@ function Get-WuuNavigationTree {
     <#
     .SYNOPSIS The grouped top-level navigation.
     .DESCRIPTION
-    Spec 9 requires operations be grouped into six categories plus Save and Exit, rather than a
-    flat command list. Each leaf's `Handler` is the NAME of a $consoleActions key - resolved at
-    dispatch time, never a captured scriptblock, so a missing handler is a diagnosable error
-    instead of a silent no-op.
+    Spec 9 requires operations be grouped into categories rather than exposed as a flat command
+    list. The taxonomy is FIVE functional categories - updates/deployment, the computer fleet,
+    diagnostics, reports, and settings - plus Advanced (the retained flat list) and Exit.
+
+    Five rather than the earlier six-plus-Save because the previous tree had grown a category per
+    FEATURE (Automation, Credentials, Deployment phases), and "Deployment phases" was not a domain
+    an operator thinks in - it is part of rolling out updates, so it now lives in Updates. Phase
+    membership is part of managing the fleet, so it also appears in Computer fleet. Saving the set
+    is persistence of the fleet, so it lives there too instead of consuming a top-level slot.
+
+    Nothing was removed by the regroup: every operation the old tree reached is still reachable,
+    and the flat list remains available under Advanced, so no capability depends on the taxonomy.
+
+    Each leaf's `Handler` is the NAME of a $consoleActions key - resolved at dispatch time, never a
+    captured scriptblock, so a missing handler is a diagnosable error instead of a silent no-op.
     #>
     @(
-        @{ Id = 'UPDATES';     Key = '1'; Label = 'Update management' }
-        @{ Id = 'COMPUTERS';   Key = '2'; Label = 'Computer management' }
-        @{ Id = 'DEPLOYMENT';  Key = '3'; Label = 'Deployment phases' }
-        @{ Id = 'AUTOMATION';  Key = '4'; Label = 'Automation' }
-        @{ Id = 'CREDENTIALS'; Key = '5'; Label = 'Credentials' }
-        @{ Id = 'DIAGNOSTICS'; Key = '6'; Label = 'Diagnostics' }
-        @{ Id = 'REPORTS';     Key = '7'; Label = 'Reports / audit' }
-        @{ Id = 'SAVE';        Key = '8'; Label = 'Save computer set' }
+        @{ Id = 'UPDATES';     Key = '1'; Label = 'Updates & deployment' }
+        @{ Id = 'COMPUTERS';   Key = '2'; Label = 'Computer fleet' }
+        @{ Id = 'DIAGNOSTICS'; Key = '3'; Label = 'Diagnostics & health' }
+        @{ Id = 'REPORTS';     Key = '4'; Label = 'Reports & audit' }
+        @{ Id = 'SETTINGS';    Key = '5'; Label = 'Settings & credentials' }
         @{ Id = 'ADVANCED';    Key = '9'; Label = 'Advanced (all operations)' }
         @{ Id = 'EXIT';        Key = 'q'; Label = 'Exit' }
     )
@@ -77,91 +85,93 @@ function Get-WuuUpdateManagementMenu {
     Show-WuuOperationConfirmationScreen.
     #>
     @(
-        @{ Key = '1'; Label = 'Check for updates';        Handler = 'EventGetUpdates';           Mutating = $false; Workflow = 'check' }
-        @{ Key = '2'; Label = 'Review available updates'; Handler = 'EventShowAvailableUpdates'; Mutating = $false; Workflow = 'review' }
-        @{ Key = '3'; Label = 'Download updates';         Handler = 'EventDownloadUpdates';      Mutating = $true;  Workflow = 'download' }
-        @{ Key = '4'; Label = 'Install updates';          Handler = 'EventInstallUpdates';       Mutating = $true;  Workflow = 'install' }
-        @{ Key = '5'; Label = 'Restart computers';        Handler = 'EventRestartComputer';      Mutating = $true;  Workflow = 'restart' }
-        @{ Key = '6'; Label = 'Full deployment';          Starts = 'DEPLOYING';                  Mutating = $true;  Workflow = 'deploy' }
-        @{ Key = '7'; Label = 'Pre-flight check';         Preflight = 'check';                   Mutating = $false; Workflow = 'check' }
-        @{ Key = 'b'; Label = 'Back';                     Handler = '';                          Mutating = $false }
+        @{ Key = '1'; Label = 'Check for updates';            Handler = 'EventGetUpdates';           Mutating = $false; Workflow = 'check' }
+        @{ Key = '2'; Label = 'Download updates';             Handler = 'EventDownloadUpdates';      Mutating = $true;  Workflow = 'download' }
+        @{ Key = '3'; Label = 'Install updates';              Handler = 'EventInstallUpdates';       Mutating = $true;  Workflow = 'install' }
+        @{ Key = '4'; Label = 'Restart computer(s)';          Handler = 'EventRestartComputer';      Mutating = $true;  Workflow = 'restart' }
+        @{ Key = '5'; Label = 'Review available updates';     Handler = 'EventShowAvailableUpdates'; Mutating = $false; Workflow = 'review' }
+        # Phase status belongs to the deployment flow, so it is offered here rather than as its own
+        # top-level category. The workflow id is deliberately absent: showing phases is a READ, and
+        # carrying 'deploy' would make the confirmation screen state deploy prerequisites for it.
+        @{ Key = '6'; Label = 'Show phase status';            Handler = 'EventShowByPhase';          Mutating = $false }
+        @{ Key = '7'; Label = 'Pre-flight check';             Preflight = 'deploy';                  Mutating = $false; Workflow = 'deploy' }
+        @{ Key = '8'; Label = 'Run full deployment sequence'; Starts = 'DEPLOYING';                  Mutating = $true;  Workflow = 'deploy' }
+        @{ Key = 'b'; Label = 'Back';                         Handler = '';                          Mutating = $false }
     )
 }
 
 function Get-WuuComputerManagementMenu {
-    @(
-        @{ Key = '1'; Label = 'Add computers manually';        Handler = 'EventAddComputer';             Mutating = $false }
-        @{ Key = '2'; Label = 'Import computers from file';    Handler = 'EventAddFile';                 Mutating = $false }
-        @{ Key = '3'; Label = 'Add from Active Directory';     Handler = 'EventAddAD';                   Mutating = $false }
-        @{ Key = '4'; Label = 'Remove computers';              Handler = 'EventRemoveSelected';          Mutating = $false }
-        @{ Key = '5'; Label = 'Assign phase';                  Handler = 'EventAssignPhaseInteractive';  Mutating = $false }
-        @{ Key = '6'; Label = 'Show computers in a phase';     Handler = 'EventShowByPhase';             Mutating = $false }
-        @{ Key = '7'; Label = 'Remove offline computers';      Handler = 'EventRemoveOfflineComputer';   Mutating = $false }
-        @{ Key = '8'; Label = 'Test connectivity (pre-flight)'; Preflight = 'check';                     Mutating = $false }
-        @{ Key = '9'; Label = 'Clear computer list';           Handler = 'ClearComputerList';            Mutating = $false }
-        @{ Key = 'x'; Label = 'Export list to file';           Handler = 'EventSaveComputerList';        Mutating = $false }
-        @{ Key = 'l'; Label = 'Load saved computer set';       Handler = 'EventLoadConfig';              Mutating = $false }
-        @{ Key = 's'; Label = 'Save computer set';             Handler = 'EventSaveConfig';              Mutating = $false }
-        @{ Key = 'b'; Label = 'Back';                          Handler = '';                             Mutating = $false }
-    )
-}
-
-function Get-WuuDeploymentMenu {
     <#
-    .SYNOPSIS Deployment phases as part of deployment, not hidden configuration (spec 13).
+    .SYNOPSIS The computer fleet: membership, phase assignment and persistence.
+    .DESCRIPTION
+    Membership and persistence are one domain - who is in the set, and how the set is kept - so
+    saving and loading live here instead of in their own top-level category. Adding manually or by
+    import routes to the GUIDED screens (`Screen`), not to the flat handlers, so the operator gets
+    the parse-and-review step from the fleet menu too; the flat handlers remain reachable under
+    Advanced for scripted use.
+
+    Phase assignment is a local change to the set, not a remote one, so it stays `Mutating = $false`
+    like the other fleet edits - matching both the flat menu and the command table's `credentials`
+    entry. The guided menu's `Mutating` flag decides whether an entry is routed through the audit
+    choke point, and a local set edit does not need a remote-change reason.
     #>
     @(
-        @{ Key = '1'; Label = 'Show phase status';         Handler = 'EventShowByPhase';             Mutating = $false }
-        @{ Key = '2'; Label = 'Assign computers to phase'; Handler = 'EventAssignPhaseInteractive';  Mutating = $false }
-        @{ Key = '3'; Label = 'Pre-flight next phase';     Preflight = 'deploy';                     Mutating = $false; Workflow = 'deploy' }
-        @{ Key = '4'; Label = 'Run full deployment';       Starts = 'DEPLOYING';                     Mutating = $true;  Workflow = 'deploy' }
-        @{ Key = 'b'; Label = 'Back';                      Handler = '';                             Mutating = $false }
+        @{ Key = '1'; Label = 'Add computers manually';     Screen = 'MANUAL';                  Mutating = $false }
+        @{ Key = '2'; Label = 'Import computers from file'; Screen = 'IMPORT';                  Mutating = $false }
+        @{ Key = '3'; Label = 'Add from Active Directory';  Handler = 'EventAddAD';            Mutating = $false }
+        @{ Key = '4'; Label = 'Assign computers to phase';  Handler = 'EventAssignPhaseInteractive'; Mutating = $false }
+        @{ Key = '5'; Label = 'Remove selected computers';  Handler = 'EventRemoveSelected';   Mutating = $false }
+        @{ Key = '6'; Label = 'Remove offline computers';   Handler = 'EventRemoveOfflineComputer'; Mutating = $false }
+        @{ Key = '7'; Label = 'Clear computer list';        Handler = 'ClearComputerList';     Mutating = $false }
+        @{ Key = '8'; Label = 'Save named computer set';    Handler = 'EventSaveConfig';       Mutating = $false }
+        @{ Key = '9'; Label = 'Load named computer set';    Handler = 'EventLoadConfig';       Mutating = $false }
+        @{ Key = 'e'; Label = 'Export computer names';      Handler = 'EventSaveComputerList'; Mutating = $false }
+        @{ Key = 'b'; Label = 'Back';                       Handler = '';                      Mutating = $false }
     )
 }
 
 function Get-WuuDiagnosticsMenu {
+    <#
+    .SYNOPSIS Inspection, service control and reachability (spec 19).
+    .DESCRIPTION
+    Connectivity pre-flight lives here rather than in its own category: it answers "is this fleet
+    reachable", which is what an operator came to Diagnostics to find out. The mutating service
+    action is first because it is the one entry that changes anything, and it is the only entry
+    here that is not a read.
+    #>
     @(
-        @{ Key = '1'; Label = 'Show errors';               Handler = 'GetErrors';                    Mutating = $false }
-        @{ Key = '2'; Label = 'View Windows Update log';   Handler = 'EventViewUpdateLog';           Mutating = $false }
-        @{ Key = '3'; Label = 'Update history';            Handler = 'EventShowUpdateHistory';       Mutating = $false }
-        @{ Key = '4'; Label = 'Show installed updates';    Handler = 'EventShowInstalledUpdates';    Mutating = $false }
-        @{ Key = '5'; Label = 'Audit WSUS updates';        Handler = 'EventAuditWSUSUpdates';        Mutating = $false }
-        @{ Key = '6'; Label = 'Windows Update service';    Handler = 'EventWUServiceActionInteractive'; Mutating = $true }
-        @{ Key = 'b'; Label = 'Back';                      Handler = '';                             Mutating = $false }
-    )
-}
-
-function Get-WuuCredentialMenu {
-    @(
-        @{ Key = '1'; Label = 'Set domain credentials';        Handler = 'EventSetDomainCredentials';    Mutating = $false }
-        @{ Key = '2'; Label = 'Test credentials (pre-flight)'; Preflight = 'check';                      Mutating = $false }
+        @{ Key = '1'; Label = 'Windows Update service actions';  Handler = 'EventWUServiceActionInteractive'; Mutating = $true }
+        @{ Key = '2'; Label = 'View Windows Update log';        Handler = 'EventViewUpdateLog';           Mutating = $false }
+        @{ Key = '3'; Label = 'Show installed updates';         Handler = 'EventShowInstalledUpdates';    Mutating = $false }
+        @{ Key = '4'; Label = 'Audit WSUS updates vs local state'; Handler = 'EventAuditWSUSUpdates';      Mutating = $false }
+        @{ Key = '5'; Label = 'View error log';                Handler = 'GetErrors';                    Mutating = $false }
+        @{ Key = '6'; Label = 'Connectivity pre-flight check'; Preflight = 'check';                      Mutating = $false }
         @{ Key = 'b'; Label = 'Back';                          Handler = '';                             Mutating = $false }
     )
 }
 
-function Get-WuuAutomationMenu {
+function Get-WuuSettingsMenu {
     <#
-    .SYNOPSIS Automation settings (instructions SS15/SS16).
+    .SYNOPSIS Settings and credentials: what automation does, and who it authenticates as.
     .DESCRIPTION
-    The guided workflow is the DEFAULT entry path, and it had no automation entry at all: the
-    settings existed, the flat menu could toggle them, and an operator using the guided UI could
-    neither set nor even SEE them. That is the same class as any other unwired feature - it exists
-    and is unreachable - except worse, because the thing it hides decides whether a check silently
-    rolls forward into downloads, installs and reboots.
+    This replaces the separate Automation and Credentials categories. They were one decision seen
+    from two angles - enabling unattended rollout is only safe if the credential the rollout uses
+    is known to work - so they belong on one screen rather than two the operator must visit in the
+    right order.
 
-    The master toggle is wired by NAME to EventToggleSettings, the same handler the flat menu's `t`
+    The master toggle is wired by NAME to EventToggleSettings, the SAME handler the flat menu's `t`
     key uses, so the two entry points cannot implement different rules.
 
-    The other three entries are PRE-FLIGHT entries, deliberately: this build has no background
-    daemon, so there is nothing to configure the automation OF except connectivity and credentials.
-    Inventing separate "configure AutoDownload" screens would be a second place for one setting to
-    live, which the instruction set forbids.
+    Credentials are `Mutating = $true`: setting a credential is a credential change, the same way
+    the command surface treats it (`wuu credentials set`). It was previously unflagged in the
+    guided menu while the command table also carried `Mutating = $false`, so the asymmetry was in
+    both places; flagging it here is the guided surface telling the truth about what it does.
     #>
     @(
-        @{ Key = '1'; Label = 'Switch ALL automation on/off (master)'; Handler = 'EventToggleSettings'; Mutating = $false }
-        @{ Key = '2'; Label = 'Test connectivity (pre-flight)';       Preflight = 'check';                     Mutating = $false }
-        @{ Key = '3'; Label = 'Test credentials (pre-flight)';        Preflight = 'check';                     Mutating = $false }
-        @{ Key = 'b'; Label = 'Back';                                Mutating = $false }
+        @{ Key = '1'; Label = 'Master automation toggle';   Handler = 'EventToggleSettings';         Mutating = $false }
+        @{ Key = '2'; Label = 'Set domain credentials';     Handler = 'EventSetDomainCredentials';   Mutating = $true }
+        @{ Key = '3'; Label = 'Credential pre-flight test'; Preflight = 'check';                     Mutating = $false }
+        @{ Key = 'b'; Label = 'Back';                        Handler = '';                            Mutating = $false }
     )
 }
 
@@ -173,14 +183,17 @@ function Get-WuuReportsMenu {
     `wuu audit verify|show|export` are handled by Invoke-WuuAuditCommand in the command layer - they
     are not action-layer operations. Delegating them to a non-existent handler key would be a dead
     menu entry (the exact defect that made AD import unreachable).
+
+    The remote Windows Update history belongs with the other history views, so it moved here from
+    Diagnostics once Diagnostics became inspection-of-this-run rather than everything that reports.
     #>
     @(
-        @{ Key = '1'; Label = 'Deployment report';        Report = $true;          Mutating = $false }
-        @{ Key = '2'; Label = 'View audit history';        AuditSubVerb = 'show';   Mutating = $false }
-        @{ Key = '3'; Label = 'Verify audit chain';        AuditSubVerb = 'verify'; Mutating = $false }
-        @{ Key = '4'; Label = 'Export audit bundle';       AuditSubVerb = 'export'; Mutating = $false }
-        @{ Key = '5'; Label = 'Export computer list';      Handler = 'EventSaveComputerList'; Mutating = $false }
-        @{ Key = 'b'; Label = 'Back';                      Mutating = $false }
+        @{ Key = '1'; Label = 'Deployment report';              Report = $true;          Mutating = $false }
+        @{ Key = '2'; Label = 'View WUU audit trail';           AuditSubVerb = 'show';   Mutating = $false }
+        @{ Key = '3'; Label = 'Verify audit chain integrity';   AuditSubVerb = 'verify'; Mutating = $false }
+        @{ Key = '4'; Label = 'Export audit bundle';            AuditSubVerb = 'export'; Mutating = $false }
+        @{ Key = '5'; Label = 'Windows Update history on targets'; Handler = 'EventShowUpdateHistory'; Mutating = $false }
+        @{ Key = 'b'; Label = 'Back';                           Mutating = $false }
     )
 }
 
@@ -626,6 +639,12 @@ function Show-WuuCategoryScreen {
                 $Ctx | Add-Member -NotePropertyName PreflightOperation -NotePropertyValue ([string]$item.Workflow) -Force
                 return [string]$item.Starts
             }
+            # A GUIDED SCREEN, not a handler. "Add computers manually" and "Import computers from
+            # file" used to be reachable only from the acquisition path, so the fleet menu offered
+            # the FLAT handlers instead - which parse a file or a line with different rules and
+            # validate nothing. Routing to the screen keeps one parse-and-review behaviour no matter
+            # which door the operator came through; the flat handlers stay reachable under Advanced.
+            if ($item.ContainsKey('Screen')) { return [string]$item.Screen }
             if ($item.Handler) {
                 # The operation id travels with the dispatch so the confirmation screen can state
                 # which prerequisites apply to it (spec 7 / 12).
@@ -1321,7 +1340,9 @@ function Get-WuuCategoryStateForOperation {
     <# Which category screen offered this operation - so cancelling returns somewhere sensible. #>
     param([Parameter(Mandatory)][string]$Operation)
     switch ($Operation.ToLowerInvariant()) {
-        'deploy' { 'DEPLOYMENT' }
+        # Deployment is offered by the Updates category now; the DEPLOYMENT category no longer
+        # exists, so a refused deploy confirmation must return somewhere that does.
+        'deploy' { 'UPDATES' }
         default  { 'UPDATES' }
     }
 }
@@ -1632,13 +1653,11 @@ function Start-WuuGuidedWorkflow {
             'IMPORT'       { $state = Show-WuuImportScreen -Ctx $ctx }
             'REVIEW'       { $state = Show-WuuComputerSetReviewScreen -Ctx $ctx }
             'DASHBOARD'    { $state = Show-WuuDashboardScreen -Ctx $ctx }
-            'UPDATES'      { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'UPDATE MANAGEMENT' -Items @(Get-WuuUpdateManagementMenu) -State 'UPDATES' }
-            'COMPUTERS'    { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'COMPUTER MANAGEMENT' -Items @(Get-WuuComputerManagementMenu) -State 'COMPUTERS' }
-            'DEPLOYMENT'   { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'DEPLOYMENT PHASES' -Items @(Get-WuuDeploymentMenu) -State 'DEPLOYMENT' }
-            'AUTOMATION'   { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'AUTOMATION' -Items @(Get-WuuAutomationMenu) -State 'AUTOMATION' }
-            'CREDENTIALS'  { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'CREDENTIALS' -Items @(Get-WuuCredentialMenu) -State 'CREDENTIALS' }
-            'DIAGNOSTICS'  { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'DIAGNOSTICS' -Items @(Get-WuuDiagnosticsMenu) -State 'DIAGNOSTICS' }
-            'REPORTS'      { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'REPORTS / AUDIT' -Items @(Get-WuuReportsMenu) -State 'REPORTS' }
+            'UPDATES'      { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'UPDATES & DEPLOYMENT' -Items @(Get-WuuUpdateManagementMenu) -State 'UPDATES' }
+            'COMPUTERS'    { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'COMPUTER FLEET' -Items @(Get-WuuComputerManagementMenu) -State 'COMPUTERS' }
+            'DIAGNOSTICS'  { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'DIAGNOSTICS & HEALTH' -Items @(Get-WuuDiagnosticsMenu) -State 'DIAGNOSTICS' }
+            'REPORTS'      { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'REPORTS & AUDIT' -Items @(Get-WuuReportsMenu) -State 'REPORTS' }
+            'SETTINGS'     { $state = Show-WuuCategoryScreen -Ctx $ctx -Title 'SETTINGS & CREDENTIALS' -Items @(Get-WuuSettingsMenu) -State 'SETTINGS' }
             'REPORT'       { $state = Show-WuuReportScreen -Ctx $ctx }
             'ADVANCED'     { $state = Show-WuuAdvancedScreen -Ctx $ctx }
             'PREFLIGHT'    { $state = Show-WuuPreflightScreen -Ctx $ctx }
@@ -1646,7 +1665,6 @@ function Start-WuuGuidedWorkflow {
             'EXECUTING'    { $state = Show-WuuExecutionScreen -Ctx $ctx }
             'RESULTS'      { $state = Show-WuuResultsScreen -Ctx $ctx }
             'DEPLOYING'    { $state = Start-WuuDeploymentSequence -Ctx $ctx }
-            'SAVE'         { Invoke-WuuGuidedHandler -Ctx $ctx -Handler 'EventSaveConfig'; $ctx.Set.IsSaved = $true; $state = 'DASHBOARD' }
             default {
                 Write-Host ("  DEFECT: unknown workflow state '{0}' - returning to dashboard." -f $state) -ForegroundColor Red
                 $state = 'DASHBOARD'
@@ -1664,10 +1682,8 @@ Export-ModuleMember -Function @(
     'Get-WuuNavigationTree'
     'Get-WuuUpdateManagementMenu'
     'Get-WuuComputerManagementMenu'
-    'Get-WuuDeploymentMenu'
-    'Get-WuuAutomationMenu'
     'Get-WuuDiagnosticsMenu'
-    'Get-WuuCredentialMenu'
+    'Get-WuuSettingsMenu'
     'Get-WuuReportsMenu'
     'Get-WuuWorkflowSpec'
     'Select-WuuImportColumn'

@@ -120,50 +120,104 @@ $tree = @(Get-WuuNavigationTree)
 if ($tree.Count -gt 12) { Fail "top-level navigation has $($tree.Count) entries - spec 9 requires grouping" }
 else { Pass "top-level navigation is grouped ($($tree.Count) entries, not 25+ operations)" }
 
-foreach ($required in @('Update management', 'Computer management', 'Deployment phases', 'Credentials', 'Diagnostics', 'Reports / audit', 'Save computer set', 'Exit')) {
+foreach ($required in @('Updates & deployment', 'Computer fleet', 'Diagnostics & health', 'Reports & audit', 'Settings & credentials', 'Advanced (all operations)', 'Exit')) {
     if (-not ($tree | Where-Object { $_.Label -eq $required })) { Fail "navigation is missing category: $required" }
 }
 if (-not $failed) { Pass 'all spec-9 categories are present' }
+
+# The taxonomy is a CONTRACT, pinned by Id and Label rather than by count alone, so renaming a
+# category or re-adding a retired one fails here. The earlier tree had grown a category per FEATURE
+# (Deployment phases, Automation, Credentials, Save); those were folded into the domains an operator
+# actually thinks in, and this is what keeps them from drifting back one at a time.
+$expectedTree = @(
+    @{ Id = 'UPDATES';     Label = 'Updates & deployment' }
+    @{ Id = 'COMPUTERS';   Label = 'Computer fleet' }
+    @{ Id = 'DIAGNOSTICS'; Label = 'Diagnostics & health' }
+    @{ Id = 'REPORTS';     Label = 'Reports & audit' }
+    @{ Id = 'SETTINGS';    Label = 'Settings & credentials' }
+    @{ Id = 'ADVANCED';    Label = 'Advanced (all operations)' }
+    @{ Id = 'EXIT';        Label = 'Exit' }
+)
+$actualIds = @($tree | ForEach-Object { $_.Id })
+$expectedIds = @($expectedTree | ForEach-Object { $_.Id })
+if (($actualIds -join ',') -ne ($expectedIds -join ',')) {
+    Fail "the top-level taxonomy is not the agreed one: got '$($actualIds -join ',')', want '$($expectedIds -join ',')'"
+} else { Pass "the top-level taxonomy is 5 categories + Advanced + Exit ($($tree.Count) entries)" }
+
+$retired = @($tree | Where-Object { $_.Id -in @('DEPLOYMENT', 'AUTOMATION', 'CREDENTIALS', 'SAVE') })
+if ($retired.Count) { Fail "retired top-level categor(ies) present: $((@($retired | ForEach-Object { $_.Id })) -join ', ')" }
+else { Pass 'no retired feature-per-category entry survives at the top level' }
+
+# ...and nothing was LOST in the regroup. Every operation the flat menu reaches must also be
+# reachable by navigating the taxonomy; Advanced is what makes that guarantee hold, and this is the
+# assertion that would catch a regroup that quietly dropped an operation instead of relocating it.
+#
+# Compared on CAPABILITIES, not on handler names alone: the grouped menus also reach things through
+# an entry KIND rather than a Handler - the deployment report is a `Report` entry (its own screen,
+# not an action-layer handler) and the audit subverbs are `AuditSubVerb` entries. A handler-name-only
+# comparison would report those as stranded when they are in fact reachable.
+#
+# `ShowHelp` is excluded deliberately: it renders help, it is not an operation, and the flat `?` key
+# is its only home. Listing it here would force a meaningless menu entry into the taxonomy.
+$flatHandlersForCoverage = @((Get-WuuMenuActions) |
+        Where-Object { $_.Handler -and $_.Handler -ne 'ShowHelp' } |
+        ForEach-Object { $_.Handler } | Sort-Object -Unique)
+$guidedHandlersForCoverage = @()
+foreach ($menuFnForCoverage in @('Get-WuuUpdateManagementMenu', 'Get-WuuComputerManagementMenu', 'Get-WuuDiagnosticsMenu', 'Get-WuuReportsMenu', 'Get-WuuSettingsMenu')) {
+    $guidedHandlersForCoverage += @((& $menuFnForCoverage) | Where-Object { $_.ContainsKey('Handler') -and $_.Handler } | ForEach-Object { $_.Handler })
+}
+$guidedHandlersForCoverage += @('EventAddComputer', 'EventAddFile')        # reachable via a Screen entry
+$guidedHandlersForCoverage += @('EventDeploymentReport')                   # reachable via the Report entry
+$guidedHandlersForCoverage += @('Invoke-WuuAuditCommand', 'Invoke-WuuAuditSubVerb')  # via AuditSubVerb entries
+$guidedHandlersForCoverage = @($guidedHandlersForCoverage | Sort-Object -Unique)
+$unreachableOps = @($flatHandlersForCoverage | Where-Object { $guidedHandlersForCoverage -notcontains $_ })
+if ($unreachableOps.Count) { Fail "operation(s) reachable only from the flat menu, so the regroup strands them if Advanced is ever removed: $($unreachableOps -join ', ')" }
+else { Pass "every flat operation is also reachable by navigating the grouped taxonomy ($($flatHandlersForCoverage.Count) handlers)" }
 
 # Navigating must not expose a mutating operation at the top level.
 $mutatingTopLevel = @($tree | Where-Object { $_.ContainsKey('Mutating') -and $_.Mutating })
 if ($mutatingTopLevel.Count) { Fail 'top-level navigation exposes a mutating operation' } else { Pass 'no mutating operation at the top level' }
 
 # ---------------------------------------------------------------------------------------
-# 5a. AUTOMATION must be reachable from the guided workflow, and its state VISIBLE.
+# 5a. Automation must remain reachable from the guided workflow, and its state VISIBLE.
 #
 # Before this, automation settings existed and the flat menu could toggle them, but the guided
 # workflow - the DEFAULT entry path - had no way to set or even see them. An operator using the
-# guided UI therefore could neither enable nor discover the automatic behaviours, and the
-# instruction set requires the operator always be able to determine what automation is enabled.
-# The settings engine was fine; the interface did not reach it.
-$automationCategory = $tree | Where-Object { $_.Id -eq 'AUTOMATION' }
-if (-not $automationCategory) {
-    Fail 'the guided navigation has no AUTOMATION category - automatic behaviour cannot be reached or seen from the default interface'
-} else { Pass 'the guided navigation exposes an AUTOMATION category' }
+# guided UI could neither enable nor discover the automatic behaviours, and the instruction set
+# requires the operator always be able to determine what automation is enabled. The settings
+# engine was fine; the interface did not reach it.
+#
+# The AUTOMATION category has since been merged into Settings & credentials. The REQUIREMENT is
+# therefore asserted against wherever the control now lives rather than against the retired id:
+# what must hold is that the master control is reachable from a top-level category and that the
+# dashboard states what automation is enabled.
+$settingsCategory = $tree | Where-Object { $_.Id -eq 'SETTINGS' }
+if (-not $settingsCategory) {
+    Fail 'the guided navigation has no SETTINGS category - automatic behaviour cannot be reached or seen from the default interface'
+} else { Pass 'the guided navigation exposes a SETTINGS category' }
 
-$autoItems = @(Get-WuuAutomationMenu)
-if ($autoItems.Count -eq 0) { Fail 'the automation menu is empty' }
-else { Pass "the automation menu lists $($autoItems.Count) entry(ies)" }
+$settingsItems = @(Get-WuuSettingsMenu)
+if ($settingsItems.Count -eq 0) { Fail 'the settings menu is empty' }
+else { Pass "the settings menu lists $($settingsItems.Count) entry(ies)" }
 
 # The master control must be reachable, wired by name to the SAME handler the flat menu uses.
-if (-not ($autoItems | Where-Object { $_.Handler -eq 'EventToggleSettings' })) {
-    Fail 'the automation menu does not offer the master toggle (EventToggleSettings)'
-} else { Pass 'the automation menu offers the master automation toggle' }
+if (-not ($settingsItems | Where-Object { $_.Handler -eq 'EventToggleSettings' })) {
+    Fail 'the settings menu does not offer the master toggle (EventToggleSettings)'
+} else { Pass 'the settings menu offers the master automation toggle' }
 
-# Every automation entry needs a dispatch key, like every other category.
-$autoUndispatched = @($autoItems | Where-Object {
+# Every settings entry needs a dispatch key, like every other category.
+$settingsUndispatched = @($settingsItems | Where-Object {
         -not $_.ContainsKey('Handler') -and -not $_.ContainsKey('Preflight') -and
         -not $_.ContainsKey('Starts') -and $_.Key -ne 'b'
     })
-if ($autoUndispatched.Count -gt 0) { Fail "$($autoUndispatched.Count) automation entry(ies) dispatch to nothing" }
-else { Pass 'every automation menu entry dispatches to something' }
+if ($settingsUndispatched.Count -gt 0) { Fail "$($settingsUndispatched.Count) settings entry(ies) dispatch to nothing" }
+else { Pass 'every settings menu entry dispatches to something' }
 
-# The workflow loop must actually dispatch the new state, or the category is unreachable.
+# The workflow loop must actually dispatch the state, or the category is unreachable.
 $navRawAuto = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Navigate.psm1') -Raw
-if ($navRawAuto -notmatch "'AUTOMATION'\s*\{\s*\`$state = Show-WuuCategoryScreen") {
-    Fail "the workflow loop has no dispatch for the 'AUTOMATION' state - the category would be a dead menu entry"
-} else { Pass "the workflow loop dispatches the 'AUTOMATION' state" }
+if ($navRawAuto -notmatch "'SETTINGS'\s*\{\s*\`$state = Show-WuuCategoryScreen") {
+    Fail "the workflow loop has no dispatch for the 'SETTINGS' state - the category would be a dead menu entry"
+} else { Pass "the workflow loop dispatches the 'SETTINGS' state" }
 
 # ...and the DASHBOARD must SHOW the automation state, so the operator can determine it without
 # navigating. A setting that is only visible inside a submenu is one an operator forgets.
@@ -192,11 +246,9 @@ if ($wiredActions.Count -lt 15) {
 $allLeafMenus = @(
     @{ Name = 'update management';  Items = @(Get-WuuUpdateManagementMenu) }
     @{ Name = 'computer management'; Items = @(Get-WuuComputerManagementMenu) }
-    @{ Name = 'deployment';         Items = @(Get-WuuDeploymentMenu) }
-    @{ Name = 'automation';         Items = @(Get-WuuAutomationMenu) }
-    @{ Name = 'credentials';        Items = @(Get-WuuCredentialMenu) }
     @{ Name = 'diagnostics';        Items = @(Get-WuuDiagnosticsMenu) }
     @{ Name = 'reports';            Items = @(Get-WuuReportsMenu) }
+    @{ Name = 'settings';           Items = @(Get-WuuSettingsMenu) }
 )
 
 # The list above is written BY HAND, and it silently omitted `automation` - so the menu added most
@@ -207,13 +259,11 @@ $allLeafMenus = @(
 # Compared data-to-data (the list above against this map), not by re-parsing the list's own text,
 # which would be a test that reads its own source and can drift from what it actually sweeps.
 $categoryMenu = [ordered]@{
-    UPDATES     = @{ Fn = 'Get-WuuUpdateManagementMenu';     SweptAs = 'update management' }
-    COMPUTERS   = @{ Fn = 'Get-WuuComputerManagementMenu';   SweptAs = 'computer management' }
-    DEPLOYMENT  = @{ Fn = 'Get-WuuDeploymentMenu';           SweptAs = 'deployment' }
-    AUTOMATION  = @{ Fn = 'Get-WuuAutomationMenu';           SweptAs = 'automation' }
-    CREDENTIALS = @{ Fn = 'Get-WuuCredentialMenu';           SweptAs = 'credentials' }
-    DIAGNOSTICS = @{ Fn = 'Get-WuuDiagnosticsMenu';          SweptAs = 'diagnostics' }
-    REPORTS     = @{ Fn = 'Get-WuuReportsMenu';              SweptAs = 'reports' }
+    UPDATES     = @{ Fn = 'Get-WuuUpdateManagementMenu';   SweptAs = 'update management' }
+    COMPUTERS   = @{ Fn = 'Get-WuuComputerManagementMenu'; SweptAs = 'computer management' }
+    DIAGNOSTICS = @{ Fn = 'Get-WuuDiagnosticsMenu';        SweptAs = 'diagnostics' }
+    REPORTS     = @{ Fn = 'Get-WuuReportsMenu';            SweptAs = 'reports' }
+    SETTINGS    = @{ Fn = 'Get-WuuSettingsMenu';           SweptAs = 'settings' }
 }
 $navSourceForSweep = [string](Get-Content (Join-Path $root 'src\Wuu.Navigate.psm1') -Raw)
 $unswept = @()
@@ -752,13 +802,54 @@ if (-not ($updItems | Where-Object { $_.ContainsKey('Preflight') })) { Fail 'upd
 elseif (-not ($updItems | Where-Object { $_.ContainsKey('Starts') })) { Fail 'update management has no full-deployment entry' }
 else { Pass 'update management exposes pre-flight and full deployment' }
 
-$credItems = @(Get-WuuCredentialMenu)
-if (-not ($credItems | Where-Object { $_.ContainsKey('Preflight') })) { Fail 'credentials menu has no contextual test (spec 18)' }
-else { Pass 'spec 18: credentials are testable from their own menu, not only after a failure' }
+# The credentials pre-flight lives in Settings now that Credentials is a category no longer; the
+# spec-18 requirement (credentials are testable from their own area, not only after a failure) is
+# asserted against where they actually are.
+$credItems = @(Get-WuuSettingsMenu)
+if (-not ($credItems | Where-Object { $_.ContainsKey('Preflight') })) { Fail 'settings has no credential pre-flight test (spec 18)' }
+elseif (-not ($credItems | Where-Object { $_.Handler -eq 'EventSetDomainCredentials' })) { Fail 'settings cannot set credentials' }
+else { Pass 'spec 18: credentials are settable and testable from Settings, not only after a failure' }
 
-$deployItems = @(Get-WuuDeploymentMenu)
-if (-not ($deployItems | Where-Object { $_.ContainsKey('Starts') })) { Fail 'deployment menu cannot start a deployment' }
-else { Pass 'spec 13: a deployment can be started from the phases menu' }
+# A deployment can still be started from the taxonomy (it moved from its own category into Updates).
+$deployItems = @(Get-WuuUpdateManagementMenu)
+if (-not ($deployItems | Where-Object { $_.ContainsKey('Starts') })) { Fail 'deployment cannot be started from the grouped taxonomy' }
+else { Pass 'spec 13: a deployment can be started from Updates & deployment' }
+
+# The guided screens the fleet menu routes to must actually be dispatched. Three separate things
+# have to line up, and a check of only the first two is vacuous - it passes while the entry is dead:
+#   1. the menu entry names a Screen;
+#   2. the workflow loop dispatches that state;
+#   3. the CATEGORY SCREEN acts on the Screen key (without this, the entry falls through to
+#      `return $State` and silently does nothing - the dead-entry class all over again).
+#
+# (3) is checked on the AST, not on the source text. This assertion was first written as a regex and
+# was VACUOUS: commenting the dispatch out still left the words `ContainsKey('Screen')` in the file,
+# so the pattern matched the comment that replaced the code. A comment cannot be an IfStatementAst.
+$fleetItems = @(Get-WuuComputerManagementMenu)
+$navAstForScreen = [System.Management.Automation.Language.Parser]::ParseInput($navRawAuto, [ref]$null, [ref]$null)
+$categoryFnAst = @($navAstForScreen.FindAll({
+            param($x) ($x -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($x.Name -eq 'Show-WuuCategoryScreen')
+        }, $true))
+if ($categoryFnAst.Count -ne 1) {
+    Fail "expected exactly 1 Show-WuuCategoryScreen definition, found $($categoryFnAst.Count)"
+} else {
+    $screenDispatch = @($categoryFnAst[0].FindAll({
+                param($x) ($x -is [System.Management.Automation.Language.IfStatementAst]) -and
+                ($x.Clauses[0].Item1.Extent.Text -match "ContainsKey\('Screen'\)") -and
+                ($x.Clauses[0].Item2.Extent.Text -match '\$item\.Screen')
+            }, $true))
+    if (-not $screenDispatch.Count) {
+        Fail "Show-WuuCategoryScreen does not dispatch on a 'Screen' key, so any entry that routes to a screen falls through to 'return `$State' and silently does nothing"
+    } else { Pass 'the category screen dispatches entries that name a Screen (checked on the AST, so a comment cannot satisfy it)' }
+}
+foreach ($needScreen in @('MANUAL', 'IMPORT')) {
+    if (-not ($fleetItems | Where-Object { $_.ContainsKey('Screen') -and $_.Screen -eq $needScreen })) {
+        Fail "the fleet menu does not route to the '$needScreen' screen"
+    } elseif ($navRawAuto -notmatch ("'" + $needScreen + "'\s*\{\s*\`$state = Show-")) {
+        Fail "the workflow loop has no dispatch for the '$needScreen' screen, so the fleet menu entry is dead"
+    }
+}
+if (-not $failed) { Pass 'the fleet menu routes add/import to the guided screens, and both the loop and the category screen dispatch them' }
 
 # The pre-flight screen must be reachable and must not explode on an EMPTY set.
 $emptyCtx = [pscustomobject]@{

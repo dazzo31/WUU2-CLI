@@ -125,10 +125,10 @@ Last operation: Check completed 22:14
   1   SRV01        1       Ready       3         Updates available
   ...
 
-  1. Update management     5. Diagnostics
-  2. Computer management   6. Reports / audit
-  3. Deployment phases     7. Save computer set
-  4. Credentials           8. Exit
+  1. Updates & deployment   5. Settings & credentials
+  2. Computer fleet         9. Advanced (all operations)
+  3. Diagnostics & health   q. Exit
+  4. Reports & audit
 ```
 
 The dashboard must answer: what am I managing, what state is it in, what updates are pending, what
@@ -136,7 +136,18 @@ is running, and what should I do next.
 
 ## 9. Do not expose 25+ operations at the top level
 
-Group into the six categories above (plus Save and Exit).
+Group into **five** functional categories - updates & deployment, computer fleet, diagnostics &
+health, reports & audit, settings & credentials - plus Advanced and Exit.
+
+The taxonomy is a contract in two directions. It groups by the domain an operator thinks in, so
+"Deployment phases" is not a category (it is part of rolling out updates); Automation and
+Credentials are one decision seen from two angles, so they share a screen; and saving the set is
+persistence of the fleet, so it belongs to the fleet. But it must also **lose nothing**: every
+operation the flat list reaches stays reachable by navigation, and the flat list itself remains
+available under Advanced, so no capability depends on the taxonomy.
+
+Five is a deliberate floor rather than a target. The previous tree had grown to ten entries, one per
+feature, which is the same failure as a flat menu - just indented.
 
 ## 10. Update management
 
@@ -264,8 +275,8 @@ Child states:
 
 ```
 COMPUTER_SET  ├── ManualEntry ├── Import ├── ActiveDirectory └── LoadSavedSet
-DASHBOARD     ├── UpdateManagement ├── ComputerManagement ├── Deployment
-              ├── Credentials ├── Diagnostics └── Reports
+DASHBOARD     ├── UpdateManagement ├── ComputerManagement ├── Diagnostics
+              └── Reports ├── Settings
 RESULTS       ├── Retry ├── InspectFailure ├── ContinuePhase ├── Export └── Dashboard
 ```
 
