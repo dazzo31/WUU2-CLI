@@ -68,7 +68,7 @@ function New-RecordingActions {
         'ClearComputerList', 'EventAddAD', 'EventAddComputer', 'EventAddFile', 'EventAssignPhaseInteractive',
         'EventAuditWSUSUpdates', 'EventDeploymentReport', 'EventDownloadUpdates', 'EventGetUpdates',
         'EventInstallUpdates', 'EventLoadConfig', 'EventRemoveOfflineComputer', 'EventRemoveSelected',
-        'EventRestartComputer', 'EventSaveComputerList', 'EventSaveConfig', 'EventSetDomainCredentials',
+        'EventRestartComputer', 'EventSaveComputerList', 'EventSaveConfig', 'EventSetDomainCredentials', 'EventSetViewFilter',
         'EventShowAvailableUpdates', 'EventShowByPhase', 'EventShowInstalledUpdates', 'EventShowUpdateHistory',
         'EventToggleSettings', 'EventViewUpdateLog', 'EventWUServiceActionInteractive', 'GetErrors', 'ShowHelp'
     )

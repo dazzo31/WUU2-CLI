@@ -126,6 +126,7 @@ function Get-WuuComputerManagementMenu {
         @{ Key = '8'; Label = 'Save named computer set';    Handler = 'EventSaveConfig';       Mutating = $false }
         @{ Key = '9'; Label = 'Load named computer set';    Handler = 'EventLoadConfig';       Mutating = $false }
         @{ Key = 'e'; Label = 'Export computer names';      Handler = 'EventSaveComputerList'; Mutating = $false }
+        @{ Key = 'f'; Label = 'Set view filter';            Handler = 'EventSetViewFilter';    Mutating = $false }
         @{ Key = 'b'; Label = 'Back';                       Handler = '';                      Mutating = $false }
     )
 }
@@ -578,6 +579,12 @@ function Show-WuuDashboardScreen {
 
     $choice = [string](Read-WuuAnswer -Prompt '  Selection' -Default '')
     $sel = $choice.Trim().ToLowerInvariant()
+    if ($sel -eq 'f') {
+        if ($Ctx.Actions -and $Ctx.Actions.EventSetViewFilter) {
+            & $Ctx.Actions.EventSetViewFilter
+        }
+        return 'DASHBOARD'
+    }
     foreach ($node in $tree) {
         if ($node.Key -eq $sel) { return $node.Id }
     }

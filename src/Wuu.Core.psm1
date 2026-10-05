@@ -1599,6 +1599,7 @@ $GetUpdates = {
                     $computer.UpdatesStatus = 'Updates required'
                     $computer.Status = "$($adjustedAvailableCount) update(s) found. Right-click > Download Updates."
                     $computer.State = 'UpdatesFound'
+                    $computer.Color = 'Default'
                     # SS8: the check CONCLUDED. Work is outstanding (updates are available), which is
                     # what the phase gate needs to know - not the wording of UpdatesStatus.
                     if ($computer.PSObject.Properties['CheckConcluded']) { $computer.CheckConcluded = $true }
@@ -1608,6 +1609,7 @@ $GetUpdates = {
                         $computer.UpdatesStatus = 'Reboot required'
                         $computer.Status = 'Up-to-date. Reboot required to complete previous installations.'
                         $computer.State = 'RebootRequired'
+                        $computer.Color = 'Default'
                         # A required reboot is outstanding WORK, not "nothing to do": the phase cannot
                         # be complete while a machine is waiting to restart.
                         if ($computer.PSObject.Properties['CheckConcluded']) { $computer.CheckConcluded = $true }
@@ -1615,6 +1617,7 @@ $GetUpdates = {
                         $computer.UpdatesStatus = 'All updates installed'
                         $computer.Status = 'Up-to-date. No updates available.'
                         $computer.State = 'Complete'
+                        $computer.Color = 'Success'
                         # Concluded with nothing outstanding. This is the ONLY row state in which the
                         # phase gate may treat the row as settled-and-clean.
                         if ($computer.PSObject.Properties['CheckConcluded']) { $computer.CheckConcluded = $false }
@@ -2916,6 +2919,11 @@ $consoleActions.EventDownloadUpdates = {
     }
     $started = 0; $deferred = 0; $uptodate = 0; $replaced = @(); $declined = @()
     foreach ($r in $rows) {
+        # An errored, timed-out, or offline computer cannot be assumed up-to-date just because Available is 0.
+        if ($r.State -in @('Error', 'Timeout', 'Offline') -or $r.Color -in @('Error', 'Timeout')) {
+            Write-Host ("  {0} is in {1} state - check for updates or resolve issue before downloading." -f $r.Computer, $r.State) -ForegroundColor Yellow
+            continue
+        }
         # Nothing to do - answer immediately rather than queuing an operation that will no-op.
         if ($r.Available -eq $r.Downloaded) {
             $r.Status = if ($r.Available -eq 0) { 'Up-to-Date - No updates available for download.' } else { 'All available updates are already downloaded.' }
@@ -3132,6 +3140,34 @@ $consoleActions.EventWUServiceActionInteractive = {
     $key = $act.Trim().ToLowerInvariant()
     if (-not $map.ContainsKey($key)) { Write-Host '  Invalid action.' -ForegroundColor Yellow; return }
     foreach ($r in $rows) { & $eventWUServiceAction $map[$key] $r }
+}
+
+$consoleActions.EventSetViewFilter = {
+    Write-Host ''
+    Write-Host '  Select Status Table View Filter:' -ForegroundColor Cyan
+    Write-Host '  [1] Needs Attention (Hide up-to-date systems) [Default]'
+    Write-Host '  [2] Active (Running operations / pending)'
+    Write-Host '  [3] Failed (Errors, timeouts, offline)'
+    Write-Host '  [4] Updates (Updates available or downloaded)'
+    Write-Host '  [5] Reboot (Reboot pending)'
+    Write-Host '  [6] All (Show entire fleet)'
+    Write-Host ''
+    $ans = Read-WuuAnswer -Prompt '  Select filter [1-6, default 1]' -Default '1'
+    $filterChoice = switch (([string]$ans).Trim()) {
+        '1' { 'NeedsAttention' }
+        '2' { 'Active' }
+        '3' { 'Failed' }
+        '4' { 'Updates' }
+        '5' { 'Reboot' }
+        '6' { 'All' }
+        default { 'NeedsAttention' }
+    }
+    if ($stateStore) {
+        $stateStore.ViewFilter = $filterChoice
+        $stateStore.Touch()
+    }
+    $label = Get-WuuFilterLabel -Filter $filterChoice
+    Write-Host ("  Status table filter set to: {0}" -f $label) -ForegroundColor Green
 }
 #endregion Console action layer
 

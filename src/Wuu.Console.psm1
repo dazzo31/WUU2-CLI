@@ -84,21 +84,142 @@ function Format-WuuTable {
     return $sb.ToString()
 }
 
+function Test-WuuRowFilter {
+    <# Evaluates whether a computer row matches a named view filter.
+       Filter categories:
+         - 'NeedsAttention' (Primary: hides clean settled up-to-date systems)
+         - 'Active' (currently running operations or pending items)
+         - 'Failed' (errors, timeouts, offline)
+         - 'Updates' (available or downloaded updates > 0)
+         - 'Reboot' (reboot required)
+         - 'All' (unfiltered fleet view) #>
+    param(
+        [Parameter(Mandatory)][object]$Row,
+        [string]$Filter = 'All'
+    )
+    if ([string]::IsNullOrWhiteSpace($Filter) -or $Filter -eq 'All') {
+        return $true
+    }
+
+    switch ($Filter) {
+        'NeedsAttention' {
+            # An errored host or failed state must NEVER be hidden by NeedsAttention
+            if ($Row.State -in @('Error', 'Timeout', 'Offline') -or
+                $Row.Color -in @('Error', 'Timeout') -or
+                [int]$Row.InstallErrors -gt 0) {
+                return $true
+            }
+            # Active operations or pending queue items need attention
+            if ($Row.OpState -eq 'Running' -or $Row.Pending) {
+                return $true
+            }
+            # Systems with updates waiting need attention
+            if ([int]$Row.Available -gt 0 -or [int]$Row.Downloaded -gt 0) {
+                return $true
+            }
+            # Systems requiring reboot need attention
+            if ([bool]$Row.RebootRequired) {
+                return $true
+            }
+            # Clean settled host: complete, 0 updates, no reboot, no errors, idle
+            if ($Row.State -eq 'Complete' -and
+                $Row.Available -eq 0 -and
+                $Row.Downloaded -eq 0 -and
+                (-not $Row.RebootRequired) -and
+                $Row.InstallErrors -le 0 -and
+                $Row.OpState -eq 'Idle') {
+                return $false
+            }
+            # Non-terminal or unsettled state needs attention
+            return $true
+        }
+        'Active' {
+            return ($Row.OpState -eq 'Running' -or $Row.Pending -or $Row.State -in @('Checking', 'Downloading', 'Installing', 'Rebooting'))
+        }
+        'Failed' {
+            return ($Row.State -in @('Error', 'Timeout', 'Offline') -or $Row.Color -in @('Error', 'Timeout') -or [int]$Row.InstallErrors -gt 0)
+        }
+        'Updates' {
+            return ([int]$Row.Available -gt 0 -or [int]$Row.Downloaded -gt 0)
+        }
+        'Reboot' {
+            return ([bool]$Row.RebootRequired)
+        }
+        default {
+            return $true
+        }
+    }
+}
+
+function Get-WuuFilterLabel {
+    param([string]$Filter)
+    switch ($Filter) {
+        'NeedsAttention' { return 'Needs Attention (Hide Up-to-Date)' }
+        'Active'         { return 'Active Operations' }
+        'Failed'         { return 'Errors & Timeouts' }
+        'Updates'        { return 'Updates Available/Downloaded' }
+        'Reboot'         { return 'Reboot Pending' }
+        'All'            { return 'All Computers (Fleet View)' }
+        default          { return $Filter }
+    }
+}
+
+function Get-WuuFilteredRows {
+    <# Observational projection: filters rows according to the specified category
+       without mutating the underlying state store collections. #>
+    param(
+        [Parameter(Mandatory)][object[]]$Rows,
+        [string]$Filter = 'All'
+    )
+    if ([string]::IsNullOrWhiteSpace($Filter) -or $Filter -eq 'All') {
+        return @($Rows)
+    }
+    $filtered = New-Object System.Collections.ArrayList
+    foreach ($r in $Rows) {
+        if (Test-WuuRowFilter -Row $r -Filter $Filter) {
+            $filtered.Add($r) | Out-Null
+        }
+    }
+    return $filtered.ToArray()
+}
+
 function Write-WuuStatusTable {
     <# Writes the current rows. Does not clear the screen unless asked, so past output
        remains in the transcript. #>
     param(
         [Parameter(Mandatory)][hashtable]$Store,
-        [switch]$Clear
+        [switch]$Clear,
+        [string]$Filter
     )
     if ($Clear) { try { Clear-Host } catch { } }
-    $rows = @(Get-WuuComputerRow -Store $Store)
-    if ($rows.Count -eq 0) {
+    $allRows = @(Get-WuuComputerRow -Store $Store)
+    if ($allRows.Count -eq 0) {
         Write-Host '  (no computers in the list)' -ForegroundColor DarkGray
         return
     }
+    $activeFilter = if ($PSBoundParameters.ContainsKey('Filter') -and $Filter) {
+        $Filter
+    } elseif ($Store.ContainsKey('ViewFilter') -and $Store.ViewFilter) {
+        [string]$Store.ViewFilter
+    } else {
+        'All'
+    }
+    $rows = if ($activeFilter -and $activeFilter -ne 'All') {
+        @(Get-WuuFilteredRows -Rows $allRows -Filter $activeFilter)
+    } else {
+        $allRows
+    }
     # Colour per row is applied by writing each line individually.
     Write-Host ''
+    if ($activeFilter -and $activeFilter -ne 'All') {
+        $badge = "  [Filter: $(Get-WuuFilterLabel -Filter $activeFilter) ($($rows.Count) of $($allRows.Count) computers shown - press 'f' to change)]"
+        Write-Host $badge -ForegroundColor Cyan
+    }
+    if ($rows.Count -eq 0) {
+        Write-Host "  (no computers match filter '$activeFilter' - $($allRows.Count) computers in fleet)" -ForegroundColor DarkGray
+        Write-Host ''
+        return
+    }
     $lines = (Format-WuuTable -Rows $rows) -split "`r?`n"
     $headerLines = 2
     for ($i = 0; $i -lt $lines.Count; $i++) {
@@ -155,6 +276,7 @@ function Get-WuuMenuActions {
         @{ Key = 'w';  Label = 'Windows Update service';      Mutating = $true;  Handler = 'EventWUServiceActionInteractive';   Run = { param($ctx) & $ctx.EventWUServiceActionInteractive } }
         @{ Key = 'n';  Label = 'Add computers from Active Directory'; Mutating = $false; Handler = 'EventAddAD';                 Run = { param($ctx) & $ctx.EventAddAD } }
         @{ Key = 't';  Label = 'Toggle ALL automation (download/install/reboot)'; Mutating = $false; Handler = 'EventToggleSettings';        Run = { param($ctx) & $ctx.EventToggleSettings } }
+        @{ Key = 'f';  Label = 'Set view filter';             Mutating = $false; Handler = 'EventSetViewFilter';               Run = { param($ctx) & $ctx.EventSetViewFilter } }
         @{ Key = '?';  Label = 'Help';                        Mutating = $false; Handler = 'ShowHelp';                         Run = { param($ctx) & $ctx.ShowHelp } }
         @{ Key = 'q';  Label = 'Quit';                        Mutating = $false; Handler = '';                                 Run = { param($ctx) $ctx.Quit = $true } }
     )
@@ -536,6 +658,9 @@ function Read-WuuYesNo {
 Export-ModuleMember -Function @(
     'Get-WuuRowColor'
     'Format-WuuTable'
+    'Test-WuuRowFilter'
+    'Get-WuuFilterLabel'
+    'Get-WuuFilteredRows'
     'Write-WuuStatusTable'
     'Write-WuuStatusLine'
     'Get-WuuMenuActions'

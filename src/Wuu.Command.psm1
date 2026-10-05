@@ -565,13 +565,19 @@ function Get-WuuCommandPlan {
             # The handler's own no-op test: `$r.Available -eq $r.Downloaded` answers 'Up-to-Date'.
             $avail = [int]$r.Available
             $dl = if ($r.PSObject.Properties['Downloaded']) { [int]$r.Downloaded } else { 0 }
-            if ($avail -eq $dl) {
+            if ($r.State -in @('Error', 'Timeout', 'Offline') -or $r.Color -in @('Error', 'Timeout')) {
+                $action = 'skip'
+                $reason = "in error/offline state ($($r.State)) - check required before downloading"
+            } elseif ($avail -eq $dl) {
                 $action = 'noop'
                 $reason = if ($avail -eq 0) { 'no updates available for download' } else { 'all available updates are already downloaded' }
             }
         } elseif ($Verb -eq 'install' -and $r.PSObject.Properties['Downloaded']) {
             $dl = [int]$r.Downloaded
-            if ($dl -eq 0) {
+            if ($r.State -in @('Error', 'Timeout', 'Offline') -or $r.Color -in @('Error', 'Timeout')) {
+                $action = 'skip'
+                $reason = "in error/offline state ($($r.State)) - check required before installing"
+            } elseif ($dl -eq 0) {
                 $action = 'noop'
                 $reason = 'nothing downloaded to install'
             }

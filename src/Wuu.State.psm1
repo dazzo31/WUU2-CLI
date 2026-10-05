@@ -267,6 +267,7 @@ function New-WuuStateStore {
         })
         Status   = ''
         Revision = 0
+        ViewFilter = 'All'
     })
     # Worker-safe redraw signal. `Touch` is a SCRIPT METHOD on the store object, so it
     # resolves from an isolated worker runspace (which cannot see module functions).
