@@ -114,17 +114,19 @@ Assert-True ($why -like '*slow host*') 'and names the symptom an operator would 
 '=== 4. the predicate never throws, whatever it is handed ==='
 # It is driven from the release gate and from a status render, so it must survive any input.
 $threw = $false
-foreach ($input in @(0, 1, -1, 100, [int]::MaxValue)) {
-    try { $null = Test-PoolCompatibility -MaxConcurrentJobs $input } catch { $threw = $true }
+foreach ($testVal in @(0, 1, -1, 100, [int]::MaxValue)) {
+    try { $null = Test-PoolCompatibility -MaxConcurrentJobs $testVal } catch { $threw = $true }
 }
 Assert-False $threw 'no input made the predicate throw'
+
+Close-WuuWorkerPool
 
 ''
 if ($failures.Count -eq 0) {
     Write-Host "ALL PASSED" -ForegroundColor Green
-    exit 0
+    [System.Environment]::Exit(0)
 } else {
     Write-Host ("FAILURES: {0}" -f $failures.Count) -ForegroundColor Red
     $failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
-    exit 1
+    [System.Environment]::Exit(1)
 }
