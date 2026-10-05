@@ -40,7 +40,9 @@ try {
         if ((New-Object -ComObject 'Microsoft.Update.SystemInfo').RebootRequired) { $rebootRequired = $true }
     } catch { }
 
-    Write-WuuProgress @{ Phase = 'Done'; Result = 'Success'; Count = $numErrors; Total = $toInstall.Count; RebootRequired = $rebootRequired }
+    $resultStr = if ($numErrors -gt 0) { 'Failed' } else { 'Success' }
+    $errMsg = if ($numErrors -gt 0) { "$numErrors update(s) failed to install" } else { $null }
+    Write-WuuProgress @{ Phase = 'Done'; Result = $resultStr; Count = $numErrors; Total = $toInstall.Count; RebootRequired = $rebootRequired; ErrorMessage = $errMsg }
     exit $numErrors
 } catch {
     Write-WuuProgress @{ Phase = 'Done'; Result = 'Error'; ErrorMessage = $_.Exception.Message }

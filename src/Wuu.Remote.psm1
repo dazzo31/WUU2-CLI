@@ -472,8 +472,11 @@ function Invoke-WuuRemoteTask {
         if ($state -and $state.Result -eq 'Success') {
             return @{ Success = $true; Count = [int]$state.Count; Total = [int]$state.Total; RebootRequired = [bool]$state.RebootRequired; ExitCode = $exitCode; Error = $null }
         }
+        $errorCount = if ($state -and $state.Count) { [int]$state.Count } else { 0 }
+        $totalCount = if ($state -and $state.Total) { [int]$state.Total } else { 0 }
+        $rebootReq = if ($state -and $state.RebootRequired) { [bool]$state.RebootRequired } else { $false }
         $errorText = if ($state -and $state.ErrorMessage) { $state.ErrorMessage } else { "Remote $Operation task ended without a result (task result 0x{0:X})" -f $exitCode }
-        return @{ Success = $false; Count = 0; Total = 0; RebootRequired = $false; ExitCode = $exitCode; Error = $errorText }
+        return @{ Success = $false; Count = $errorCount; Total = $totalCount; RebootRequired = $rebootReq; ExitCode = $exitCode; Error = $errorText }
     } finally {
         if ($cim) {
             if ($registered) {

@@ -1801,14 +1801,21 @@ $InstallUpdates = {
             if ($stateStore) { $stateStore.Touch() }
         }
         $taskResult = & $InvokeRemoteTaskScript -ComputerName $Computer.computer -ScriptPath $ConfigPaths.InstallScript -Operation 'Install' -Credential $remoteCred -ProgressCallback $onProgress
-        if (-not $taskResult.Success) {
-            throw "Remote install failed: $($taskResult.Error)"
-        }
-        $installErrors = $taskResult.Count
-        $rebootRequired = $taskResult.RebootRequired
+        $installErrors = [int]$taskResult.Count
+        $rebootRequired = [bool]$taskResult.RebootRequired
+        $computer.InstallErrors = $installErrors
 
-        #Update status
-            $computer.InstallErrors = $installErrors
+        if (-not $taskResult.Success -or $installErrors -gt 0) {
+            $errDetail = if ($taskResult.Error) { $taskResult.Error } elseif ($installErrors -gt 0) { "$installErrors update(s) failed to install" } else { "Remote install reported failure" }
+            $computer.Status = "Install failed: $errDetail"
+            $computer.UpdatesStatus = 'Error'
+            $computer.State = 'Error'
+            $computer.Color = 'Error'
+            if ($rebootRequired) {
+                $computer.RebootRequired = $True
+            }
+        } else {
+            # Update status
             if ($rebootRequired -eq $True) {
                 $computer.Status = 'Install complete. Reboot required.'
                 $computer.State = 'RebootRequired'
@@ -1818,6 +1825,7 @@ $InstallUpdates = {
                 $computer.State = 'Complete'
                 $computer.RebootRequired = $False
             }
+        }
         if ($stateStore) { $stateStore.Touch() }
     }
     Catch{

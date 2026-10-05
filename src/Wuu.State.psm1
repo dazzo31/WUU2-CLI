@@ -1773,6 +1773,10 @@ function Get-WuuTargetOutcome {
 
     if ($null -eq $Row) { return 'Unknown' }
 
+    if ($Row.PSObject.Properties['InstallErrors'] -and [int]$Row.InstallErrors -gt 0) {
+        return 'Failed'
+    }
+
     $state = ''
     if ($Row.PSObject.Properties['State'] -and $Row.State) { $state = [string]$Row.State }
     $updatesStatus = ''
