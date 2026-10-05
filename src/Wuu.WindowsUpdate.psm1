@@ -833,18 +833,14 @@ function Start-UpdateCheckJob {
         # walked the visual tree for the row's container, neither of which exists now).
         if ($ctx.StateStore) {
             try {
-                $ComputerItem.Status = "Failed to initialize: $errorMessage"
-                $ComputerItem.UpdatesStatus = 'Error'
-                # APPROVED-STATE-EXCEPTION(submission-never-started). Failure reporting for a
-                # submission that never began, so there is no operation to attribute and no
-                # transition to gate. Routing it through the funnel would be REFUSED when the row
-                # is settled, and that refusal is correct - the terminal-state rule (invariant 8.4) outranks
-                # this metric. Do not "fix" this into a funnel call; an operator RESET needs its
-                # own specification (ResetOperation), not a widened transition rule.
-                $ComputerItem.State = 'Error'
-                # Errored entries render grey
-                $ComputerItem.Color = 'Error'
-                $ctx.StateStore.Touch()
+                # STATE-RESET-OP-01: Runspace creation failed before submission began.
+                # Uses the explicit ResetOperation contract to safely retire any operation context,
+                # record the failure, and set State='Error' without bypassing the funnel.
+                $resetCtx = New-WuuResetOperationContext -Source 'SubmissionFailure' `
+                    -Reason "Failed to initialize runspace: $errorMessage" -Actor 'System'
+                $null = Update-WuuOperationState -Row $ComputerItem -ResetOperation $resetCtx `
+                    -State 'Error' -Color 'Error' -UpdatesStatus 'Error' `
+                    -Status "Failed to initialize: $errorMessage" -Touch -Store $ctx.StateStore
             } catch {
                 Write-WarningLog "Failed to update row for $($ComputerItem.Computer): $($_.Exception.Message)"
             }
@@ -905,14 +901,15 @@ function Start-PendingUpdateCheck {
         if (Test-WuuComputerBusy -Row $item -IgnorePending) { continue }
         if (-not (Test-PhaseReady -Phase $item.Phase)) {
             if ($item.Status -notlike 'Waiting for previous phase*') {
-                $item.Status = "Waiting for previous phase to complete. Current phase: $($item.Phase)"
-                # APPROVED-STATE-EXCEPTION(phase-wait-bookkeeping). Display bookkeeping that holds
-                # the row out of the scheduler while its phase is blocked; it is not a transition
-                # and the row is not running. The funnel refuses a settled row by design (invariant 8.4),
-                # so routing this there would silently stop phase gating from re-queueing.
-                if ($item.PSObject.Properties['State']) { $item.State = 'Queued' }
-                # Was $uiHash.Listview.Items.Refresh() - the store's redraw signal replaces it.
-                $store.Touch()
+                # STATE-RESET-OP-01: Phase-wait bookkeeping parking a pending row while previous
+                # phase finishes. Uses ResetOperation to safely park in State='Queued' via funnel.
+                $resetCtx = New-WuuResetOperationContext -Source 'PhaseWaitBookkeeping' `
+                    -Reason "Waiting for previous phase to complete. Current phase: $($item.Phase)" `
+                    -Actor 'Scheduler'
+                $null = Update-WuuOperationState -Row $item -ResetOperation $resetCtx `
+                    -State 'Queued' -ColorFromState `
+                    -Status "Waiting for previous phase to complete. Current phase: $($item.Phase)" `
+                    -Touch -Store $store
             }
             continue
         }

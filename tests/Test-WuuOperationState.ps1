@@ -445,6 +445,73 @@ Assert-True ($guardCount -ge 10) "identity is consulted at multiple sites in Wuu
 $wupdGuard = ([regex]::Matches($wupdCode, 'rowOpId')).Count
 Assert-True ($wupdGuard -ge 2) "the injected worker writers consult row identity ($wupdGuard references)"
 
+'=== 12. ResetOperation contract (STATE-RESET-OP-01) ==='
+
+# 1. New-WuuResetOperationContext validation
+$roCtx = New-WuuResetOperationContext -Source 'SubmissionFailure' -Reason 'Init failed' -Actor 'Admin'
+Assert-True ($null -ne $roCtx) 'New-WuuResetOperationContext creates a context object'
+Assert-True ($roCtx.ResetOperationId -like 'reset-*') 'context generates a reset-* operation id'
+Assert-Equal $roCtx.Source 'SubmissionFailure' 'context records Source'
+Assert-Equal $roCtx.Reason 'Init failed' 'context records Reason'
+Assert-Equal $roCtx.Actor 'Admin' 'context records Actor'
+
+# 2. Invariant 8.4 remains strictly enforced against unattributed writes
+$rowTerm = New-TestRow 'TERMINAL-PC'
+$rowTerm.State = 'Complete'
+$legUnatt = Test-WuuStateTransitionAllowed -Row $rowTerm -ToState 'Queued'
+Assert-False $legUnatt.Allowed 'unattributed transition from Complete to Queued is refused (8.4 holds)'
+
+# 3. ResetOperation with invalid/empty reason is refused
+$legEmpty = Test-WuuStateTransitionAllowed -Row $rowTerm -ToState 'Queued' -ResetOperation @{ Source = 'PhaseWaitBookkeeping'; Reason = '' }
+Assert-False $legEmpty.Allowed 'ResetOperation with empty reason is refused'
+
+# 4. Source-restricted target states
+$legSubFail = Test-WuuStateTransitionAllowed -Row $rowTerm -ToState 'Error' -ResetOperation (New-WuuResetOperationContext -Source 'SubmissionFailure' -Reason 'Init failed')
+Assert-True $legSubFail.Allowed 'SubmissionFailure reset to Error is allowed'
+$legSubFailQueued = Test-WuuStateTransitionAllowed -Row $rowTerm -ToState 'Queued' -ResetOperation (New-WuuResetOperationContext -Source 'SubmissionFailure' -Reason 'Init failed')
+Assert-False $legSubFailQueued.Allowed 'SubmissionFailure reset to Queued is refused (source-restricted)'
+
+$legPhaseQueued = Test-WuuStateTransitionAllowed -Row $rowTerm -ToState 'Queued' -ResetOperation (New-WuuResetOperationContext -Source 'PhaseWaitBookkeeping' -Reason 'Waiting for Phase 1')
+Assert-True $legPhaseQueued.Allowed 'PhaseWaitBookkeeping reset to Queued is allowed'
+$legPhaseErr = Test-WuuStateTransitionAllowed -Row $rowTerm -ToState 'Error' -ResetOperation (New-WuuResetOperationContext -Source 'PhaseWaitBookkeeping' -Reason 'Waiting for Phase 1')
+Assert-False $legPhaseErr.Allowed 'PhaseWaitBookkeeping reset to Error is refused (source-restricted)'
+
+$legOpRun = Test-WuuStateTransitionAllowed -Row $rowTerm -ToState 'Running' -ResetOperation (New-WuuResetOperationContext -Source 'OperatorReset' -Reason 'Operator restart')
+Assert-False $legOpRun.Allowed 'OperatorReset directly to Running is refused'
+
+# 5. Funnel application: submission failure retiring in-flight context and setting State='Error'
+$rowInitFail = New-TestRow 'FAIL-INIT-PC'
+$null = Update-WuuOperationState -Row $rowInitFail -OperationIdNew 'op-old-init' -OpState 'Running' -Phase 'Check' -TimeoutSec 300
+$resFail = Update-WuuOperationState -Row $rowInitFail `
+    -ResetOperation (New-WuuResetOperationContext -Source 'SubmissionFailure' -Reason 'Runspace creation crashed') `
+    -State 'Error' -Color 'Error' -UpdatesStatus 'Error' -Status 'Failed to initialize'
+Assert-True $resFail.Applied 'ResetOperation to Error applied via funnel'
+Assert-Equal ([string]$rowInitFail.State) 'Error' 'row State is Error'
+Assert-Equal ([string]$rowInitFail.Color) 'Error' 'row Color is Error'
+Assert-Equal ([string]$rowInitFail.UpdatesStatus) 'Error' 'row UpdatesStatus is Error'
+Assert-Equal ([string]$rowInitFail.OpState) 'Idle' 'OpState is retired to Idle'
+Assert-Equal ([string]$rowInitFail.OperationId) '' 'OperationId is cleared'
+Assert-True ($null -eq $rowInitFail.TimeoutExpiresAt) 'TimeoutExpiresAt is cleared'
+Assert-Equal $rowInitFail.LastResetSource 'SubmissionFailure' 'LastResetSource recorded'
+
+# 6. Funnel application: settled row parked in Queued via PhaseWaitBookkeeping
+$rowPhasePark = New-TestRow 'PHASE-PARK-PC'
+$rowPhasePark.State = 'Complete'
+$rowPhasePark.Pending = $true
+$rowPhasePark.PendingOp = 'Download'
+$resPhase = Update-WuuOperationState -Row $rowPhasePark `
+    -ResetOperation (New-WuuResetOperationContext -Source 'PhaseWaitBookkeeping' -Reason 'Waiting for Phase 1') `
+    -State 'Queued' -ColorFromState -Status 'Waiting for previous phase to complete. Current phase: Phase 2'
+Assert-True $resPhase.Applied 'ResetOperation to Queued applied via funnel'
+Assert-Equal ([string]$rowPhasePark.State) 'Queued' 'row State is Queued'
+Assert-Equal ([string]$rowPhasePark.Color) 'Queued' 'row Color is Queued'
+Assert-Equal ([string]$rowPhasePark.PendingOp) 'Download' 'PendingOp is preserved'
+
+# 7. Late worker fencing: late worker carrying the retired OperationId is refused as stale
+$lateWrite = Update-WuuOperationState -Row $rowInitFail -OperationId 'op-old-init' -State 'Complete'
+Assert-False $lateWrite.Applied 'late worker write after reset is refused'
+Assert-True ($lateWrite.Reason -like '*stale*') 'refusal reason indicates staleness'
+
 ''
 if ($failures.Count -eq 0) {
     Write-Host "ALL PASSED" -ForegroundColor Green

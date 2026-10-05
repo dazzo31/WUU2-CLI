@@ -389,7 +389,7 @@ function Get-ApprovedRangeAZ {
     return $found
 }
 
-$unauthorisedCeilingAZ = 2
+$unauthorisedCeilingAZ = 0
 $statePropsAZ = @('State', 'OpState', 'OperationId', 'PendingOp', 'TimeoutExpiresAt')
 $approvedNamesAZ = @{
     'Wuu.Core.psm1'          = @('$DownloadUpdates', '$GetUpdates', '$InstallUpdates', '$RestartComputer',
@@ -464,6 +464,8 @@ if ($missingRangesAZ.Count -gt 0) {
 $exceptionSitesAZ = @($unauthorisedAZ | Where-Object { $_ -like 'Wuu.WindowsUpdate.psm1:*' })
 if ($unauthorisedAZ.Count -eq $unauthorisedCeilingAZ -and $exceptionSitesAZ.Count -ne $unauthorisedAZ.Count) {
     Fail "an unauthorised operation-state write appeared outside Wuu.WindowsUpdate ($($unauthorisedAZ -join ', ')) - the two known exceptions are both terminal-state writes in the submission/scheduler path (P0)"
+} elseif ($unauthorisedCeilingAZ -eq 0 -and $unauthorisedAZ.Count -eq 0) {
+    Pass 'zero unauthorised module-scope operation-state writes remain - all terminal resets route through ResetOperation (P0, SS8.4)'
 } elseif ($exceptionSitesAZ.Count -eq 2) {
     Pass 'the 2 remaining exceptions are the known terminal-state writes (settled -> Error, settled -> Queued), which the funnel must keep refusing (P0, SS8.4)'
 }

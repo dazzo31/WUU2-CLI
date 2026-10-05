@@ -306,17 +306,15 @@ If there is no compelling architectural reason, use the state API.
 > | `CoreWorkerPayload` | `$DownloadUpdates`, `$GetUpdates`, `$InstallUpdates`, `$RestartComputer`, `$RemoveOfflineComputer` | they execute in isolated worker runspaces |
 > | `WorkerCleanupPayload` | `Get-WuuJobCleanupPayload` (Wuu.Workers) | the injected copy of the funnel |
 >
-> Measured 2026-10-02: **2 unauthorised module-scope writes remain**, both terminal-state writes in the
-> submission/scheduler path (`settled -> Error` after a submission that never started; `settled ->
-> Queued` for phase-wait bookkeeping). A third - the scheduler clearing `PendingOp` - was converted to
-> `Update-WuuOperationState -ClearPendingOp`.
+> Hardened 2026-10-05 (STATE-RESET-OP-01): **0 unauthorised module-scope writes remain** (ceiling 0).
+> The two terminal-state writes in the submission/scheduler path (`settled -> Error` after a submission
+> that never started; `settled -> Queued` for phase-wait bookkeeping) have been safely routed through
+> `Update-WuuOperationState` via the explicit `ResetOperation` contract (`New-WuuResetOperationContext`).
 >
-> **Do NOT convert the remaining two.** The funnel correctly REFUSES `settled -> Error` and `settled ->
-> Queued`; that refusal is invariant 8.4 working. Converting them to funnel calls would trade the
-> terminal-state invariant for a metric, and would silently stop phase gating from re-queueing. An
-> operator RESET is a real future need but needs its own operation (`ResetOperation`) and its own
-> specification - who may reset, whether it is interactive-only, whether it audits, whether the
-> OperationId changes, what happens to late workers - not a widened transition rule.
+> Invariant 8.4 remains strictly enforced: unattributed writes from terminal states are refused.
+> `ResetOperation` provides an explicit, typed, attributed operation with source-restricted target states
+> (`SubmissionFailure` -> Error, `PhaseWaitBookkeeping` -> Queued, `OperatorReset`), fences late workers by
+> retiring in-flight operation context, and clears `LastResetOperationId` on adoption of a new operation.
 >
 > **Scope labels mislead - do not classify by "nearest enclosing function".** A payload defines its own
 > helpers inside itself (Core defines `Invoke-ServiceWithTimeout` inside `$GetUpdates`), so a write that

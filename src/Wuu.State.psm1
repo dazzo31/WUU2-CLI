@@ -198,6 +198,10 @@ function New-WuuComputerRow {
         # erase the difference between "checked and clean" and "never checked", which is the same
         # class of ambiguity this whole pass exists to remove.
         CheckConcluded  = $null
+        LastResetOperationId = ''
+        LastResetReason      = ''
+        LastResetSource      = ''
+        LastResetAt          = $null
         Revision        = 0
     }
 }
@@ -762,19 +766,58 @@ function Test-WuuTerminalState {
     }
 }
 
+function New-WuuResetOperationContext {
+    <#
+    .SYNOPSIS
+    Creates an explicit, attributed ResetOperation context (P0 Hardening, STATE-RESET-OP-01).
+    .DESCRIPTION
+    A reset is NOT a normal transition and NOT a widened rule: it is an explicit administrative or
+    scheduler operation that resets or retires a row's state (e.g. following a submission that failed
+    to initialize, or during multi-phase wait bookkeeping).
+
+    Carries mandatory Source, Reason, Actor, and a unique ResetOperationId.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('SubmissionFailure', 'PhaseWaitBookkeeping', 'OperatorReset')][string]$Source,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [Parameter(Mandatory=$false)][string]$Actor = 'System',
+        [Parameter(Mandatory=$false)][string]$ResetOperationId = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Reason)) {
+        throw 'ResetOperation requires a non-empty Reason.'
+    }
+    $effResetId = $ResetOperationId
+    if ([string]::IsNullOrEmpty($effResetId)) {
+        $effResetId = ('reset-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+    }
+
+    [pscustomobject]@{
+        ResetOperationId = $effResetId
+        Source           = $Source
+        Reason           = $Reason
+        Actor            = $Actor
+        ResetAt          = (Get-Date)
+    }
+}
+
 function Test-WuuStateTransitionAllowed {
     <#
     .SYNOPSIS Whether a display State change is legal for a row (invariant 8.4).
     .DESCRIPTION
     A terminal row may not change state without an attributed operation; a retry is a new operation and
     is allowed. Identity (staleness) is checked earlier, in Update-WuuOperationState.
+    An explicit ResetOperation contract permits targeted resets (SubmissionFailure -> Error,
+    PhaseWaitBookkeeping -> Queued, OperatorReset) while preserving invariant 8.4 against accidental rewrites.
     Returns @{ Allowed; Reason }.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$false)][AllowNull()]$Row,
         [Parameter(Mandatory)][string]$ToState,
-        [Parameter(Mandatory=$false)][AllowNull()][string]$OperationId = $null
+        [Parameter(Mandatory=$false)][AllowNull()][string]$OperationId = $null,
+        [Parameter(Mandatory=$false)][AllowNull()][object]$ResetOperation = $null
     )
 
     if ($null -eq $Row) { return @{ Allowed = $false; Reason = 'no row' } }
@@ -787,6 +830,43 @@ function Test-WuuStateTransitionAllowed {
     # The id is not matched against the row's: a resubmission is by definition a new id.
     $fromTerminal = Test-WuuTerminalState -State $fromState
     if ($fromTerminal.Terminal -and ($fromState -ne [string]$ToState)) {
+        if ($null -ne $ResetOperation) {
+            # STATE-RESET-OP-01: An explicit, attributed ResetOperation context authorizes targeted transitions
+            # from settled states, strictly restricted by source.
+            $rSource = if ($ResetOperation.PSObject.Properties['Source']) { [string]$ResetOperation.Source }
+                       elseif ($ResetOperation -is [System.Collections.IDictionary] -and $ResetOperation.Contains('Source')) { [string]$ResetOperation['Source'] }
+                       else { '' }
+            $rReason = if ($ResetOperation.PSObject.Properties['Reason']) { [string]$ResetOperation.Reason }
+                       elseif ($ResetOperation -is [System.Collections.IDictionary] -and $ResetOperation.Contains('Reason')) { [string]$ResetOperation['Reason'] }
+                       else { '' }
+
+            if ([string]::IsNullOrWhiteSpace($rSource) -or [string]::IsNullOrWhiteSpace($rReason)) {
+                return @{ Allowed = $false; Reason = "ResetOperation refused: Source and Reason must be non-empty (unattributed reset)" }
+            }
+
+            switch ($rSource) {
+                'SubmissionFailure' {
+                    if ($ToState -notin @('Error', 'Failed')) {
+                        return @{ Allowed = $false; Reason = "SubmissionFailure reset may only transition to 'Error' (got '$ToState')" }
+                    }
+                }
+                'PhaseWaitBookkeeping' {
+                    if ($ToState -ne 'Queued') {
+                        return @{ Allowed = $false; Reason = "PhaseWaitBookkeeping reset may only transition to 'Queued' (got '$ToState')" }
+                    }
+                }
+                'OperatorReset' {
+                    if ($ToState -in @('Running', 'Checking', 'Searching', 'Downloading', 'Installing', 'Verifying')) {
+                        return @{ Allowed = $false; Reason = "OperatorReset cannot transition directly to active running state '$ToState' without scheduling" }
+                    }
+                }
+                default {
+                    return @{ Allowed = $false; Reason = "Unknown ResetOperation source '$rSource'" }
+                }
+            }
+            return @{ Allowed = $true; Reason = '' }
+        }
+
         if ([string]::IsNullOrEmpty($OperationId)) {
             return @{ Allowed = $false; Reason = "a settled row ('$fromState') may not move to '$ToState' without a new attributed operation" }
         }
@@ -876,6 +956,7 @@ function Update-WuuOperationState {
         [Parameter(Mandatory=$false)][int]$TimeoutSec = 0,
         [Parameter(Mandatory=$false)][switch]$ClearOperation,
         [Parameter(Mandatory=$false)][switch]$ClearPendingOp,
+        [Parameter(Mandatory=$false)][AllowNull()][object]$ResetOperation = $null,
         [Parameter(Mandatory=$false)][switch]$Heartbeat,
         [Parameter(Mandatory=$false)][AllowNull()]$Runspace = $null,
         [Parameter(Mandatory=$false)][string]$UpdatesStatus = '',
@@ -892,6 +973,32 @@ function Update-WuuOperationState {
 
     if ($null -eq $Row) { return (& $refused 'no row') }
 
+    $resetCtx = $null
+    if ($null -ne $ResetOperation) {
+        if ($ResetOperation -is [System.Collections.IDictionary]) {
+            $rSrc = if ($ResetOperation.Contains('Source')) { [string]$ResetOperation['Source'] } else { 'OperatorReset' }
+            $rRsn = if ($ResetOperation.Contains('Reason')) { [string]$ResetOperation['Reason'] } else { '' }
+            $rAct = if ($ResetOperation.Contains('Actor')) { [string]$ResetOperation['Actor'] } else { 'System' }
+            $rId  = if ($ResetOperation.Contains('ResetOperationId')) { [string]$ResetOperation['ResetOperationId'] } else { '' }
+            if ([string]::IsNullOrWhiteSpace($rRsn)) {
+                return (& $refused 'ResetOperation requires an attributed context with non-empty Reason')
+            }
+            $resetCtx = New-WuuResetOperationContext -Source $rSrc -Reason $rRsn -Actor $rAct -ResetOperationId $rId
+        } elseif ($ResetOperation.PSObject.Properties['ResetOperationId'] -and $ResetOperation.PSObject.Properties['Source']) {
+            if ([string]::IsNullOrWhiteSpace($ResetOperation.Reason)) {
+                return (& $refused 'ResetOperation requires an attributed context with non-empty Reason')
+            }
+            $resetCtx = $ResetOperation
+        } elseif ($ResetOperation -is [string]) {
+            if ([string]::IsNullOrWhiteSpace($ResetOperation)) {
+                return (& $refused 'ResetOperation requires an attributed context with non-empty Reason')
+            }
+            $resetCtx = New-WuuResetOperationContext -Source 'OperatorReset' -Reason $ResetOperation -Actor 'System'
+        } else {
+            return (& $refused 'ResetOperation requires a valid context object, hashtable, or non-empty reason string')
+        }
+    }
+
     # --- 1. IDENTITY, first ----------------------------------------------------------------
     # Test-WuuStaleWrite, not Test-WuuOperationCurrent: a WRITE is refused only when it is PROVEN
     # stale. An unattributed write is permitted, or list loading would be discarded.
@@ -906,10 +1013,15 @@ function Update-WuuOperationState {
     if ($Row.PSObject.Properties['OperationId']) { $rowOpId = [string]$Row.OperationId }
     $rowIsRunning = ($Row.PSObject.Properties['OpState'] -and ([string]$Row.OpState -eq 'Running'))
 
-    if ($OperationIdNew) {
+    if ($resetCtx) {
+        # STATE-RESET-OP-01: ResetOperation is an administrative/orchestrator reset of the row. It
+        # supersedes any in-flight operation and fences late workers by retiring the OperationId.
+    } elseif ($OperationIdNew) {
         if ($rowIsRunning -and $rowOpId -ne '' -and $rowOpId -cne $OperationIdNew) {
             return (& $refused "cannot adopt '$OperationIdNew': the row is Running under '$rowOpId'")
         }
+    } elseif ($Row.PSObject.Properties['LastResetOperationId'] -and $Row.LastResetOperationId -and $OperationId) {
+        return (& $refused "stale writer: operation was reset ($($Row.LastResetSource): $($Row.LastResetReason)), writer '$OperationId' is stale")
     } elseif (Test-WuuStaleWrite -Row $Row -OperationId $OperationId) {
         return (& $refused "stale writer: row belongs to operation '$rowOpId', writer is '$OperationId'")
     }
@@ -925,7 +1037,7 @@ function Update-WuuOperationState {
     # Only consulted when a display State is being set; a pure bookkeeping write (deadline,
     # heartbeat) is not a transition and must not be gated by the settled rule.
     if ($State) {
-        $legality = Test-WuuStateTransitionAllowed -Row $Row -ToState $State -OperationId $OperationId
+        $legality = Test-WuuStateTransitionAllowed -Row $Row -ToState $State -OperationId $OperationId -ResetOperation $resetCtx
         if (-not $legality.Allowed) { return (& $refused $legality.Reason) }
     }
 
@@ -947,7 +1059,33 @@ function Update-WuuOperationState {
         return $false
     }
 
-    if ($OperationIdNew) { & $set 'OperationId' $OperationIdNew }
+    if ($resetCtx) {
+        # STATE-RESET-OP-01: Fencing and retiring previous operation context.
+        & $set 'OperationId' ''
+        & $set 'OpState' 'Idle'
+        & $set 'OpStartedAt' $null
+        & $set 'TimeoutExpiresAt' $null
+        & $set 'TimeoutSource' ''
+        & $set 'OpName' ''
+        & $set 'LastHeartbeatAt' $null
+        if ($Row.PSObject.Properties['Runspace'] -and $Row.Runspace) {
+            try { $Row.Runspace.Close() } catch { }
+            try { $Row.Runspace.Dispose() } catch { }
+            & $set 'Runspace' $null
+        }
+        if ($Row.PSObject.Properties['LastResetOperationId']) { $Row.LastResetOperationId = $resetCtx.ResetOperationId }
+        if ($Row.PSObject.Properties['LastResetReason'])      { $Row.LastResetReason = $resetCtx.Reason }
+        if ($Row.PSObject.Properties['LastResetSource'])      { $Row.LastResetSource = $resetCtx.Source }
+        if ($Row.PSObject.Properties['LastResetAt'])          { $Row.LastResetAt = $resetCtx.ResetAt }
+    }
+
+    if ($OperationIdNew) {
+        & $set 'OperationId' $OperationIdNew
+        & $set 'LastResetOperationId' ''
+        & $set 'LastResetReason' ''
+        & $set 'LastResetSource' ''
+        & $set 'LastResetAt' $null
+    }
 
     if ($effState) {
         & $set 'State' $effState
@@ -2118,4 +2256,5 @@ Export-ModuleMember -Function @(
     'Get-WuuOperationRemainingSeconds'
     'Get-WuuEffectiveInnerTimeout'
     'New-WuuOperatorContext'
+    'New-WuuResetOperationContext'
 )
