@@ -36,6 +36,7 @@ $cases = @(
     @{ Args = @('phase', '-Set', '3', '-Computer', 'X'); Verb = 'phase';      Sub = $null;       Opt = @{ Set = '3'; Computer = 'X' } }
     @{ Args = @('install', '-WhatIf');                   Verb = 'install';    Sub = $null;       Opt = @{ WhatIf = $true } }
     @{ Args = @('service', 'restart');                   Verb = 'service';    Sub = 'restart';   Opt = @{} }
+    @{ Args = @('audit', 'verify', '-AnchorPath', 'C:\anchors\a.json'); Verb = 'audit'; Sub = 'verify'; Opt = @{ AnchorPath = 'C:\anchors\a.json' } }
 )
 foreach ($c in $cases) {
     $r = ConvertTo-WuuCommandLine -Arguments $c.Args

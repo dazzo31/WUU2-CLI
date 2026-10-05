@@ -107,8 +107,12 @@ likewise detectable for interior records, but **not** for:
 - a trailing run of records at the end of a file (see §8.3 of the mapping document);
 - an entire day's file, since daily chains are independent.
 
-Both gaps are closed only by the non-repudiation anchor described in
-`ISO_27001_A815_MAPPING.md` §8.1, which is designed but not yet implemented.
+These gaps are mitigated by external anchoring (SS26): `wuu audit anchor` writes a chain-head
+anchor file, and `wuu audit anchor -EventLog` mirrors the head into the Windows Event Log. Both
+are implemented and reachable from the command surface; `wuu audit verify` compares the chain
+against the anchor and reports a rebuilt or truncated log as `REWRITTEN`. The residual risk —
+deleting the log, the anchor file, *and* the event log together — remains, and the anchor
+artifacts state that boundary in their own `Claim` field. See `ISO_27001_A815_MAPPING.md` §8.1.
 
 ---
 

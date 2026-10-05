@@ -112,6 +112,14 @@ $swapLog = New-RealLog -Directory $swapDir -Messages @('a', 'b', 'c', 'd')
 $swapVerdict = Test-WuuAuditAnchor -LogPath $swapLog -AnchorPath $anchorPath
 Assert-True $swapVerdict.Rewritten 'a SAME-LENGTH replacement is reported as rewritten (not missed by a length check)'
 
+'=== 4b. the COMMAND surface reports an anchored rewrite as a FAILURE (CLI-AUDIT-VERIFY-01) ==='
+# The forged log verifies clean on its own terms; only the anchor sees the rewrite. `wuu audit verify`
+# must propagate that into Ok/Result rather than reporting Success because the chain is internally valid.
+$cmdVerify = Invoke-WuuAuditCommand -SubVerb 'verify' -LogPath $forgedLog -AnchorPath $anchorPath
+Assert-False $cmdVerify.Ok 'verify returns Ok=$false when the external anchor detects a rewrite'
+Assert-Equal $cmdVerify.Result 'AuditFailure' 'verify classifies an anchored rewrite as AuditFailure'
+Assert-True $cmdVerify.AnchorRewritten 'verify reports the anchor finding (AnchorRewritten)'
+
 '=== 5. an anchor in the log''s own directory is REFUSED ==='
 # Separation IS the control: an anchor beside the log is written by the same access path as the log, so it
 # proves nothing and would create a false sense of external anchoring.
@@ -193,6 +201,31 @@ if (-not (Get-Command Write-WuuAuditEventLogAnchor -ErrorAction SilentlyContinue
         }
     }
 }
+
+'=== 7b. the Event Log anchor is COMPARED during verification, and is best-effort (AUDIT-EVENTLOG-VERIFY-01) ==='
+# The shared comparison core powers BOTH sinks, so assert it directly: a rebuilt chain must be a rewrite.
+$dataVerdict = Test-WuuAuditAnchorData -LogPath $forgedLog -AnchoredSeq $anchor.Seq -AnchoredHash $anchor.Hash
+Assert-True $dataVerdict.Rewritten 'the shared anchor-data comparison detects a rebuilt chain'
+Assert-True (Test-WuuAuditAnchorData -LogPath $logPath -AnchoredSeq $anchor.Seq -AnchoredHash $anchor.Hash).Consistent 'and reports an intact/appendable log as consistent'
+
+# The Event Log verification is best-effort: absent mirroring must report unavailable, never throw and
+# never turn a clean chain into a failure.
+$evtUnavailable = $null
+$evtThrew = $false
+try {
+    $evtUnavailable = Test-WuuAuditEventLogAnchor -LogPath $logPath -Source 'WUU2-NoSuchSource-ForVerify'
+} catch { $evtThrew = $true }
+Assert-False $evtThrew 'Event Log verification never throws when the mirror is absent'
+if (-not $evtThrew) {
+    Assert-False $evtUnavailable.EventLogAvailable 'an absent Event Log anchor reports EventLogAvailable=$false'
+    Assert-False $evtUnavailable.Rewritten 'and is NOT reported as a rewrite'
+    Assert-True ([bool]$evtUnavailable.Reason) "and says why ($($evtUnavailable.Reason))"
+}
+
+# A verify run WITHOUT -EventLog must not query the mirror (opt-in, so default behaviour is unchanged).
+$noEvt = Invoke-WuuAuditCommand -SubVerb 'verify' -LogPath $logPath -AnchorPath $anchorPath
+Assert-True $noEvt.Ok 'a clean chain with a matching file anchor verifies Ok'
+Assert-Equal $noEvt.Result 'Success' 'and classifies as Success'
 
 try { Remove-Item $base -Recurse -Force -ErrorAction SilentlyContinue } catch { }
 

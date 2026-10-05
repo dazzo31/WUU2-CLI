@@ -99,31 +99,13 @@ function Invoke-WuuAuditCommand {
         'verify' {
             Write-Host ("  Verifying {0}" -f $resolvedLog) -ForegroundColor Gray
             $v = Test-WuuAuditChain -LogPath $resolvedLog -Quiet
-            if ($Json) {
-                # SS34: ONE renderer, so this shape is versioned like every other command's. WRITTEN TO THE
-                # HOST rather than emitted, because emitting it made this function return TWO objects -
-                # the JSON string and the result below - and a caller doing `... | ConvertFrom-Json`
-                # then receives an array of two unrelated values.
-                Write-Host (Format-WuuJsonDocument -Command 'audit verify' -Fields ([ordered]@{
-                            LogPath = $resolvedLog; Ok = $v.Ok; Checked = $v.Checked
-                            FirstBreak = $v.FirstBreak; Problems = @($v.Problems)
-                        }))
-            } elseif ($v.Ok) {
-                Write-Host ("  Chain intact: {0} record(s) verified." -f $v.Checked) -ForegroundColor Green
-            } else {
-                Write-Host ("  CHAIN BROKEN at line {0} of {1}:" -f $v.FirstBreak, $v.Checked) -ForegroundColor Red
-                foreach ($p in $v.Problems) { Write-Host "    $p" -ForegroundColor Red }
-            }
             # A broken chain is an audit-integrity failure, not an operation failure (SS10): it has
             # its own exit code so CI can tell "the trail is tampered with" from "the work failed".
-            # The old code set $script:CommandExitCode here, which is THIS module's script scope -
-            # not the caller's - so the value never reached the exit path. Classification travels on
-            # the result object instead, which crosses the scope boundary correctly.
             #
-            # Look for the anchor the `anchor` subverb would have written for THIS log. `Join-Path`
-            # THROWS on a null base, and $global:AuditAnchorDirectory only exists once startup has run
-            # ($WuuRoot is not in scope for a module loaded alone, e.g. by a test) - so the directory is
-            # resolved defensively and an absent setting means "no anchor to look for", not a crash.
+            # Resolve the external anchor BEFORE any output so the anchor verdict is part of the
+            # unified outcome (CLI-AUDIT-VERIFY-01). A REWRITTEN chain verifies clean on its own terms
+            # ($v.Ok stays $true) - only the anchor comparison can see the rebuild, so it must feed the
+            # same Ok/Result that the JSON and the exit code read.
             $anchorVerdict = $null
             $anchorDirResolved = $global:AuditAnchorDirectory
             if (-not $anchorDirResolved) { $anchorDirResolved = Join-Path $env:ProgramData 'WUU2\anchors' }
@@ -134,7 +116,40 @@ function Invoke-WuuAuditCommand {
             if ($anchorFileToCompare) {
                 $anchorVerdict = Test-WuuAuditAnchor -LogPath $resolvedLog -AnchorPath $anchorFileToCompare
             }
-            if (-not $Json -and $v.Ok -and $anchorVerdict) {
+            # AUDIT-EVENTLOG-VERIFY-01: when asked, also compare against the Event Log mirror - the sink
+            # an unprivileged operator cannot rewrite and the reason SS26 names it. Opt-in (mirroring
+            # needs a one-time elevated source registration), and best-effort: absence is reported, not thrown.
+            $eventLogVerdict = $null
+            if ($EventLog) {
+                $eventLogVerdict = Test-WuuAuditEventLogAnchor -LogPath $resolvedLog
+            }
+            $hasRewrite = ($null -ne $anchorVerdict -and $anchorVerdict.Rewritten)
+            $hasEvtRewrite = ($null -ne $eventLogVerdict -and $eventLogVerdict.Rewritten)
+            $overallOk = ($v.Ok -and (-not $hasRewrite) -and (-not $hasEvtRewrite))
+            $overallResult = if ($overallOk) { 'Success' } else { 'AuditFailure' }
+
+            if ($Json) {
+                # SS34: ONE renderer, so this shape is versioned like every other command's. WRITTEN TO THE
+                # HOST rather than emitted, because emitting it made this function return TWO objects -
+                # the JSON string and the result below - and a caller doing `... | ConvertFrom-Json`
+                # then receives an array of two unrelated values.
+                Write-Host (Format-WuuJsonDocument -Command 'audit verify' -Fields ([ordered]@{
+                            LogPath = $resolvedLog; Ok = $overallOk; Checked = $v.Checked
+                            FirstBreak = $v.FirstBreak; Problems = @($v.Problems)
+                            AnchorConsistent = $(if ($anchorVerdict) { [bool]$anchorVerdict.Consistent } else { $false })
+                            AnchorRewritten = $(if ($anchorVerdict) { [bool]$anchorVerdict.Rewritten } else { $false })
+                            AnchorReason = $(if ($anchorVerdict) { [string]$anchorVerdict.Reason } else { '' })
+                            EventLogAvailable = $(if ($eventLogVerdict) { [bool]$eventLogVerdict.EventLogAvailable } else { $false })
+                            EventLogRewritten = $(if ($eventLogVerdict) { [bool]$eventLogVerdict.Rewritten } else { $false })
+                            EventLogReason = $(if ($eventLogVerdict) { [string]$eventLogVerdict.Reason } else { '' })
+                        }))
+            } elseif ($v.Ok) {
+                Write-Host ("  Chain intact: {0} record(s) verified." -f $v.Checked) -ForegroundColor Green
+            } else {
+                Write-Host ("  CHAIN BROKEN at line {0} of {1}:" -f $v.FirstBreak, $v.Checked) -ForegroundColor Red
+                foreach ($p in $v.Problems) { Write-Host "    $p" -ForegroundColor Red }
+            }
+            if (-not $Json -and $anchorVerdict) {
                 if ($anchorVerdict.Consistent) {
                     Write-Host ("  External anchor: consistent ({0})" -f $anchorVerdict.Reason) -ForegroundColor Green
                 } elseif ($anchorVerdict.Rewritten) {
@@ -143,7 +158,16 @@ function Invoke-WuuAuditCommand {
                     Write-Host ("  External anchor: unavailable - {0}" -f $anchorVerdict.Reason) -ForegroundColor DarkYellow
                 }
             }
-            return [pscustomobject]@{ Ok = $v.Ok; Verb = 'audit'; SubVerb = $SubVerb; Checked = $v.Checked; FirstBreak = $v.FirstBreak; AnchorConsistent = $anchorVerdict.Consistent; AnchorRewritten = $anchorVerdict.Rewritten; AnchorReason = $anchorVerdict.Reason; Result = $(if ($v.Ok) { 'Success' } else { 'AuditFailure' }) }
+            if (-not $Json -and $eventLogVerdict) {
+                if ($eventLogVerdict.Rewritten) {
+                    Write-Host ("  Event Log anchor: REWRITTEN - {0}" -f $eventLogVerdict.Reason) -ForegroundColor Red
+                } elseif ($eventLogVerdict.Consistent) {
+                    Write-Host ("  Event Log anchor: consistent ({0})" -f $eventLogVerdict.Reason) -ForegroundColor Green
+                } else {
+                    Write-Host ("  Event Log anchor: unavailable - {0}" -f $eventLogVerdict.Reason) -ForegroundColor DarkYellow
+                }
+            }
+            return [pscustomobject]@{ Ok = $overallOk; Verb = 'audit'; SubVerb = $SubVerb; Checked = $v.Checked; FirstBreak = $v.FirstBreak; AnchorConsistent = $(if ($anchorVerdict) { [bool]$anchorVerdict.Consistent } else { $false }); AnchorRewritten = $(if ($anchorVerdict) { [bool]$anchorVerdict.Rewritten } else { $false }); AnchorReason = $(if ($anchorVerdict) { [string]$anchorVerdict.Reason } else { '' }); EventLogRewritten = $(if ($eventLogVerdict) { [bool]$eventLogVerdict.Rewritten } else { $false }); Result = $overallResult }
         }
         'show' {
             $recs = @(Get-Content -LiteralPath $resolvedLog | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
@@ -180,8 +204,21 @@ function Invoke-WuuAuditCommand {
             New-Item -ItemType Directory -Path $staging -Force | Out-Null
             Copy-Item -LiteralPath $resolvedLog -Destination $staging -Force
             $dirOfLog = Split-Path $resolvedLog -Parent
-            foreach ($t in @(Get-ChildItem -LiteralPath $dirOfLog -Filter 'transcript-*.log' -File -ErrorAction SilentlyContinue)) {
+            # Only transcripts from THIS log's day travel with it, so the bundle is the day's evidence
+            # rather than every session ever recorded. Transcript names are transcript-<yyyyMMdd>_*.
+            $logName = [System.IO.Path]::GetFileNameWithoutExtension($resolvedLog)
+            $dateStamp = $logName -replace '^audit-', ''
+            foreach ($t in @(Get-ChildItem -LiteralPath $dirOfLog -Filter ("transcript-{0}*.log" -f $dateStamp) -File -ErrorAction SilentlyContinue)) {
                 Copy-Item -LiteralPath $t.FullName -Destination $staging -Force
+            }
+            # Include the matching external anchor, if one was taken, so the bundle is independently
+            # verifiable away from the log host. The anchor names the log it describes; a missing anchor
+            # is reported in the manifest, not invented.
+            $anchorDirResolved = $global:AuditAnchorDirectory
+            if (-not $anchorDirResolved) { $anchorDirResolved = Join-Path $env:ProgramData 'WUU2\anchors' }
+            $anchorFile = Join-Path $anchorDirResolved ($logName + '.anchor.json')
+            if (Test-Path -LiteralPath $anchorFile) {
+                Copy-Item -LiteralPath $anchorFile -Destination $staging -Force
             }
             # Copy the compliance documentation alongside the evidence. An auditor receiving a
             # bundle needs the control mapping and the retention policy: without them the zip is
@@ -193,6 +230,23 @@ function Invoke-WuuAuditCommand {
                     Copy-Item -LiteralPath $docPath -Destination $staging -Force
                 }
             }
+            # Evidence manifest: hashes every artefact so the recipient can verify the bundle without
+            # trusting the transport. Written BEFORE compression so it is inside the zip; it hashes the
+            # other entries, never itself.
+            $manifestFiles = @()
+            foreach ($f in @(Get-ChildItem -LiteralPath $staging -File | Where-Object { $_.Name -ne 'evidence-manifest.json' })) {
+                $h = Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256
+                $manifestFiles += [ordered]@{ Name = $f.Name; Sha256 = $h.Hash; SizeBytes = $f.Length }
+            }
+            $manifest = [ordered]@{
+                Schema      = 'wuu.audit.export.manifest.v1'
+                ExportedUtc = (Get-Date).ToUniversalTime().ToString('o')
+                LogPath     = $resolvedLog
+                HasAnchor   = [bool](Test-Path -LiteralPath $anchorFile)
+                Files       = @($manifestFiles)
+            }
+            $manifestJson = Format-WuuJsonDocument -Command 'audit export' -Fields $manifest -Depth 6
+            [System.IO.File]::WriteAllText((Join-Path $staging 'evidence-manifest.json'), $manifestJson, (New-Object System.Text.UTF8Encoding($false)))
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             if (Test-Path -LiteralPath $outPath) { Remove-Item -LiteralPath $outPath -Force }
             [IO.Compression.ZipFile]::CreateFromDirectory($staging, $outPath)
@@ -210,8 +264,12 @@ function Invoke-WuuAuditCommand {
             }
             Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host ("  Exported audit bundle: {0} ({1} entries)" -f $outPath, $entryCount) -ForegroundColor Green
-            Write-Host '  NOTE: the bundle carries the hash chain but NO external anchor, so it is' -ForegroundColor DarkGray
-            Write-Host '        tamper-EVIDENT, not non-repudiable. See docs/ISO_27001_A815_MAPPING.md 8.' -ForegroundColor DarkGray
+            if (Test-Path -LiteralPath $anchorFile) {
+                Write-Host '  Includes the external anchor and an evidence-manifest.json.' -ForegroundColor Green
+            } else {
+                Write-Host '  NOTE: no external anchor was found, so the bundle is tamper-EVIDENT,' -ForegroundColor DarkGray
+                Write-Host '        not non-repudiable. See docs/ISO_27001_A815_MAPPING.md 8.' -ForegroundColor DarkGray
+            }
             return [pscustomobject]@{ Ok = $true; Verb = 'audit'; SubVerb = $SubVerb; Path = $outPath; Entries = $entryCount; Result = 'Success' }
         }
         'anchor' {
@@ -879,6 +937,8 @@ function Invoke-WuuCommand {
         # destination for export). One parameter serves both because it means the same thing in both
         # cases: "this is the audit file, not the default one".
         [string]$LogPath,
+        # verify: compare against an anchor held at THIS path rather than the default location.
+        [string]$AnchorPath = '',
         # Required for mutating verbs once audit is active (Phase 4): records WHY the change was
         # made. Interactive mode prompts; non-interactive mode fails without it.
         [string]$Reason = '',
@@ -1118,6 +1178,7 @@ function ConvertTo-WuuCommandLine {
         '-computer' = 'Computer'; '-all' = 'All'; '-json' = 'Json'; '-whatif' = 'WhatIf'
         '-path' = 'Path'; '-column' = 'Column'; '-set' = 'Set'; '-help' = 'Help'
         '-reason' = 'Reason'; '-logpath' = 'LogPath'
+        '-anchorpath' = 'AnchorPath'
         '-eventlog' = 'EventLog'
         # SS: names which of the lists in the encrypted config file to save into or load from.
         # Omitted, a save uses the default name and a load prefers the default-named list.
@@ -1158,7 +1219,7 @@ function ConvertTo-WuuCommandLine {
             # error and no hint that the argument was ignored. Pre-existing, found while adding the
             # report options to this same list - the gate asserted that -LogPath is REGISTERED, which
             # it was, and never that it consumes a value.
-            if ($name -in @('Computer', 'Path', 'Column', 'Set', 'Reason', 'LogPath', 'Period', 'GroupBy', 'From', 'To', 'Out', 'Dataset', 'ListName')) {
+            if ($name -in @('Computer', 'Path', 'Column', 'Set', 'Reason', 'LogPath', 'AnchorPath', 'Period', 'GroupBy', 'From', 'To', 'Out', 'Dataset', 'ListName')) {
                 if ($i + 1 -ge $Arguments.Count) { [void]$result.Unknown.Add("$a (missing value)"); $i++; continue }
                 $result.Options[$name] = $Arguments[$i + 1]; $i += 2; continue
             }

@@ -390,6 +390,41 @@ try { Stop-WuuAuditTranscript -Session $s7 } catch { $threwNoStart = $true }
 if ($threwNoStart) { Fail 'Stop on a session with no transcript threw' }
 else { Pass 'Stop on a session with no transcript is a no-op' }
 
+# ---------------------------------------------------------------------------------------
+# 12. audit export carries an evidence manifest (IMPROVEMENTS-EXPORT-DOCS-01)
+# ---------------------------------------------------------------------------------------
+# A bundle handed to an auditor must be independently checkable: it says which files it contains
+# and what each hashes to, so the recipient can verify the transport without trusting it.
+$exportBase = Join-Path $tmp 'handoff'
+$exported = Invoke-WuuAuditCommand -SubVerb 'export' -LogPath $s5.LogPath -Path $exportBase
+if (-not $exported.Ok) { Fail "audit export failed: $($exported.Error)" }
+else {
+    $zipPath = "$exportBase.export.zip"
+    if (-not (Test-Path -LiteralPath $zipPath)) { Fail 'export did not produce a bundle' }
+    else {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zr = [IO.Compression.ZipFile]::OpenRead($zipPath)
+        try {
+            $names = @($zr.Entries | ForEach-Object { $_.FullName })
+            if ($names -notcontains 'evidence-manifest.json') { Fail 'export bundle is missing evidence-manifest.json' }
+            else { Pass 'export bundle carries evidence-manifest.json' }
+            $manifestEntry = $zr.Entries | Where-Object { $_.FullName -eq 'evidence-manifest.json' }
+            $sr = New-Object System.IO.StreamReader($manifestEntry.Open())
+            try { $manifest = $sr.ReadToEnd() | ConvertFrom-Json } finally { $sr.Dispose() }
+            if ($manifest.Schema -ne 'wuu.audit.export.manifest.v1') { Fail "manifest schema is '$($manifest.Schema)'" }
+            else { Pass 'manifest declares its schema' }
+            $logName = [System.IO.Path]::GetFileName($s5.LogPath)
+            $logEntry = @($manifest.Files | Where-Object { $_.Name -eq $logName })
+            if ($logEntry.Count -ne 1) { Fail "manifest does not list the exported log ($logName)" }
+            elseif (-not $logEntry[0].Sha256) { Fail 'manifest lists the log without a SHA-256' }
+            else { Pass 'manifest lists the log with a SHA-256' }
+            # The manifest must not list itself - self-hashing is circular.
+            if (@($manifest.Files | Where-Object { $_.Name -eq 'evidence-manifest.json' }).Count -gt 0) { Fail 'manifest hashes itself (circular)' }
+            else { Pass 'manifest excludes itself from its own hash table' }
+        } finally { $zr.Dispose() }
+    }
+}
+
 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 if ($fail) { Write-Host 'SOME CHECKS FAILED' -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS' -ForegroundColor Cyan }

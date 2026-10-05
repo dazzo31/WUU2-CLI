@@ -703,77 +703,40 @@ function New-WuuAuditAnchor {
     return $result
 }
 
-function Test-WuuAuditAnchor {
+function Test-WuuAuditAnchorData {
     <#
     .SYNOPSIS
-    Compares an anchor against the chain as it stands now (reviewer P3).
+    Compares an anchored (seq, hash) pair against a log, wherever the anchor came from (P3/AUDIT-EVENTLOG-VERIFY-01).
     .DESCRIPTION
-    THE COMPARISON THE ANCHOR EXISTS FOR. It answers one question: is the hash the anchor recorded still
-    ON the chain the log presents? Three outcomes, and the distinction between them is the whole value:
+    ONE comparison, shared by the file anchor and the Event Log mirror. A second copy would let the two
+    sinks disagree about what "rewritten" means, which is how one control silently becomes two.
 
-      Consistent  the anchored head is the current head, or the current head's chain reaches back to it
-                  intact. Nothing before the anchor point has changed.
-      Rewritten   the chain no longer contains the anchored hash at the anchored sequence number. THIS IS
-                  THE FINDING: the log was rebuilt after the anchor was taken, and a rebuilt log verifies
-                  cleanly on its own terms, so no amount of chain verification would have found it.
-      Unavailable the anchor is missing, unreadable, or does not cover this log.
-
-    Deliberately does NOT re-verify the whole log - that is Test-WuuAuditChain's job, and doing both here
-    would conflate two findings: "the chain is broken" and "the chain was rebuilt". A rewritten chain is
-    perfectly valid arithmetic; that is exactly why it needs an external comparison to detect.
-
-    A TRUNCATION is reported as Rewritten, not as a special case: a log whose head moved BACKWARD lost
-    records, and "the log no longer contains what it did" is the finding regardless of direction. An
-    anchor whose Seq exceeds the current head's Seq is the clearest form of it, and gets its own message.
-
-    Never throws: this is called from a release gate and a status command, and neither may fail because
-    the anchor is a day old or was written by a different host.
+    Returns a hashtable with the same fields the callers render: Available, Consistent, Rewritten,
+    AnchoredSeq, AnchoredHash, CurrentSeq, CurrentHash, Reason. Never throws.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$LogPath,
-        [Parameter(Mandatory)][string]$AnchorPath
+        [Parameter(Mandatory)][int]$AnchoredSeq,
+        [Parameter(Mandatory = $false)][AllowEmptyString()][string]$AnchoredHash = ''
     )
 
     $verdict = @{
         Available = $false; Consistent = $false; Rewritten = $false
-        AnchoredSeq = 0; AnchoredHash = ''; CurrentSeq = 0; CurrentHash = ''
+        AnchoredSeq = $AnchoredSeq; AnchoredHash = $AnchoredHash; CurrentSeq = 0; CurrentHash = ''
         Reason = ''
     }
 
-    if (-not (Test-Path -LiteralPath $AnchorPath)) {
-        $verdict.Reason = "no anchor at $AnchorPath - nothing to compare against, so a rewritten log would be undetectable"
-        return $verdict
-    }
     if (-not (Test-Path -LiteralPath $LogPath)) {
         $verdict.Reason = "log file not found: $LogPath"
         return $verdict
     }
-
-    try {
-        $anchorRaw = Get-Content -LiteralPath $AnchorPath -Raw
-        $anchor = $anchorRaw | ConvertFrom-Json
-    } catch {
-        $verdict.Reason = "anchor could not be read: $($_.Exception.Message)"
-        return $verdict
-    }
-
-    if (-not $anchor.PSObject.Properties['HeadHash'] -or -not $anchor.PSObject.Properties['Seq']) {
-        $verdict.Reason = 'anchor is malformed (no HeadHash/Seq) - it cannot be compared'
+    if ($AnchoredSeq -le 0 -or -not $AnchoredHash) {
+        $verdict.Reason = 'anchor records no records yet (seq 0) - nothing was anchored to compare'
         return $verdict
     }
 
     $verdict.Available = $true
-    $verdict.AnchoredSeq = [int]$anchor.Seq
-    $verdict.AnchoredHash = [string]$anchor.HeadHash
-
-    # An anchor with no sequence number records nothing yet; treat as unavailable rather than as a break.
-    if ($verdict.AnchoredSeq -le 0 -or -not $verdict.AnchoredHash) {
-        $verdict.Reason = 'anchor records no records yet (seq 0) - nothing was anchored to compare'
-        $verdict.Available = $false
-        return $verdict
-    }
-
     try {
         $head = Get-WuuAuditChainHead -LogPath $LogPath
         $verdict.CurrentSeq = [int]$head.Seq
@@ -815,6 +778,70 @@ function Test-WuuAuditAnchor {
     }
 
     return $verdict
+}
+
+function Test-WuuAuditAnchor {
+    <#
+    .SYNOPSIS
+    Compares an anchor against the chain as it stands now (reviewer P3).
+    .DESCRIPTION
+    THE COMPARISON THE ANCHOR EXISTS FOR. It answers one question: is the hash the anchor recorded still
+    ON the chain the log presents? Three outcomes, and the distinction between them is the whole value:
+
+      Consistent  the anchored head is the current head, or the current head's chain reaches back to it
+                  intact. Nothing before the anchor point has changed.
+      Rewritten   the chain no longer contains the anchored hash at the anchored sequence number. THIS IS
+                  THE FINDING: the log was rebuilt after the anchor was taken, and a rebuilt log verifies
+                  cleanly on its own terms, so no amount of chain verification would have found it.
+      Unavailable the anchor is missing, unreadable, or does not cover this log.
+
+    Deliberately does NOT re-verify the whole log - that is Test-WuuAuditChain's job, and doing both here
+    would conflate two findings: "the chain is broken" and "the chain was rebuilt". A rewritten chain is
+    perfectly valid arithmetic; that is exactly why it needs an external comparison to detect.
+
+    A TRUNCATION is reported as Rewritten, not as a special case: a log whose head moved BACKWARD lost
+    records, and "the log no longer contains what it did" is the finding regardless of direction. An
+    anchor whose Seq exceeds the current head's Seq is the clearest form of it, and gets its own message.
+
+    Never throws: this is called from a release gate and a status command, and neither may fail because
+    the anchor is a day old or was written by a different host.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$AnchorPath
+    )
+
+    if (-not (Test-Path -LiteralPath $AnchorPath)) {
+        return @{
+            Available = $false; Consistent = $false; Rewritten = $false
+            AnchoredSeq = 0; AnchoredHash = ''; CurrentSeq = 0; CurrentHash = ''
+            Reason = "no anchor at $AnchorPath - nothing to compare against, so a rewritten log would be undetectable"
+        }
+    }
+
+    try {
+        $anchorRaw = Get-Content -LiteralPath $AnchorPath -Raw
+        $anchor = $anchorRaw | ConvertFrom-Json
+    } catch {
+        return @{
+            Available = $false; Consistent = $false; Rewritten = $false
+            AnchoredSeq = 0; AnchoredHash = ''; CurrentSeq = 0; CurrentHash = ''
+            Reason = "anchor could not be read: $($_.Exception.Message)"
+        }
+    }
+
+    if (-not $anchor.PSObject.Properties['HeadHash'] -or -not $anchor.PSObject.Properties['Seq']) {
+        return @{
+            Available = $false; Consistent = $false; Rewritten = $false
+            AnchoredSeq = 0; AnchoredHash = ''; CurrentSeq = 0; CurrentHash = ''
+            Reason = 'anchor is malformed (no HeadHash/Seq) - it cannot be compared'
+        }
+    }
+
+    # The comparison itself is shared with the Event Log sink (Test-WuuAuditAnchorData), so the two
+    # anchors cannot drift on what "rewritten" means.
+    return (Test-WuuAuditAnchorData -LogPath $LogPath -AnchoredSeq ([int]$anchor.Seq) -AnchoredHash ([string]$anchor.HeadHash))
 }
 
 function Write-WuuAuditEventLogAnchor {
@@ -943,10 +970,19 @@ function Get-WuuAuditEventLogAnchor {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $false)][string]$LogName = 'Application',
-        [Parameter(Mandatory = $false)][string]$Source = 'WUU2-CLI-Audit'
+        [Parameter(Mandatory = $false)][string]$Source = 'WUU2-CLI-Audit',
+        # When set, only an event whose recorded LogPath matches this log is returned. Without it the
+        # newest event from the source would be used for ANY log being verified, so verifying an older
+        # day would compare it against a different day's anchor - a false finding in either direction.
+        [Parameter(Mandatory = $false)][AllowEmptyString()][string]$TargetLogPath = ''
     )
 
     if (-not (Get-Command -Name 'Get-WinEvent' -ErrorAction SilentlyContinue)) { return $null }
+
+    $targetFull = ''
+    if (-not [string]::IsNullOrWhiteSpace($TargetLogPath)) {
+        try { $targetFull = [System.IO.Path]::GetFullPath($TargetLogPath) } catch { $targetFull = $TargetLogPath }
+    }
 
     try {
         $ev = Get-WinEvent -FilterHashtable @{ LogName = $LogName; ProviderName = $Source } `
@@ -975,11 +1011,22 @@ function Get-WuuAuditEventLogAnchor {
             continue
         }
         if ($obj.PSObject.Properties['HeadHash'] -and $obj.PSObject.Properties['Seq']) {
+            $eventLogPath = [string]$obj.LogPath
+            # A log-path filter must match the log being verified; skip an event that names a different
+            # log so the anchor cannot be applied across days. An event that records no path is only
+            # usable when no target was requested.
+            if ($targetFull) {
+                $eventFull = ''
+                if (-not [string]::IsNullOrWhiteSpace($eventLogPath)) {
+                    try { $eventFull = [System.IO.Path]::GetFullPath($eventLogPath) } catch { $eventFull = $eventLogPath }
+                }
+                if ($eventFull -ine $targetFull) { continue }
+            }
             return [pscustomobject]@{
                 AnchoredUtc = [string]$obj.AnchoredUtc
                 Seq         = [int]$obj.Seq
                 HeadHash    = [string]$obj.HeadHash
-                LogPath     = [string]$obj.LogPath
+                LogPath     = $eventLogPath
                 Operator    = [string]$obj.Operator
                 LogName     = $LogName
                 Source      = $Source
@@ -988,6 +1035,40 @@ function Get-WuuAuditEventLogAnchor {
     }
 
     return $null
+}
+
+function Test-WuuAuditEventLogAnchor {
+    <#
+    .SYNOPSIS
+    Reads the newest Event Log anchor for a log and compares it against that log (AUDIT-EVENTLOG-VERIFY-01).
+    .DESCRIPTION
+    The Event Log mirror was write-only from the verify path's point of view: the reader existed and was
+    tested, but nothing compared its anchor against a log during verification. This closes that loop using
+    Test-WuuAuditAnchorData, so the Event Log and the file anchor share one definition of "rewritten".
+
+    Returns the same verdict shape as Test-WuuAuditAnchor, plus EventLogAvailable so a caller can tell
+    "no event anchor exists" from "the chain disagrees with the anchor". Never throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory = $false)][string]$LogName = 'Application',
+        [Parameter(Mandatory = $false)][string]$Source = 'WUU2-CLI-Audit'
+    )
+
+    $anchor = Get-WuuAuditEventLogAnchor -LogName $LogName -Source $Source -TargetLogPath $LogPath
+    if ($null -eq $anchor) {
+        return @{
+            Available = $false; Consistent = $false; Rewritten = $false
+            AnchoredSeq = 0; AnchoredHash = ''; CurrentSeq = 0; CurrentHash = ''
+            EventLogAvailable = $false
+            Reason = "no event log anchor found for this log (source '$Source') - the mirror may be unconfigured or this log was never mirrored"
+        }
+    }
+
+    $verdict = Test-WuuAuditAnchorData -LogPath $LogPath -AnchoredSeq ([int]$anchor.Seq) -AnchoredHash ([string]$anchor.HeadHash)
+    $verdict.EventLogAvailable = $true
+    return $verdict
 }
 
 function Get-WuuAuditRecordAtSeq {
@@ -1207,8 +1288,10 @@ Export-ModuleMember -Function @(
     # The separation is the control, so the functions cannot be private to this module.
     'New-WuuAuditAnchor'
     'Test-WuuAuditAnchor'
+    'Test-WuuAuditAnchorData'
     'Write-WuuAuditEventLogAnchor'
     'Get-WuuAuditEventLogAnchor'
+    'Test-WuuAuditEventLogAnchor'
     'Get-WuuAuditRecordAtSeq'
     'Invoke-WuuAuditedAction'
     'Write-WuuAuditDenial'

@@ -189,7 +189,7 @@ Stating these plainly is part of the control, not a caveat against it.
    whole file produces a file that verifies.
 
    The standard mitigation is a non-repudiation anchor: mirror a periodic digest to a destination
-   the operator cannot rewrite (Windows Event Log, or a remote sink). This is **implemented** - two
+   the operator cannot rewrite (Windows Event Log, or a remote sink). This is **implemented** — two
    sinks, both reachable from the command surface (`CLI_AUDIT_PLAN.md` SS5.6):
 
    * `wuu audit anchor` writes a chain-head anchor **file**. Written and compared by
