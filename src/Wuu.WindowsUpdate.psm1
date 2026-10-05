@@ -533,7 +533,10 @@ function Start-UpdateCheckJob {
         [string]$Op = 'Check',
         # Only used by 'ServiceAction' (start|stop|restart). Passed through rather than carried on
         # the row, so the op stays explicit at the submission call site.
-        [string]$ServiceAction = ''
+        [string]$ServiceAction = '',
+        # SCHED-REFUSAL-01: When called by the scheduler, the scheduler IS the consumer of Pending
+        # so Pending=$true must not be treated as a busy lock preventing its own submission.
+        [switch]$IgnorePending
     )
     $ctx = $script:WuuCtx
     # $MaxConcurrentJobs comes from the context, not the global, so the submission point and the
@@ -553,7 +556,7 @@ function Start-UpdateCheckJob {
         # A refusal here is a normal outcome, not an error: the scheduler re-considers the row on
         # the next tick, and the auto-flow chain sets Pending so it is picked up after the current
         # operation finishes. Logged at INFO so a run can be reconstructed without guessing.
-        if (Test-WuuComputerBusy -Row $ComputerItem) {
+        if (Test-WuuComputerBusy -Row $ComputerItem -IgnorePending:$IgnorePending) {
             # PHASE 5: record the refusal. It is NOT an error - the operation never started and the
             # computer is undamaged - but without a record the row is indistinguishable from one
             # waiting its turn, so a permanent refusal stalls the phase silently.

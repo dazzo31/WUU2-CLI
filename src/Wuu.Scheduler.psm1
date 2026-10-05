@@ -261,18 +261,24 @@ function Start-PendingUpdateCheck {
             }
             continue
         }
-        $item.Pending = $false
-        # Consume and clear any queued follow-up op so this item starts the right chain. The clear goes
-        # through the mutation funnel (SS16) rather than assigning the property: the scheduler is the
-        # CONSUMER of the slot, and PendingOp is operation state, so the write belongs to Wuu.State.
-        # Unattributed on purpose - the scheduler is not a worker and holds no operation id, which
-        # Test-WuuStaleWrite permits (a write is refused only when PROVEN stale).
+        # SCHED-REFUSAL-01: Resolve the requested op before submission, but do NOT clear Pending
+        # or PendingOp until submission is accepted. If Start-UpdateCheckJob refuses (e.g. concurrency
+        # cap reached, computer busy, or reservation race), the submission returns $false and the row
+        # must remain Pending with PendingOp intact so it is retried on later ticks.
+        # Once accepted, consume and clear any queued follow-up op through the mutation funnel (SS16).
         $op = 'Check'
+        $hasPendingOp = $false
         if ($item.PSObject.Properties['PendingOp'] -and $item.PendingOp) {
             $op = $item.PendingOp
-            [void](Update-WuuOperationState -Row $item -ClearPendingOp)
+            $hasPendingOp = $true
         }
-        [void](Start-UpdateCheckJob -ComputerItem $item -Op $op)
+        $submitted = Start-UpdateCheckJob -ComputerItem $item -Op $op -IgnorePending
+        if ($submitted) {
+            $item.Pending = $false
+            if ($hasPendingOp) {
+                [void](Update-WuuOperationState -Row $item -ClearPendingOp)
+            }
+        }
     }
 }
 
