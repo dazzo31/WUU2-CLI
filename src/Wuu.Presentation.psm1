@@ -21,6 +21,115 @@ know about it, and both are called from Start-WuuApplication's startup path.
 # Update-Status is called from 17 sites that have no reason to thread a store through their signatures.
 $script:WuuPresentationStore = $null
 
+# Presentation theme: 'Standard', 'Accessible', 'NoColor'.
+# Controlled via Set-WuuTheme, or environment overrides $env:NO_COLOR and $env:WUU_THEME.
+$script:WuuPresentationTheme = 'Standard'
+
+function Get-WuuTheme {
+    <#
+    .SYNOPSIS Resolves the currently active presentation theme.
+    .DESCRIPTION
+    Checks for external environment overrides in priority order:
+      1. $env:NO_COLOR (if defined and non-empty, yields 'NoColor' per https://no-color.org)
+      2. $env:WUU_THEME (if defined and valid: 'Standard', 'Accessible', 'NoColor')
+      3. Script configuration set via Set-WuuTheme (defaults to 'Standard')
+    #>
+    if ($env:NO_COLOR -and -not [string]::IsNullOrWhiteSpace($env:NO_COLOR)) {
+        return 'NoColor'
+    }
+    if ($env:WUU_THEME -and -not [string]::IsNullOrWhiteSpace($env:WUU_THEME)) {
+        $envTheme = $env:WUU_THEME.Trim()
+        if ($envTheme -match '^(?i)standard$') { return 'Standard' }
+        if ($envTheme -match '^(?i)accessible$') { return 'Accessible' }
+        if ($envTheme -match '^(?i)nocolor$') { return 'NoColor' }
+    }
+    return $script:WuuPresentationTheme
+}
+
+function Set-WuuTheme {
+    <#
+    .SYNOPSIS Sets the active presentation theme ('Standard', 'Accessible', 'NoColor').
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Standard', 'Accessible', 'NoColor', IgnoreCase = $true)]
+        [string]$Theme
+    )
+    switch -Regex ($Theme) {
+        '(?i)^standard$'   { $script:WuuPresentationTheme = 'Standard' }
+        '(?i)^accessible$' { $script:WuuPresentationTheme = 'Accessible' }
+        '(?i)^nocolor$'    { $script:WuuPresentationTheme = 'NoColor' }
+    }
+    return $script:WuuPresentationTheme
+}
+
+function Get-WuuThemeColor {
+    <#
+    .SYNOPSIS Maps a presentation role to a console color based on the active theme.
+    .DESCRIPTION
+    Returns a ConsoleColor name string, or '' when NoColor is active.
+    Roles:
+      - 'Success': Green (Standard), Cyan (Accessible)
+      - 'Failure' / 'Error': Red (Standard), Magenta (Accessible)
+      - 'RowError': DarkGray (Standard), DarkMagenta (Accessible)
+      - 'Attention' / 'Warning' / 'Timeout' / 'Reboot' / 'Available': Yellow (Standard), Yellow (Accessible)
+      - 'Stale': DarkYellow (Standard), Yellow (Accessible)
+      - 'Progress' / 'Active' / 'Running': Cyan (Standard), White (Accessible)
+      - 'Header': DarkCyan (Standard), DarkCyan (Accessible)
+      - 'Muted' / 'Waiting' / 'Offline': DarkGray (Standard), DarkGray (Accessible)
+      - 'Info': White (Standard), White (Accessible)
+      - 'Default': Gray (Standard), Gray (Accessible)
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Role,
+        [string]$Theme = ''
+    )
+
+    $effectiveTheme = if ($Theme) {
+        switch -Regex ($Theme) {
+            '(?i)^standard$'   { 'Standard' }
+            '(?i)^accessible$' { 'Accessible' }
+            '(?i)^nocolor$'    { 'NoColor' }
+            default            { Get-WuuTheme }
+        }
+    } else {
+        Get-WuuTheme
+    }
+
+    if ($effectiveTheme -eq 'NoColor') {
+        return ''
+    }
+
+    if ($effectiveTheme -eq 'Accessible') {
+        switch -Regex ($Role) {
+            '(?i)^(Success|OK)$'                                       { return 'Cyan' }
+            '(?i)^(Failure|Error|Fail)$'                                { return 'Magenta' }
+            '(?i)^RowError$'                                            { return 'DarkMagenta' }
+            '(?i)^(Attention|Warning|Timeout|Reboot|Available|Warn)$'   { return 'Yellow' }
+            '(?i)^Stale$'                                               { return 'Yellow' }
+            '(?i)^(Progress|Active|Running|Run)$'                       { return 'White' }
+            '(?i)^Header$'                                              { return 'DarkCyan' }
+            '(?i)^(Muted|Waiting|Wait|Offline)$'                        { return 'DarkGray' }
+            '(?i)^Info$'                                                { return 'White' }
+            default                                                     { return 'Gray' }
+        }
+    }
+
+    # Standard Theme
+    switch -Regex ($Role) {
+        '(?i)^(Success|OK)$'                                       { return 'Green' }
+        '(?i)^(Failure|Error|Fail)$'                                { return 'Red' }
+        '(?i)^RowError$'                                            { return 'DarkGray' }
+        '(?i)^(Attention|Warning|Timeout|Reboot|Available|Warn)$'   { return 'Yellow' }
+        '(?i)^Stale$'                                               { return 'DarkYellow' }
+        '(?i)^(Progress|Active|Running|Run)$'                       { return 'Cyan' }
+        '(?i)^Header$'                                              { return 'DarkCyan' }
+        '(?i)^(Muted|Waiting|Wait|Offline)$'                        { return 'DarkGray' }
+        '(?i)^Info$'                                                { return 'White' }
+        default                                                     { return 'Gray' }
+    }
+}
+
 function Initialize-WuuPresentation {
     <#
     .SYNOPSIS Hands the presentation helpers the state store they write status into.
@@ -106,8 +215,13 @@ function Show-ErrorDialog {
         Write-ErrorLog $Message -Computer $Computer
     }
 
+    $errColor = Get-WuuThemeColor -Role 'Failure'
     Write-Host ''
-    Write-Host ("  {0}: {1}" -f $Title, $Message) -ForegroundColor Red
+    if ($errColor) {
+        Write-Host ("  {0}: {1}" -f $Title, $Message) -ForegroundColor $errColor
+    } else {
+        Write-Host ("  {0}: {1}" -f $Title, $Message)
+    }
 }
 
 # Function to show warning dialog and log
@@ -126,8 +240,13 @@ function Show-WarningDialog {
         Write-WarningLog $Message -Computer $Computer
     }
 
+    $warnColor = Get-WuuThemeColor -Role 'Attention'
     Write-Host ''
-    Write-Host ("  {0}: {1}" -f $Title, $Message) -ForegroundColor Yellow
+    if ($warnColor) {
+        Write-Host ("  {0}: {1}" -f $Title, $Message) -ForegroundColor $warnColor
+    } else {
+        Write-Host ("  {0}: {1}" -f $Title, $Message)
+    }
 }
 
 # Background processing control functions.
@@ -437,8 +556,12 @@ function Write-WuuProgressTicker {
 
     $progress = Get-WuuOperationProgress -Store $Store -Now $Now
     $line = Format-WuuProgressTicker -Progress $progress
-    if (-not $line) { return $null }
-    Write-Host ('  ' + $line) -ForegroundColor DarkCyan
+    $tickerColor = Get-WuuThemeColor -Role 'Header'
+    if ($tickerColor) {
+        Write-Host ('  ' + $line) -ForegroundColor $tickerColor
+    } else {
+        Write-Host ('  ' + $line)
+    }
     return $line
 }
 
@@ -458,4 +581,7 @@ Export-ModuleMember -Function @(
     'Format-WuuElapsed'
     'Format-WuuProgressTicker'
     'Write-WuuProgressTicker'
+    'Get-WuuTheme'
+    'Set-WuuTheme'
+    'Get-WuuThemeColor'
 )

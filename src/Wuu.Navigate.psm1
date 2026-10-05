@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .DESCRIPTION
 Guided interactive workflow for WUU2-CLI.
@@ -1021,22 +1021,22 @@ function Get-WuuRowOperationState {
     param([Parameter(Mandatory)]$Row)
 
     switch ([string]$Row.State) {
-        'Queued'         { @{ Name = 'Waiting';     Color = 'DarkGray' } }
-        'Connecting'     { @{ Name = 'Connecting';  Color = 'DarkGray' } }
-        'Connected'      { @{ Name = 'Connected';   Color = 'DarkGray' } }
-        'Checking'       { @{ Name = 'Checking';    Color = 'Cyan' } }
-        'Searching'      { @{ Name = 'Checking';    Color = 'Cyan' } }
-        'UpdatesFound'   { @{ Name = 'Available';   Color = 'Yellow' } }
-        'Downloading'    { @{ Name = 'Downloading'; Color = 'Cyan' } }
-        'Installing'     { @{ Name = 'Installing';  Color = 'Cyan' } }
-        'RebootRequired' { @{ Name = 'Reboot needed'; Color = 'Yellow' } }
-        'Rebooting'      { @{ Name = 'Rebooting';   Color = 'Yellow' } }
-        'Verifying'      { @{ Name = 'Verifying';   Color = 'Cyan' } }
-        'Complete'       { @{ Name = 'Complete';    Color = 'Green' } }
-        'Timeout'        { @{ Name = 'Timed out';   Color = 'Yellow' } }
-        'Error'          { @{ Name = 'Failed';      Color = 'Red' } }
-        'Offline'        { @{ Name = 'Offline';     Color = 'DarkGray' } }
-        default          { @{ Name = [string]$Row.State; Color = 'Gray' } }
+        'Queued'         { @{ Name = 'Waiting';       Color = (Get-WuuThemeColor -Role 'Muted') } }
+        'Connecting'     { @{ Name = 'Connecting';    Color = (Get-WuuThemeColor -Role 'Muted') } }
+        'Connected'      { @{ Name = 'Connected';     Color = (Get-WuuThemeColor -Role 'Muted') } }
+        'Checking'       { @{ Name = 'Checking';      Color = (Get-WuuThemeColor -Role 'Progress') } }
+        'Searching'      { @{ Name = 'Checking';      Color = (Get-WuuThemeColor -Role 'Progress') } }
+        'UpdatesFound'   { @{ Name = 'Available';     Color = (Get-WuuThemeColor -Role 'Attention') } }
+        'Downloading'    { @{ Name = 'Downloading';   Color = (Get-WuuThemeColor -Role 'Progress') } }
+        'Installing'     { @{ Name = 'Installing';    Color = (Get-WuuThemeColor -Role 'Progress') } }
+        'RebootRequired' { @{ Name = 'Reboot needed'; Color = (Get-WuuThemeColor -Role 'Attention') } }
+        'Rebooting'      { @{ Name = 'Rebooting';     Color = (Get-WuuThemeColor -Role 'Attention') } }
+        'Verifying'      { @{ Name = 'Verifying';     Color = (Get-WuuThemeColor -Role 'Progress') } }
+        'Complete'       { @{ Name = 'Complete';      Color = (Get-WuuThemeColor -Role 'Success') } }
+        'Timeout'        { @{ Name = 'Timed out';     Color = (Get-WuuThemeColor -Role 'Attention') } }
+        'Error'          { @{ Name = 'Failed';        Color = (Get-WuuThemeColor -Role 'Failure') } }
+        'Offline'        { @{ Name = 'Offline';       Color = (Get-WuuThemeColor -Role 'Muted') } }
+        default          { @{ Name = [string]$Row.State; Color = (Get-WuuThemeColor -Role 'Default') } }
     }
 }
 
@@ -1457,11 +1457,20 @@ function Write-WuuExecutionTable {
 
     Write-Host ''
     $fmt = '    {0,-22} {1,-16} {2}'
-    Write-Host ($fmt -f 'COMPUTER', 'STATE', 'DETAIL') -ForegroundColor DarkCyan
+    $headerColor = Get-WuuThemeColor -Role 'Header'
+    if ($headerColor) {
+        Write-Host ($fmt -f 'COMPUTER', 'STATE', 'DETAIL') -ForegroundColor $headerColor
+    } else {
+        Write-Host ($fmt -f 'COMPUTER', 'STATE', 'DETAIL')
+    }
     foreach ($r in @(Get-WuuComputerSetComputers -Set $Ctx.Set)) {
         if (@($Targets).Count -gt 0 -and $Targets -notcontains $r.Computer) { continue }
         $s = Get-WuuRowOperationState -Row $r
-        Write-Host ($fmt -f $r.Computer, $s.Name, ([string]$r.Status)) -ForegroundColor $s.Color
+        if ($s.Color) {
+            Write-Host ($fmt -f $r.Computer, $s.Name, ([string]$r.Status)) -ForegroundColor $s.Color
+        } else {
+            Write-Host ($fmt -f $r.Computer, $s.Name, ([string]$r.Status))
+        }
     }
 }
 
@@ -1487,27 +1496,48 @@ function Show-WuuResultsScreen {
     $rebootPending = @($computers | Where-Object { $_.RebootRequired })
     $successful = @($computers | Where-Object { [string]$_.State -eq 'Complete' })
 
+    $succCol = Get-WuuThemeColor -Role 'Success'
+    $failCol = if (($failed.Count + $timedOut.Count) -gt 0) { Get-WuuThemeColor -Role 'Failure' } else { Get-WuuThemeColor -Role 'Muted' }
+    $offCol = if ($summary.Offline -gt 0) { Get-WuuThemeColor -Role 'Attention' } else { Get-WuuThemeColor -Role 'Muted' }
+    $rebootCol = if ($rebootPending.Count -gt 0) { Get-WuuThemeColor -Role 'Attention' } else { Get-WuuThemeColor -Role 'Muted' }
+
     Write-WuuHeader 'RESULTS'
-    Write-Host ("  Operation:      {0}" -f (Get-WuuOperationLabel -Operation $op)) -ForegroundColor White
-    Write-Host ("  Successful:     {0}" -f $successful.Count) -ForegroundColor Green
-    Write-Host ("  Failed:         {0}" -f ($failed.Count + $timedOut.Count)) -ForegroundColor $(if (($failed.Count + $timedOut.Count) -gt 0) { 'Red' } else { 'Gray' })
-    Write-Host ("  Offline:        {0}" -f $summary.Offline) -ForegroundColor $(if ($summary.Offline -gt 0) { 'Yellow' } else { 'Gray' })
-    Write-Host ("  Reboot required:{0}" -f $rebootPending.Count) -ForegroundColor $(if ($rebootPending.Count -gt 0) { 'Yellow' } else { 'Gray' })
+    Write-Host ("  Operation:      {0}" -f (Get-WuuOperationLabel -Operation $op))
+    if ($succCol) { Write-Host ("  Successful:     {0}" -f $successful.Count) -ForegroundColor $succCol } else { Write-Host ("  Successful:     {0}" -f $successful.Count) }
+    if ($failCol) { Write-Host ("  Failed:         {0}" -f ($failed.Count + $timedOut.Count)) -ForegroundColor $failCol } else { Write-Host ("  Failed:         {0}" -f ($failed.Count + $timedOut.Count)) }
+    if ($offCol) { Write-Host ("  Offline:        {0}" -f $summary.Offline) -ForegroundColor $offCol } else { Write-Host ("  Offline:        {0}" -f $summary.Offline) }
+    if ($rebootCol) { Write-Host ("  Reboot required:{0}" -f $rebootPending.Count) -ForegroundColor $rebootCol } else { Write-Host ("  Reboot required:{0}" -f $rebootPending.Count) }
 
     # Failures with their cause (spec 15). The row's Status is where the engine records why.
     if (($failed.Count + $timedOut.Count) -gt 0) {
         Write-Host ''
-        Write-Host '  FAILURES' -ForegroundColor Red
+        $failHeaderColor = Get-WuuThemeColor -Role 'Failure'
+        if ($failHeaderColor) {
+            Write-Host '  FAILURES' -ForegroundColor $failHeaderColor
+        } else {
+            Write-Host '  FAILURES'
+        }
         foreach ($f in ($failed + $timedOut)) {
-            Write-Host ("    {0}" -f $f.Computer) -ForegroundColor Red
-            Write-Host ("      {0}" -f ([string]$f.Status)) -ForegroundColor DarkRed
+            if ($failHeaderColor) {
+                Write-Host ("    {0}" -f $f.Computer) -ForegroundColor $failHeaderColor
+                Write-Host ("      {0}" -f ([string]$f.Status)) -ForegroundColor $failHeaderColor
+            } else {
+                Write-Host ("    {0}" -f $f.Computer)
+                Write-Host ("      {0}" -f ([string]$f.Status))
+            }
         }
     }
 
     if ($rebootPending.Count -gt 0) {
         Write-Host ''
-        Write-Host '  REBOOT PENDING' -ForegroundColor Yellow
-        foreach ($r in $rebootPending) { Write-Host ("    {0}" -f $r.Computer) -ForegroundColor Yellow }
+        $rebHeaderColor = Get-WuuThemeColor -Role 'Attention'
+        if ($rebHeaderColor) {
+            Write-Host '  REBOOT PENDING' -ForegroundColor $rebHeaderColor
+            foreach ($r in $rebootPending) { Write-Host ("    {0}" -f $r.Computer) -ForegroundColor $rebHeaderColor }
+        } else {
+            Write-Host '  REBOOT PENDING'
+            foreach ($r in $rebootPending) { Write-Host ("    {0}" -f $r.Computer) }
+        }
     }
 
     Write-Host ''

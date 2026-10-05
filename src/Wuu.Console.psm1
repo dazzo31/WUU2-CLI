@@ -28,21 +28,21 @@ auto-flow keeps running while the operator sits at the menu.
 #region Rendering
 
 function Get-WuuRowColor {
-    <# Maps the store's colour NAME to a console colour. The store deliberately carries
-       names ('Error'/'Timeout'/'Success'/'Default'), not WPF brushes, so this is the only
-       place that knows about presentation. #>
+    <# Maps the store's colour NAME to a console colour via the unified presentation theme.
+       The store deliberately carries names ('Error'/'Timeout'/'Success'/'Default'), not
+       WPF brushes, so this is the presentation bridge. #>
     param([string]$Color)
     switch ($Color) {
-        'Error'   { 'DarkGray' }
-        'Timeout' { 'Yellow' }
-        'Success' { 'Green' }
-        default   { 'Gray' }
+        'Error'   { Get-WuuThemeColor -Role 'RowError' }
+        'Timeout' { Get-WuuThemeColor -Role 'Timeout' }
+        'Success' { Get-WuuThemeColor -Role 'Success' }
+        default   { Get-WuuThemeColor -Role 'Default' }
     }
 }
 
 function Get-WuuStatusToken {
     <# Returns a high-visibility, fixed-width ASCII status token:
-       [OK], [RUN], [WAIT], [FAIL], [RBT] #>
+       [OK], [RUN], [WAIT], [FAIL], [RBT], [---] #>
     param([Parameter(Mandatory)][object]$Row)
 
     if (($Row.PSObject.Properties['State'] -and $Row.State -in @('Error', 'Timeout', 'Offline')) -or
@@ -69,7 +69,7 @@ function Get-WuuStatusToken {
         ($Row.PSObject.Properties['State'] -and $Row.State -eq 'Queued')) {
         return '[WAIT]'
     }
-    return '[OK]'
+    return '[---]'
 }
 
 function Format-WuuTable {
@@ -262,7 +262,8 @@ function Write-WuuStatusTable {
     if ($Clear) { try { Clear-Host } catch { } }
     $allRows = @(Get-WuuComputerRow -Store $Store)
     if ($allRows.Count -eq 0) {
-        Write-Host '  (no computers in the list)' -ForegroundColor DarkGray
+        $mColor = Get-WuuThemeColor -Role 'Muted'
+        if ($mColor) { Write-Host '  (no computers in the list)' -ForegroundColor $mColor } else { Write-Host '  (no computers in the list)' }
         return
     }
     $activeFilter = if ($PSBoundParameters.ContainsKey('Filter') -and $Filter) {
@@ -281,10 +282,13 @@ function Write-WuuStatusTable {
     Write-Host ''
     if ($activeFilter -and $activeFilter -ne 'All') {
         $badge = "  [Filter: $(Get-WuuFilterLabel -Filter $activeFilter) ($($rows.Count) of $($allRows.Count) computers shown - press 'f' to change)]"
-        Write-Host $badge -ForegroundColor Cyan
+        $bColor = Get-WuuThemeColor -Role 'Progress'
+        if ($bColor) { Write-Host $badge -ForegroundColor $bColor } else { Write-Host $badge }
     }
     if ($rows.Count -eq 0) {
-        Write-Host "  (no computers match filter '$activeFilter' - $($allRows.Count) computers in fleet)" -ForegroundColor DarkGray
+        $mColor = Get-WuuThemeColor -Role 'Muted'
+        $emptyMsg = "  (no computers match filter '$activeFilter' - $($allRows.Count) computers in fleet)"
+        if ($mColor) { Write-Host $emptyMsg -ForegroundColor $mColor } else { Write-Host $emptyMsg }
         Write-Host ''
         return
     }
@@ -292,16 +296,20 @@ function Write-WuuStatusTable {
     $headerLines = 2
     $now = Get-Date
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($i -lt $headerLines) { Write-Host $lines[$i] -ForegroundColor DarkCyan; continue }
+        if ($i -lt $headerLines) {
+            $hColor = Get-WuuThemeColor -Role 'Header'
+            if ($hColor) { Write-Host $lines[$i] -ForegroundColor $hColor } else { Write-Host $lines[$i] }
+            continue
+        }
         if ($i - $headerLines -ge $rows.Count) { continue }
         $row = $rows[$i - $headerLines]
         $color = Get-WuuRowColor -Color $row.Color
         if ($row.PSObject.Properties['OpState'] -and $row.OpState -eq 'Running' -and
             $row.PSObject.Properties['LastHeartbeatAt'] -and $row.LastHeartbeatAt -is [datetime] -and
             ($now - $row.LastHeartbeatAt).TotalSeconds -gt 45) {
-            $color = 'DarkYellow'
+            $color = Get-WuuThemeColor -Role 'Stale'
         }
-        Write-Host $lines[$i] -ForegroundColor $color
+        if ($color) { Write-Host $lines[$i] -ForegroundColor $color } else { Write-Host $lines[$i] }
     }
     Write-Host ''
 }
@@ -309,7 +317,10 @@ function Write-WuuStatusTable {
 function Write-WuuStatusLine {
     param([Parameter(Mandatory)][hashtable]$Store)
     $s = [string]$Store.Status
-    if ($s) { Write-Host "  $s" -ForegroundColor Cyan }
+    if ($s) {
+        $color = Get-WuuThemeColor -Role 'Progress'
+        if ($color) { Write-Host "  $s" -ForegroundColor $color } else { Write-Host "  $s" }
+    }
 }
 
 #endregion Rendering

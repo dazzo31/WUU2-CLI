@@ -550,89 +550,99 @@ function Format-WuuReportTable {
         [int]$Top = 5
     )
 
+    $writeReportLine = {
+        param([string]$Text, [string]$Role = '')
+        if ($Role) {
+            $col = Get-WuuThemeColor -Role $Role
+            if ($col) { Write-Host $Text -ForegroundColor $col } else { Write-Host $Text }
+        } else {
+            Write-Host $Text
+        }
+    }
+
     $s = $Report.Summary
     Write-Host ''
-    Write-Host '  ============================================================' -ForegroundColor DarkGray
-    Write-Host '   WUU2 DEPLOYMENT REPORT' -ForegroundColor White
-    Write-Host '  ============================================================' -ForegroundColor DarkGray
+    &$writeReportLine '  ============================================================' 'Muted'
+    &$writeReportLine '   WUU2 DEPLOYMENT REPORT' 'Info'
+    &$writeReportLine '  ============================================================' 'Muted'
     if ($Window) {
-        Write-Host ("   Period   : {0}" -f $Window.Label)
-        Write-Host ("   From (UTC): {0}" -f ([datetime]$Window.From).ToString('yyyy-MM-dd HH:mm:ss'))
-        Write-Host ("   To   (UTC): {0}" -f ([datetime]$Window.To).ToString('yyyy-MM-dd HH:mm:ss'))
-        if ($Window.Files) { Write-Host ("   Logs     : {0} file(s)" -f @($Window.Files).Count) -ForegroundColor DarkGray }
-        if ($Window.FilesSkipped) { Write-Host ("              ({0} file(s) outside the window skipped by name)" -f $Window.FilesSkipped) -ForegroundColor DarkGray }
+        &$writeReportLine ("   Period   : {0}" -f $Window.Label)
+        &$writeReportLine ("   From (UTC): {0}" -f ([datetime]$Window.From).ToString('yyyy-MM-dd HH:mm:ss'))
+        &$writeReportLine ("   To   (UTC): {0}" -f ([datetime]$Window.To).ToString('yyyy-MM-dd HH:mm:ss'))
+        if ($Window.Files) { &$writeReportLine ("   Logs     : {0} file(s)" -f @($Window.Files).Count) 'Muted' }
+        if ($Window.FilesSkipped) { &$writeReportLine ("              ({0} file(s) outside the window skipped by name)" -f $Window.FilesSkipped) 'Muted' }
     }
     Write-Host ''
 
-    Write-Host '   DEPLOYMENT RUNS' -ForegroundColor Cyan
-    Write-Host ("     Runs recorded      : {0}" -f $s.TotalRuns)
-    Write-Host ("     Succeeded          : {0}" -f $s.SuccessfulRuns) -ForegroundColor $(if ($s.SuccessfulRuns -gt 0) { 'Green' } else { 'DarkGray' })
-    Write-Host ("     Failed             : {0}" -f $s.FailedRuns) -ForegroundColor $(if ($s.FailedRuns -gt 0) { 'Red' } else { 'DarkGray' })
-    Write-Host ("     Refused (pre-flight): {0}" -f $s.DeniedRuns) -ForegroundColor $(if ($s.DeniedRuns -gt 0) { 'Yellow' } else { 'DarkGray' })
+    &$writeReportLine '   DEPLOYMENT RUNS' 'Header'
+    &$writeReportLine ("     Runs recorded      : {0}" -f $s.TotalRuns)
+    $succRole = if ($s.SuccessfulRuns -gt 0) { 'Success' } else { 'Muted' }
+    &$writeReportLine ("     Succeeded          : {0}" -f $s.SuccessfulRuns) $succRole
+    $failRole = if ($s.FailedRuns -gt 0) { 'Failure' } else { 'Muted' }
+    &$writeReportLine ("     Failed             : {0}" -f $s.FailedRuns) $failRole
+    $denRole = if ($s.DeniedRuns -gt 0) { 'Attention' } else { 'Muted' }
+    &$writeReportLine ("     Refused (pre-flight): {0}" -f $s.DeniedRuns) $denRole
     if ($s.StartedRuns -gt 0) {
-        Write-Host ("     Started, no outcome: {0}" -f $s.StartedRuns) -ForegroundColor Yellow
-        Write-Host '       (intent recorded with no outcome record - typically interrupted)' -ForegroundColor DarkGray
+        &$writeReportLine ("     Started, no outcome: {0}" -f $s.StartedRuns) 'Attention'
+        &$writeReportLine '       (intent recorded with no outcome record - typically interrupted)' 'Muted'
     }
-    if ($s.UnknownRuns -gt 0) { Write-Host ("     Unclassified       : {0}" -f $s.UnknownRuns) -ForegroundColor DarkGray }
+    if ($s.UnknownRuns -gt 0) { &$writeReportLine ("     Unclassified       : {0}" -f $s.UnknownRuns) 'Muted' }
 
     if ($null -ne $s.SuccessRatePercent) {
-        $colour = if ($s.SuccessRatePercent -ge 95) { 'Green' } elseif ($s.SuccessRatePercent -ge 80) { 'Yellow' } else { 'Red' }
-        Write-Host ("     Success rate       : {0}% of settled runs" -f $s.SuccessRatePercent) -ForegroundColor $colour
+        $rateRole = if ($s.SuccessRatePercent -ge 95) { 'Success' } elseif ($s.SuccessRatePercent -ge 80) { 'Attention' } else { 'Failure' }
+        &$writeReportLine ("     Success rate       : {0}% of settled runs" -f $s.SuccessRatePercent) $rateRole
     } else {
-        Write-Host '     Success rate       : n/a (no run reached a settled outcome)' -ForegroundColor DarkGray
+        &$writeReportLine '     Success rate       : n/a (no run reached a settled outcome)' 'Muted'
     }
-    if ($null -ne $s.AvgDurationSeconds) { Write-Host ("     Avg duration       : {0}s" -f $s.AvgDurationSeconds) -ForegroundColor DarkGray }
+    if ($null -ne $s.AvgDurationSeconds) { &$writeReportLine ("     Avg duration       : {0}s" -f $s.AvgDurationSeconds) 'Muted' }
 
-    # Say what is NOT counted, in the report itself. A reader who assumes success-rate covers every
-    # target will read "100%" as "every machine patched".
     Write-Host ''
-    Write-Host '   NOTE: rates above are per RUN. The audit trail records a batch outcome and its target' -ForegroundColor DarkGray
-    Write-Host '         list, not a per-machine result, so per-machine success cannot be derived from it.' -ForegroundColor DarkGray
-    Write-Host ("         Per-machine detail below shows FAILURES only ({0} target(s) affected)." -f $s.FailingTargets) -ForegroundColor DarkGray
+    &$writeReportLine '   NOTE: rates above are per RUN. The audit trail records a batch outcome and its target' 'Muted'
+    &$writeReportLine '         list, not a per-machine result, so per-machine success cannot be derived from it.' 'Muted'
+    &$writeReportLine ("         Per-machine detail below shows FAILURES only ({0} target(s) affected)." -f $s.FailingTargets) 'Muted'
 
     if ($Report.TimeBuckets.Count -gt 0) {
         Write-Host ''
-        Write-Host '   BY PERIOD' -ForegroundColor Cyan
-        Write-Host ("     {0,-16} {1,6} {2,7} {3,6} {4,7} {5,8}" -f 'Period', 'Total', 'OK', 'Failed', 'Refused', 'Rate')
+        &$writeReportLine '   BY PERIOD' 'Header'
+        &$writeReportLine ("     {0,-16} {1,6} {2,7} {3,6} {4,7} {5,8}" -f 'Period', 'Total', 'OK', 'Failed', 'Refused', 'Rate')
         foreach ($b in $Report.TimeBuckets) {
             $rate = if ($null -ne $b.SuccessRate) { "$($b.SuccessRate)%" } else { '-' }
-            Write-Host ("     {0,-16} {1,6} {2,7} {3,6} {4,7} {5,8}" -f $b.PeriodLabel, $b.Total, $b.Succeeded, $b.Failed, $b.Denied, $rate)
+            &$writeReportLine ("     {0,-16} {1,6} {2,7} {3,6} {4,7} {5,8}" -f $b.PeriodLabel, $b.Total, $b.Succeeded, $b.Failed, $b.Denied, $rate)
         }
     }
 
     if ($Report.ProblemTargets.Count -gt 0) {
         Write-Host ''
-        Write-Host ("   TOP FAILING TARGETS (machines that failed a deployment, top {0})" -f $Top) -ForegroundColor Red
-        Write-Host ("     {0,-22} {1,9} {2,9} {3,8}  {4}" -f 'Computer', 'Attempts', 'Failures', 'Rate', 'Last error')
+        &$writeReportLine ("   TOP FAILING TARGETS (machines that failed a deployment, top {0})" -f $Top) 'Failure'
+        &$writeReportLine ("     {0,-22} {1,9} {2,9} {3,8}  {4}" -f 'Computer', 'Attempts', 'Failures', 'Rate', 'Last error')
         foreach ($t in @($Report.ProblemTargets | Select-Object -First $Top)) {
             $rate = if ($null -ne $t.FailureRate) { "$($t.FailureRate)%" } else { '-' }
             $err = if ($t.LastError) { $t.LastError } else { '-' }
             if ($err.Length -gt 34) { $err = $err.Substring(0, 31) + '...' }
-            Write-Host ("     {0,-22} {1,9} {2,9} {3,8}  {4}" -f $t.Computer, $t.Attempts, $t.Failures, $rate, $err)
+            &$writeReportLine ("     {0,-22} {1,9} {2,9} {3,8}  {4}" -f $t.Computer, $t.Attempts, $t.Failures, $rate, $err)
         }
     } else {
         Write-Host ''
-        Write-Host '   No target failures recorded in this window.' -ForegroundColor Green
+        &$writeReportLine '   No target failures recorded in this window.' 'Success'
         if ($s.DeniedRuns -gt 0) {
-            Write-Host '     (Deployment runs were refused before reaching a machine - see causes below.)' -ForegroundColor DarkGray
+            &$writeReportLine '     (Deployment runs were refused before reaching a machine - see causes below.)' 'Muted'
         }
     }
 
     if ($Report.ErrorBreakdown.Count -gt 0) {
         Write-Host ''
-        Write-Host ("   TOP CAUSES OF UNSETTLED RUNS (top {0})" -f $Top) -ForegroundColor Yellow
+        &$writeReportLine ("   TOP CAUSES OF UNSETTLED RUNS (top {0})" -f $Top) 'Attention'
         foreach ($e in @($Report.ErrorBreakdown | Select-Object -First $Top)) {
-            # The marker matters: "missing -Reason" and a WUA error code look alike in a table, but one
-            # is a process fix and the other is a machine fix.
             $tag = if ($e.IsRefusal) { ' [refused]' } else { ' [failed] ' }
-            Write-Host ("     {0,5}x{1} {2}" -f $e.Count, $tag, $e.Error) -ForegroundColor $(if ($e.IsRefusal) { 'DarkGray' } else { 'Yellow' })
+            $causeRole = if ($e.IsRefusal) { 'Muted' } else { 'Attention' }
+            &$writeReportLine ("     {0,5}x{1} {2}" -f $e.Count, $tag, $e.Error) $causeRole
         }
     }
 
     if ($Window -and $Window.MalformedLines -gt 0) {
         Write-Host ''
-        Write-Host ("   WARNING: {0} unreadable line(s) were skipped; figures cover the lines that parsed." -f $Window.MalformedLines) -ForegroundColor Yellow
-        Write-Host '            Run "wuu audit verify" to decide whether that is tampering.' -ForegroundColor DarkGray
+        &$writeReportLine ("   WARNING: {0} unreadable line(s) were skipped; figures cover the lines that parsed." -f $Window.MalformedLines) 'Attention'
+        &$writeReportLine '            Run "wuu audit verify" to decide whether that is tampering.' 'Muted'
     }
     Write-Host ''
 }
