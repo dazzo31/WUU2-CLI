@@ -566,6 +566,15 @@ function Update-WuuComputerRow {
             Write-WarningLog "[$ComputerName] stale row write refused: the row belongs to operation '$rowOpId', writer is '$writerOpId'"
             return
         }
+        if ($targetRow.PSObject.Properties['LastResetOperationId'] -and $targetRow.LastResetOperationId -and $writerOpId) {
+            Write-WarningLog "[$ComputerName] stale row write refused: operation was reset ($($targetRow.LastResetSource): $($targetRow.LastResetReason)), writer '$writerOpId' is stale"
+            return
+        }
+        $curRowState = if ($targetRow.PSObject.Properties['State']) { [string]$targetRow.State } else { '' }
+        if ($curRowState -in @('Error', 'Timeout', 'Complete') -and $Properties -and $Properties.ContainsKey('State') -and [string]$Properties['State'] -ne $curRowState) {
+            Write-WarningLog "[$ComputerName] terminal transition refused: settled row ('$curRowState') cannot move to '$($Properties['State'])'"
+            return
+        }
 
         foreach ($propertyName in $Properties.Keys) {
             $targetRow.$propertyName = $Properties[$propertyName]
@@ -816,6 +825,9 @@ $DownloadUpdates = {
         $numDownloaded = $taskResult.Count
 
         #Update status
+        if ($computer.PSObject.Properties['LastResetOperationId'] -and $computer.LastResetOperationId) { return }
+        $curState = if ($computer.PSObject.Properties['State']) { [string]$computer.State } else { '' }
+        if ($curState -in @('Error', 'Timeout', 'Complete')) { return }
             $computer.Status = 'Download complete.'
             $computer.State = 'UpdatesFound'
             $computer.Downloaded += $numDownloaded
@@ -868,6 +880,7 @@ $DownloadUpdates = {
         }
     }
     Catch{
+        if ($computer.PSObject.Properties['LastResetOperationId'] -and $computer.LastResetOperationId) { exit }
             $computer.Status = "Error occured: $($_.Exception.Message)."
             $computer.UpdatesStatus = 'Error'
             $computer.State = 'Error'
@@ -1588,6 +1601,9 @@ $GetUpdates = {
 
         # Update UI in a safer way that avoids cross-thread exceptions
         try {
+                if ($computer.PSObject.Properties['LastResetOperationId'] -and $computer.LastResetOperationId) { return }
+                $curState = if ($computer.PSObject.Properties['State']) { [string]$computer.State } else { '' }
+                if ($curState -in @('Error', 'Timeout', 'Complete')) { return }
                 $computer.Available = $adjustedAvailableCount
                 $computer.Downloaded = $dlCount
                 $computer.RebootRequired = $rebootRequired
@@ -1758,6 +1774,7 @@ $GetUpdates = {
             }
         }
         else {
+            if ($computer.PSObject.Properties['LastResetOperationId'] -and $computer.LastResetOperationId) { exit }
             # Terminal error - grey row, Error status
                 $computer.Status = "Error occurred: $errorMessage"
                 $computer.UpdatesStatus = 'Error'
@@ -1805,6 +1822,10 @@ $InstallUpdates = {
         $rebootRequired = [bool]$taskResult.RebootRequired
         $computer.InstallErrors = $installErrors
 
+        if ($computer.PSObject.Properties['LastResetOperationId'] -and $computer.LastResetOperationId) { return }
+        $curState = if ($computer.PSObject.Properties['State']) { [string]$computer.State } else { '' }
+        if ($curState -in @('Error', 'Timeout', 'Complete')) { return }
+
         if (-not $taskResult.Success -or $installErrors -gt 0) {
             $errDetail = if ($taskResult.Error) { $taskResult.Error } elseif ($installErrors -gt 0) { "$installErrors update(s) failed to install" } else { "Remote install reported failure" }
             $computer.Status = "Install failed: $errDetail"
@@ -1829,6 +1850,7 @@ $InstallUpdates = {
         if ($stateStore) { $stateStore.Touch() }
     }
     Catch{
+        if ($computer.PSObject.Properties['LastResetOperationId'] -and $computer.LastResetOperationId) { exit }
             $computer.Status = "Error occured: $($_.Exception.Message)"
             $computer.UpdatesStatus = 'Error'
             $computer.State = 'Error'

@@ -150,6 +150,23 @@ function New-ComputerRunspace {
                     } catch { }
                     return
                 }
+                if ($targetRow.PSObject.Properties['LastResetOperationId'] -and $targetRow.LastResetOperationId -and $writerOpId) {
+                    try {
+                        if ($WriteLogFileScript) {
+                            & $WriteLogFileScript ("[{0}] [WARN] [{1}] stale row write refused: operation was reset ($($targetRow.LastResetSource): $($targetRow.LastResetReason)), writer '{2}' is stale" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $ComputerName, $writerOpId)
+                        }
+                    } catch { }
+                    return
+                }
+                $curRowState = if ($targetRow.PSObject.Properties['State']) { [string]$targetRow.State } else { '' }
+                if ($curRowState -in @('Error', 'Timeout', 'Complete') -and $Properties -and $Properties.ContainsKey('State') -and [string]$Properties['State'] -ne $curRowState) {
+                    try {
+                        if ($WriteLogFileScript) {
+                            & $WriteLogFileScript ("[{0}] [WARN] [{1}] terminal transition refused: settled row ('{2}') cannot move to '{3}'" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $ComputerName, $curRowState, $Properties['State'])
+                        }
+                    } catch { }
+                    return
+                }
 
                 foreach ($propertyName in $Properties.Keys) {
                     $targetRow.$propertyName = $Properties[$propertyName]
@@ -198,6 +215,25 @@ function New-ComputerRunspace {
                 try {
                     if ($WriteLogFileScript) {
                         & $WriteLogFileScript ("[{0}] [WARN] [{1}] stale state write refused: the row belongs to operation '{2}', writer is '{3}'" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Computer.Computer, $rowOpId, $writerOpId)
+                    }
+                } catch { }
+                return $false
+            }
+            if ($Computer.PSObject.Properties['LastResetOperationId'] -and $Computer.LastResetOperationId -and $writerOpId) {
+                try {
+                    if ($WriteLogFileScript) {
+                        & $WriteLogFileScript ("[{0}] [WARN] [{1}] stale state write refused: operation was reset ($($Computer.LastResetSource): $($Computer.LastResetReason)), writer '{2}' is stale" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Computer.Computer, $writerOpId)
+                    }
+                } catch { }
+                return $false
+            }
+            $effState = $State
+            if ($Phase -and -not $effState) { $effState = 'Timeout' }
+            $currentFromState = if ($Computer.PSObject.Properties['State']) { [string]$Computer.State } else { '' }
+            if ($currentFromState -in @('Error', 'Timeout', 'Complete') -and $effState -and ($currentFromState -ne $effState)) {
+                try {
+                    if ($WriteLogFileScript) {
+                        & $WriteLogFileScript ("[{0}] [WARN] [{1}] terminal transition refused: settled row ('{2}') cannot move to '{3}'" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Computer.Computer, $currentFromState, $effState)
                     }
                 } catch { }
                 return $false
