@@ -9,7 +9,7 @@ No GUI, no WPF, no XAML. Pure PowerShell 5.1. Same update engine as the
 
 > **This document tracks the released version.** When a release changes behaviour described here,
 > this file is updated in the same commit as the version bump; see
-> [`docs/RELEASE_NOTES_v1.5.0-beta.8-cli.md`](docs/RELEASE_NOTES_v1.5.0-beta.8-cli.md) for what
+> [`docs/RELEASE_NOTES_v1.5.0-rc.1-cli.md`](docs/RELEASE_NOTES_v1.5.0-rc.1-cli.md) for what
 > changed most recently.
 
 ```
