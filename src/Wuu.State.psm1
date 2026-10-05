@@ -1035,14 +1035,6 @@ function Update-WuuOperationState {
     }
 
     # --- 3. TRANSITION LEGALITY -------------------------------------------------------------
-    # Only consulted when a display State is being set; a pure bookkeeping write (deadline,
-    # heartbeat) is not a transition and must not be gated by the settled rule.
-    if ($State) {
-        $legality = Test-WuuStateTransitionAllowed -Row $Row -ToState $State -OperationId $OperationId -ResetOperation $resetCtx
-        if (-not $legality.Allowed) { return (& $refused $legality.Reason) }
-    }
-
-    # --- 4. APPLY ---------------------------------------------------------------------------
     # A Phase IS a timeout, so it implies the Timeout display state when the caller did not name
     # one. Resolved into LOCALS: parameters are never reassigned (a gated hazard in this codebase).
     $effState = $State
@@ -1054,6 +1046,21 @@ function Update-WuuOperationState {
         $effTimeout = [int](Get-WuuOperationTimeoutSeconds -Op $Phase)
     }
 
+    # Only consulted when a display State is being set (explicitly or derived from Phase); a pure
+    # bookkeeping write (deadline, heartbeat) is not a transition and must not be gated by the settled rule.
+    if ($effState) {
+        $legality = Test-WuuStateTransitionAllowed -Row $Row -ToState $effState -OperationId $OperationId -ResetOperation $resetCtx
+        if (-not $legality.Allowed) { return (& $refused $legality.Reason) }
+    }
+
+    # A Phase records a deadline, which is valid ONLY while an operation is running (invariant 3).
+    # Setting a Phase deadline on an Idle row leaves an idle row carrying a deadline.
+    $effOpState = if ($OpState) { $OpState } elseif ($Row.PSObject.Properties['OpState']) { [string]$Row.OpState } else { 'Idle' }
+    if ($Phase -and $effOpState -eq 'Idle' -and -not $ClearOperation) {
+        return (& $refused "cannot set Phase '$Phase' on an Idle row: a deadline requires an active running operation")
+    }
+
+    # --- 4. APPLY ---------------------------------------------------------------------------
     $set = {
         param($Prop, $Value)
         if ($Row.PSObject.Properties[$Prop]) { $Row.$Prop = $Value; return $true }
