@@ -218,14 +218,16 @@ function Get-WuuOperationProgress {
     )
 
     $result = [ordered]@{
-        Active    = 0
-        Queued    = 0
-        Succeeded = 0
-        Failed    = 0
-        TimedOut  = 0
-        Total     = 0
-        Elapsed   = $null
-        StartedAt = $null
+        Active             = 0
+        Queued             = 0
+        Succeeded          = 0
+        Failed             = 0
+        TimedOut           = 0
+        Total              = 0
+        Elapsed            = $null
+        StartedAt          = $null
+        WaitingPhase       = $null
+        WaitingActiveCount = 0
     }
 
     # Resolved into NEW locals rather than reassigning the parameters. PowerShell's variable names
@@ -262,8 +264,30 @@ function Get-WuuOperationProgress {
     } catch { $outcomeMap = @{} }
 
     $earliestStart = $null
+    $activePhases = @{}
+    $waitingPhases = @{}
     foreach ($row in $rows) {
         if ($null -eq $row) { continue }
+
+        $pNum = 0
+        if ($row.PSObject.Properties['Phase'] -and $row.Phase) {
+            if ($row.Phase -match 'Phase\s*(\d+)') {
+                $pNum = [int]$matches[1]
+            }
+        }
+        if ($pNum -gt 0) {
+            $isRowActive = ($row.PSObject.Properties['OpState'] -and [string]$row.OpState -ceq 'Running')
+            $isRowWaiting = (($row.PSObject.Properties['OpState'] -and [string]$row.OpState -ceq 'Queued') -or
+                             ($row.PSObject.Properties['Pending'] -and [bool]$row.Pending) -or
+                             ($row.PSObject.Properties['Status'] -and [string]$row.Status -like 'Waiting for previous phase*'))
+            if ($isRowActive) {
+                if (-not $activePhases.ContainsKey($pNum)) { $activePhases[$pNum] = 0 }
+                $activePhases[$pNum] = [int]$activePhases[$pNum] + 1
+            }
+            if ($isRowWaiting) {
+                $waitingPhases[$pNum] = $true
+            }
+        }
 
         if ($row.PSObject.Properties['OpState']) {
             $opState = [string]$row.OpState
@@ -297,6 +321,27 @@ function Get-WuuOperationProgress {
                 }
             }
             if ($started -and ($null -eq $earliestStart -or $started -lt $earliestStart)) { $earliestStart = $started }
+        }
+    }
+
+    # Check if a higher phase is waiting on active work in a lower phase
+    $activeKeyList = New-Object System.Collections.ArrayList
+    foreach ($k in $activePhases.Keys) {
+        if ([int]$activePhases[$k] -gt 0) { [void]$activeKeyList.Add([int]$k) }
+    }
+    if ($activeKeyList.Count -gt 0) {
+        $activeKeyList.Sort()
+        $lowestActive = [int]$activeKeyList[0]
+        $hasHigherWaiting = $false
+        foreach ($h in $waitingPhases.Keys) {
+            if ([int]$h -gt $lowestActive) {
+                $hasHigherWaiting = $true
+                break
+            }
+        }
+        if ($hasHigherWaiting) {
+            $result.WaitingPhase = $lowestActive
+            $result.WaitingActiveCount = [int]$activePhases[$lowestActive]
         }
     }
 
@@ -351,8 +396,25 @@ function Format-WuuProgressTicker {
     if ($active -le 0 -and $queued -le 0) { return $null }
 
     $failed = [int]$Progress.Failed + [int]$Progress.TimedOut
-    return ('[Active: {0} | Queued: {1} | Succeeded: {2} | Failed: {3} | Elapsed: {4}]' -f `
+    $line = ('[Active: {0} | Queued: {1} | Succeeded: {2} | Failed: {3} | Elapsed: {4}]' -f `
             $active, $queued, [int]$Progress.Succeeded, $failed, (Format-WuuElapsed -Elapsed $Progress.Elapsed))
+
+    $wPhase = if ($Progress -is [System.Collections.IDictionary] -and $Progress.Contains('WaitingPhase')) {
+        $Progress['WaitingPhase']
+    } elseif ($Progress.PSObject.Properties['WaitingPhase']) {
+        $Progress.WaitingPhase
+    } else { $null }
+
+    $wCount = if ($Progress -is [System.Collections.IDictionary] -and $Progress.Contains('WaitingActiveCount')) {
+        [int]$Progress['WaitingActiveCount']
+    } elseif ($Progress.PSObject.Properties['WaitingActiveCount']) {
+        [int]$Progress.WaitingActiveCount
+    } else { 0 }
+
+    if ($wPhase -and $wCount -gt 0) {
+        return "$line Waiting for Phase $wPhase ($wCount active)"
+    }
+    return $line
 }
 
 function Write-WuuProgressTicker {

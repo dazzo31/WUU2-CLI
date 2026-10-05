@@ -40,6 +40,38 @@ function Get-WuuRowColor {
     }
 }
 
+function Get-WuuStatusToken {
+    <# Returns a high-visibility, fixed-width ASCII status token:
+       [OK], [RUN], [WAIT], [FAIL], [RBT] #>
+    param([Parameter(Mandatory)][object]$Row)
+
+    if (($Row.PSObject.Properties['State'] -and $Row.State -in @('Error', 'Timeout', 'Offline')) -or
+        ($Row.PSObject.Properties['Color'] -and $Row.Color -in @('Error', 'Timeout')) -or
+        ($Row.PSObject.Properties['InstallErrors'] -and [int]$Row.InstallErrors -gt 0)) {
+        return '[FAIL]'
+    }
+    if (($Row.PSObject.Properties['OpState'] -and $Row.OpState -eq 'Running') -or
+        ($Row.PSObject.Properties['State'] -and $Row.State -in @('Checking', 'Searching', 'Downloading', 'Installing', 'Rebooting', 'Verifying'))) {
+        return '[RUN]'
+    }
+    if (($Row.PSObject.Properties['RebootRequired'] -and [bool]$Row.RebootRequired) -or
+        ($Row.PSObject.Properties['State'] -and $Row.State -eq 'RebootRequired')) {
+        return '[RBT]'
+    }
+    if (($Row.PSObject.Properties['OpState'] -and $Row.OpState -eq 'Queued') -or
+        ($Row.PSObject.Properties['Status'] -and [string]$Row.Status -like 'Waiting for previous phase*')) {
+        return '[WAIT]'
+    }
+    if ($Row.PSObject.Properties['State'] -and $Row.State -eq 'Complete') {
+        return '[OK]'
+    }
+    if (($Row.PSObject.Properties['Pending'] -and [bool]$Row.Pending) -or
+        ($Row.PSObject.Properties['State'] -and $Row.State -eq 'Queued')) {
+        return '[WAIT]'
+    }
+    return '[OK]'
+}
+
 function Format-WuuTable {
     <# Renders rows as a fixed-width text table.
        Line-oriented on purpose (no cursor repositioning / progress bars) so a session
@@ -66,18 +98,54 @@ function Format-WuuTable {
         $name = [string]$r.Computer
         if ($name.Length -gt $ComputerWidth) { $name = $name.Substring(0, $ComputerWidth - 1) + [char]0x2026 }
         $status = [string]$r.Status
+        $token = Get-WuuStatusToken -Row $r
+
+        # Clean text-heavy boilerplate
+        if ($status -like 'Up-to-date*' -or $status -like 'All updates installed*' -or $status -like 'All available updates are already downloaded*') {
+            $status = 'Up-to-date'
+        } elseif ($status -like 'Waiting for previous phase to complete*') {
+            $status = 'Waiting for prior phase'
+        } elseif ($status -like 'Waiting to start*') {
+            $status = 'Queued to start'
+        } elseif ($status -like 'Initializing update session*') {
+            $status = 'Initializing'
+        } elseif ($status -like 'Checking for updates*') {
+            $status = 'Checking updates'
+        } elseif ($status -like 'Downloading updates*') {
+            $status = 'Downloading'
+        } elseif ($status -like 'Installing updates*') {
+            $status = 'Installing'
+        } elseif ($status -like 'Reboot required to complete previous installations*') {
+            $status = 'Reboot required'
+        }
+
         # Guarded property access: synthetic rows (tests, and any caller building a row by hand) do not
         # carry these fields, and an unguarded read would turn a status table into an error.
         $isRunning = $r.PSObject.Properties['OpState'] -and $r.OpState -eq 'Running'
-        if ($isRunning -and $r.PSObject.Properties['TimeoutExpiresAt'] -and $r.TimeoutExpiresAt) {
-            $op = if ($r.PSObject.Properties['OpName'] -and $r.OpName) { [string]$r.OpName } else { 'op' }
-            $left = [int]($r.TimeoutExpiresAt - $now).TotalMinutes
-            $beat = ''
+        if ($isRunning) {
+            $isStale = $false
+            $beatSec = 0
             if ($r.PSObject.Properties['LastHeartbeatAt'] -and $r.LastHeartbeatAt -is [datetime]) {
-                $beat = " beat $([int]($now - $r.LastHeartbeatAt).TotalSeconds)s ago"
+                $beatSec = [int][math]::Floor(($now - $r.LastHeartbeatAt).TotalSeconds)
+                if ($beatSec -lt 0) { $beatSec = 0 }
+                if ($beatSec -gt 45) { $isStale = $true }
             }
-            $status = "[$op ${left}m left$beat] $status"
+            if ($isStale) {
+                $status = "[STALE beat ${beatSec}s ago] $status"
+            } elseif ($r.PSObject.Properties['TimeoutExpiresAt'] -and $r.TimeoutExpiresAt) {
+                $op = if ($r.PSObject.Properties['OpName'] -and $r.OpName) { [string]$r.OpName } else { 'op' }
+                $left = [int]($r.TimeoutExpiresAt - $now).TotalMinutes
+                if ($left -lt 0) { $left = 0 }
+                $beat = if ($beatSec -ge 0 -and $r.PSObject.Properties['LastHeartbeatAt'] -and $r.LastHeartbeatAt -is [datetime]) { " beat ${beatSec}s ago" } else { '' }
+                $status = "[$op ${left}m left$beat] $status"
+            }
         }
+
+        # Prefix with high-visibility ASCII token if not already showing token
+        if (-not $status.StartsWith($token)) {
+            $status = "$token $status"
+        }
+
         if ($status.Length -gt 60) { $status = $status.Substring(0, 59) + [char]0x2026 }
         [void]$sb.AppendLine(($fmt -f $name, $r.Phase, $r.State, $upd, $status))
     }
@@ -222,10 +290,18 @@ function Write-WuuStatusTable {
     }
     $lines = (Format-WuuTable -Rows $rows) -split "`r?`n"
     $headerLines = 2
+    $now = Get-Date
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($i -lt $headerLines) { Write-Host $lines[$i] -ForegroundColor DarkCyan; continue }
+        if ($i - $headerLines -ge $rows.Count) { continue }
         $row = $rows[$i - $headerLines]
-        Write-Host $lines[$i] -ForegroundColor (Get-WuuRowColor -Color $row.Color)
+        $color = Get-WuuRowColor -Color $row.Color
+        if ($row.PSObject.Properties['OpState'] -and $row.OpState -eq 'Running' -and
+            $row.PSObject.Properties['LastHeartbeatAt'] -and $row.LastHeartbeatAt -is [datetime] -and
+            ($now - $row.LastHeartbeatAt).TotalSeconds -gt 45) {
+            $color = 'DarkYellow'
+        }
+        Write-Host $lines[$i] -ForegroundColor $color
     }
     Write-Host ''
 }
@@ -657,6 +733,7 @@ function Read-WuuYesNo {
 
 Export-ModuleMember -Function @(
     'Get-WuuRowColor'
+    'Get-WuuStatusToken'
     'Format-WuuTable'
     'Test-WuuRowFilter'
     'Get-WuuFilterLabel'
