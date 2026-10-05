@@ -1158,7 +1158,9 @@ function Update-WuuOperationState {
 
         # A queued follow-up means the row is NOT finished: that request is its next operation. A
         # settled display would let the outcome/phase accounting count the row as done before it runs.
-        if ($Row.PSObject.Properties['PendingOp'] -and $Row.PendingOp) {
+        # However, terminal failures (Error, Timeout) must not be laundered into Queued on cleanup.
+        $currentState = if ($Row.PSObject.Properties['State']) { [string]$Row.State } else { '' }
+        if ($Row.PSObject.Properties['PendingOp'] -and $Row.PendingOp -and $currentState -notin @('Error', 'Timeout')) {
             & $set 'State' 'Queued'
             & $set 'Status' (Get-WuuStateStatusText -State 'Queued')
         }

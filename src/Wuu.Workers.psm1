@@ -496,6 +496,7 @@ function Get-WuuJobCleanupPayload {
                                     if ($failedRow.PSObject.Properties['TimeoutSource']) { $failedRow.TimeoutSource = '' }
                                     if ($failedRow.PSObject.Properties['OpName']) { $failedRow.OpName = '' }
                                     if ($failedRow.PSObject.Properties['LastHeartbeatAt']) { $failedRow.LastHeartbeatAt = $null }
+                                    if ($failedRow.PSObject.Properties['OperationId']) { $failedRow.OperationId = '' }
                                     $stateStore.Touch()
                                     } else {
                                         # A refusal is not silence. Without this line the operator
@@ -541,6 +542,8 @@ function Get-WuuJobCleanupPayload {
                                 if ($doneRow.PSObject.Properties['TimeoutExpiresAt']) { $doneRow.TimeoutExpiresAt = $null }
                                 if ($doneRow.PSObject.Properties['TimeoutSource']) { $doneRow.TimeoutSource = '' }
                                 if ($doneRow.PSObject.Properties['OpName']) { $doneRow.OpName = '' }
+                                if ($doneRow.PSObject.Properties['LastHeartbeatAt']) { $doneRow.LastHeartbeatAt = $null }
+                                if ($doneRow.PSObject.Properties['OperationId']) { $doneRow.OperationId = '' }
                                 $stateStore.Touch()
                                 } else {
                                     & $WriteLogFileScript "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [WARN] [$($runspace.Computer)] stale operation '$jobOpId2' finished but the row belongs to '$rowOpId2' - lock NOT released (releasing it would admit a second operation while the current one still runs)"
@@ -715,6 +718,7 @@ function Get-WuuJobCleanupPayload {
                             if ($timedOutRow.PSObject.Properties['TimeoutSource']) { $timedOutRow.TimeoutSource = '' }
                             if ($timedOutRow.PSObject.Properties['OpName']) { $timedOutRow.OpName = '' }
                             if ($timedOutRow.PSObject.Properties['LastHeartbeatAt']) { $timedOutRow.LastHeartbeatAt = $null }
+                            if ($timedOutRow.PSObject.Properties['OperationId']) { $timedOutRow.OperationId = '' }
                             $stateStore.Touch()
                         }
                     } catch {
@@ -722,6 +726,12 @@ function Get-WuuJobCleanupPayload {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [WARN] Timeout row update skipped for ${timedOutComputer}: $($_.Exception.Message)"
                         & $WriteLogFileScript $logEntry
+                    } finally {
+                        if ($toRow -and $toRow.PSObject.Properties['OpState'] -and [string]$toRow.OpState -eq 'Idle') {
+                            if ($toRow.PSObject.Properties['OperationId'] -and [string]$toRow.OperationId -eq $toOpId) {
+                                $toRow.OperationId = ''
+                            }
+                        }
                     }
                     }
                 }
