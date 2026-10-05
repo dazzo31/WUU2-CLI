@@ -1009,16 +1009,13 @@ function Update-WuuOperationState {
         & $set 'OperationId' ''
         & $set 'Runspace' $null
 
-        # A dangling recoverable-timeout DISPLAY must not outlive the deadline that made it
-        # meaningful: 'Timeout' with no deadline is the "hangs in yellow forever" defect the
-        # invariant checker reports, and the deadline is being cleared right here. Callers that want
-        # the operation's OUTCOME pass -State (as every former copy did: 'Error' for a failed row).
-        # Only the unreplaced Timeout display is resolved, to 'Queued' - the state a row with no
-        # operation is in, matching a freshly loaded row.
-        if (-not $effState -and $Row.PSObject.Properties['State'] -and ([string]$Row.State -eq 'Timeout')) {
-            & $set 'State' 'Queued'
-            & $set 'Status' (Get-WuuStateStatusText -State 'Queued')
-        }
+        # STATE-TERMINAL-RESET-01: Timeout is TERMINAL, so ending its operation must not rewrite the
+        # display. The deadline is cleared above while the display stays 'Timeout' - which is correct,
+        # because invariant 4 only requires a deadline while the operation is RUNNING (a settled
+        # Timeout with no deadline is the normal post-timeout shape; the worker's own timeout path in
+        # Wuu.Workers writes exactly that). Rewriting it to 'Queued' here was an unattributed
+        # terminal->Queued transition - the very move Test-WuuStateTransitionAllowed refuses - and it
+        # laundered a counted timeout into a clean queue. A retry is a NEW operation that re-stamps it.
 
         # A queued follow-up means the row is NOT finished: that request is its next operation. A
         # settled display would let the outcome/phase accounting count the row as done before it runs.
@@ -1056,8 +1053,9 @@ function Test-WuuOperationStateInvariant {
                                              present a valid token for a job that no longer exists.
       3. Deadline while no operation       - a stale deadline in the past kills the NEXT operation on
                                              its first cleanup pass.
-      4. Timeout state without a deadline  - a Timeout display with no deadline means nothing will
-                                             ever settle the row: it hangs in yellow forever.
+      4. Timeout state without a deadline  - a RUNNING Timeout display with no deadline means nothing
+                                             will ever settle the row: it hangs in yellow forever. A
+                                             SETTLED timeout (OpState Idle) has no deadline by design.
       5. Settled plus PendingOp            - a settled row is finished, yet still advertises queued work.
       6. Settled plus Running              - a finished operation must not hold the runspace lock.
       7. TimeoutSource without deadline    - half-cleared timeout state.
@@ -1100,8 +1098,8 @@ function Test-WuuOperationStateInvariant {
     if ($opState -eq 'Idle' -and $null -ne $expires) {
         $violations.Add("$tag a deadline is recorded while no operation is running - the next operation would be judged expired immediately")
     }
-    if ($state -eq 'Timeout' -and $null -eq $expires) {
-        $violations.Add("$tag State='Timeout' with no deadline - nothing can settle this row")
+    if ($state -eq 'Timeout' -and $opState -eq 'Running' -and $null -eq $expires) {
+        $violations.Add("$tag State='Timeout' with no deadline while the operation is RUNNING - nothing can settle this row")
     }
     if ($settled -contains $state -and $pendingOp) {
         $violations.Add("$tag settled row ('$state') still queues PendingOp '$pendingOp' - the row is reported finished while its next operation is still queued")

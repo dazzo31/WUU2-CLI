@@ -147,6 +147,21 @@ Assert-Equal $row6.Runspace $null 'ClearOperation detaches the runspace'
 $v6 = @(Test-WuuOperationStateInvariant -Row $row6)
 Assert-Equal $v6.Count 0 "a cleared row satisfies the invariant ($($v6 -join '; '))"
 
+# STATE-TERMINAL-RESET-01: ending the operation on a TIMED-OUT row keeps the Timeout display. Rewriting
+# it to 'Queued' was an unattributed terminal->Queued transition that laundered a counted timeout.
+$row6t = New-TestRow 'TIMEOUT-CLOSE-PC'
+$row6t.State = 'Timeout'
+$row6t.OpState = 'Running'
+$row6t.OperationId = 'op-T6'
+$row6t.TimeoutExpiresAt = (Get-Date).AddMinutes(5)
+$row6t.TimeoutSource = 'Update Search'
+$null = Update-WuuOperationState -Row $row6t -OperationId 'op-T6' -ClearOperation -Touch:$false
+Assert-Equal ([string]$row6t.State) 'Timeout' 'ClearOperation PRESERVES a settled Timeout (terminal stays terminal)'
+Assert-Equal $row6t.OpState 'Idle' 'ClearOperation still ends the operation on a timed-out row'
+Assert-Equal $row6t.TimeoutExpiresAt $null 'and still clears the stale deadline'
+$v6t = @(Test-WuuOperationStateInvariant -Row $row6t)
+Assert-Equal $v6t.Count 0 "the settled-Timeout row satisfies the invariant ($($v6t -join '; '))"
+
 '=== 7. the invariant checker DETECTS each violation (else every gate calling it is a tautology) ==='
 
 # 1. Running with no OperationId
@@ -161,9 +176,14 @@ Assert-True ((@(Test-WuuOperationStateInvariant -Row $b) -join ' ') -like '*surv
 $c = New-TestRow; $c.OpState = 'Idle'; $c.TimeoutExpiresAt = (Get-Date)
 Assert-True ((@(Test-WuuOperationStateInvariant -Row $c) -join ' ') -like '*deadline is recorded while no operation*') 'detects: deadline with no operation'
 
-# 4. Timeout state with no deadline
-$d = New-TestRow; $d.State = 'Timeout'; $d.TimeoutExpiresAt = $null
-Assert-True ((@(Test-WuuOperationStateInvariant -Row $d) -join ' ') -like "*State='Timeout' with no deadline*") 'detects: Timeout with no deadline'
+# 4. Timeout state with no deadline WHILE THE OPERATION IS RUNNING (the hang-in-yellow case).
+$d = New-TestRow; $d.State = 'Timeout'; $d.OpState = 'Running'; $d.OperationId = 'op-T'; $d.TimeoutExpiresAt = $null
+Assert-True ((@(Test-WuuOperationStateInvariant -Row $d) -join ' ') -like "*State='Timeout' with no deadline*") 'detects: a RUNNING Timeout with no deadline'
+
+# 4b. A SETTLED Timeout (operation ended) legitimately has no deadline - that is the normal
+# post-timeout shape the worker writes, so it must NOT be reported as a violation.
+$d2 = New-TestRow; $d2.State = 'Timeout'; $d2.OpState = 'Idle'; $d2.OperationId = ''; $d2.TimeoutExpiresAt = $null
+Assert-Equal (@(Test-WuuOperationStateInvariant -Row $d2) -join ' ') '' 'a SETTLED Timeout with no deadline is NOT a violation (the operation has ended)'
 
 # 5. settled plus PendingOp
 $e = New-TestRow; $e.State = 'Complete'; $e.PendingOp = 'Download'

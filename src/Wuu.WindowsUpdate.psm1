@@ -270,13 +270,11 @@ function New-ComputerRunspace {
                     $Computer.LastHeartbeatAt = $null
                     $Computer.OperationId = ''
                     $Computer.Runspace = $null
-                    # A dangling recoverable-timeout DISPLAY must not outlive the deadline that made
-                    # it meaningful - 'Timeout' with no deadline never settles (see the invariant
-                    # checker). Only the unreplaced Timeout display is resolved.
-                    if ($Computer.State -eq 'Timeout') {
-                        $Computer.State = 'Queued'
-                        $Computer.Status = 'Waiting to start...'
-                    }
+                    # STATE-TERMINAL-RESET-01: Timeout is TERMINAL - ending the operation keeps the
+                    # display. The deadline is cleared above; invariant 4 requires it only while the
+                    # operation is RUNNING. Mirrors the module funnel (Test-WuuOperationState asserts
+                    # the two copies agree). Rewriting to 'Queued' was an unattributed terminal
+                    # transition and laundered a counted timeout into a clean queue.
                 }
 
                 if ($Heartbeat) {
