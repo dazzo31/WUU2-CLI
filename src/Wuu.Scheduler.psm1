@@ -7,9 +7,14 @@
 # so it must be assembled in one place rather than copied per call site - a copy makes agreement a
 # discipline instead of a construction guarantee.
 #
-# SCOPE: this module owns HOW a worker runspace is wired. It does NOT own WHEN work is submitted or how
-# capacity is decided - that is the submission point (Wuu.WindowsUpdate) and the concurrency contract
-# (Wuu.State).
+# SCOPE: this module owns HOW a worker runspace is wired and the scheduler tick / admission queueing.
+
+$script:WuuSchedulerCtx = $null
+
+function Initialize-WuuSchedulerContext {
+    param([Parameter(Mandatory)][hashtable]$Context)
+    $script:WuuSchedulerCtx = $Context
+}
 
 function Add-WuuWorkerHelper {
     <#
@@ -187,10 +192,96 @@ function Test-WuuWorkerVariableState {
     }
 }
 
+function Start-PendingUpdateCheck {
+    <#
+    .SYNOPSIS The scheduler tick: promotes due retries and starts queued operations.
+    .DESCRIPTION
+    Reads the queue from the STATE STORE, not from a GUI control.
+
+    This function previously iterated `$uiHash.Listview.Items`. In this edition the store is the only
+    render source, and $uiHash has been REMOVED entirely (it was created, passed around and injected
+    while nothing read it - see Wuu.Core's Synchronized collections region).
+    and NOTHING in src/ ever assigns a ListView to it - the only assignments in the repository are in
+    tests, which hand-built a fake one. So `@($null)` was empty on every tick and this function did
+    NOTHING in production. Consequences, all silent:
+
+      * an operation queued by the auto-download / auto-install chain (Pending=$true, PendingOp set)
+        was never started - the automatic behaviours could not work even once the settings gates
+        were corrected, because nothing consumed what they queued;
+      * Phase-E retries (RetryAt) were never promoted, so a timed-out computer never retried;
+      * phase gating never applied to queued items.
+
+    That is why Test-PendingDrain could pass for two releases while the queue was dead: it built the
+    very object the production code was missing. The test now populates the store instead.
+
+    Get-WuuComputerRow is an exported Wuu.State function; all modules are imported -Global, so it
+    resolves here at call time (the same cross-module visibility Test-PendingDrain asserts).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)][hashtable]$Context = $null
+    )
+    $ctx = if ($Context) { $Context } elseif ($script:WuuSchedulerCtx) { $script:WuuSchedulerCtx } else { $global:WuuCtx }
+    if (-not $ctx) { return }
+    $backgroundProcessing = $ctx.BackgroundProcessing
+    $jobs = $ctx.Jobs; $MaxConcurrentJobs = $ctx.MaxConcurrentJobs
+    $store = $ctx.StateStore
+    if ($backgroundProcessing -and $backgroundProcessing.Suspended) { return }
+    if (-not $store) { return }   # no store = nothing to schedule; never fatal on a timer tick
+
+    # Promote due Phase-E timeout retries (RetryAt set by $GetUpdates) back into the pending queue
+    $now = [DateTime]::Now
+    $rows = @(Get-WuuComputerRow -Store $store)
+    foreach ($item in $rows) {
+        if ($item.PSObject.Properties['RetryAt'] -and $item.RetryAt -and $item.RetryAt -le $now) {
+            $item.RetryAt = $null
+            $item.Pending = $true
+        }
+    }
+    $pendingItems = @($rows | Where-Object { $_.Pending })
+    foreach ($item in $pendingItems) {
+        if ($jobs.Count -ge $MaxConcurrentJobs) { break }
+        # ONE OPERATION PER COMPUTER: if this row already has an operation in flight, leave it
+        # Pending and try again on the next tick. -IgnorePending because this function IS the
+        # consumer of the Pending flag: treating it as "busy" here would make the scheduler skip
+        # every row it was handed, for ever.
+        # The check must come BEFORE $item.Pending is cleared, or a refusal would lose the request.
+        if (Test-WuuComputerBusy -Row $item -IgnorePending) { continue }
+        if (-not (Test-PhaseReady -Phase $item.Phase)) {
+            if ($item.Status -notlike 'Waiting for previous phase*') {
+                # STATE-RESET-OP-01: Phase-wait bookkeeping parking a pending row while previous
+                # phase finishes. Uses ResetOperation to safely park in State='Queued' via funnel.
+                $resetCtx = New-WuuResetOperationContext -Source 'PhaseWaitBookkeeping' `
+                    -Reason "Waiting for previous phase to complete. Current phase: $($item.Phase)" `
+                    -Actor 'Scheduler'
+                $null = Update-WuuOperationState -Row $item -ResetOperation $resetCtx `
+                    -State 'Queued' -ColorFromState `
+                    -Status "Waiting for previous phase to complete. Current phase: $($item.Phase)" `
+                    -Touch -Store $store
+            }
+            continue
+        }
+        $item.Pending = $false
+        # Consume and clear any queued follow-up op so this item starts the right chain. The clear goes
+        # through the mutation funnel (SS16) rather than assigning the property: the scheduler is the
+        # CONSUMER of the slot, and PendingOp is operation state, so the write belongs to Wuu.State.
+        # Unattributed on purpose - the scheduler is not a worker and holds no operation id, which
+        # Test-WuuStaleWrite permits (a write is refused only when PROVEN stale).
+        $op = 'Check'
+        if ($item.PSObject.Properties['PendingOp'] -and $item.PendingOp) {
+            $op = $item.PendingOp
+            [void](Update-WuuOperationState -Row $item -ClearPendingOp)
+        }
+        [void](Start-UpdateCheckJob -ComputerItem $item -Op $op)
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-WuuWorkerLogAppender'
     'Add-WuuWorkerHelper'
     'Test-WuuWorkerHelperSurface'
     'Test-WuuWorkerVariableDefined'
     'Test-WuuWorkerVariableState'
+    'Initialize-WuuSchedulerContext'
+    'Start-PendingUpdateCheck'
 )

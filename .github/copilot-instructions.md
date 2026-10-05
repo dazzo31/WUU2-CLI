@@ -1,4 +1,4 @@
-# WUU2-CLI — LLM Development Instructions
+﻿# WUU2-CLI — LLM Development Instructions
 
 ## 1. Project identity
 WUU2-CLI is the console edition of WUU2:
@@ -222,9 +222,9 @@ Where practical, scheduler responsibilities should be isolated from Windows Upda
 
 Do not add new scheduler functionality to an unrelated module merely because it is convenient.
 
-> **Current:** `Wuu.Scheduler.psm1` owns only the worker-helper surface. Admission still lives at the
-> submission point `Start-UpdateCheckJob` in `Wuu.WindowsUpdate`, and the cleanup loop lives in
-> `Wuu.Core`. **PARTIAL.**
+> **Current:** `Wuu.Scheduler.psm1` owns the worker-helper surface, the scheduler tick `Start-PendingUpdateCheck`,
+> and admission queueing. The per-computer submission point `Start-UpdateCheckJob` remains in `Wuu.WindowsUpdate`,
+> and the cleanup loop lives in `Wuu.Core`. **DONE (tick/admission extracted).**
 
 ---
 
@@ -1460,8 +1460,8 @@ Appendix A for per-invariant evidence.
 
 ## P2
 
-1. Extract scheduler responsibility. — **PARTIAL** (`Wuu.Scheduler` owns the worker-helper surface only;
-   the tick `Start-PendingUpdateCheck` and admission still live in `Wuu.WindowsUpdate`).
+1. Extract scheduler responsibility. — **DONE** (`Wuu.Scheduler` owns the worker-helper surface,
+   the tick `Start-PendingUpdateCheck`, and admission queueing).
 2. Reduce `Wuu.Core.psm1`. — **PARTIAL**: 4,129 -> 3,430 lines (Configuration, Presentation, Display
    actions, the job-cleanup payload and 6 code-less GUI regions have moved out). Still the largest
    file; the remaining regions all have real in/out coupling, so each move needs a measured plan.

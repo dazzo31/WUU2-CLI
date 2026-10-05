@@ -3181,6 +3181,7 @@ $wuuContext = @{
     StateStore                  = $stateStore
 }
 Initialize-WuuWindowsUpdateContext -Context $wuuContext
+Initialize-WuuSchedulerContext -Context $wuuContext
 
 # Console edition: NO DispatcherTimer. The GUI could use one because ShowDialog() pumps a
 # WPF message loop, so a UI-thread timer fired while the app waited for input. A console

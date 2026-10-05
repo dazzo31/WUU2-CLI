@@ -261,7 +261,7 @@ Assert-Equal ($reported -join ',') 'Download' '6. the displaced Download was REP
 # operation-state writes the P0 investigation identified. Asserting the call - not merely that the
 # text disappeared - is the point: the requirement is that pending state IS cleared, and that it is
 # cleared by the state API rather than by whoever happened to be holding the row.
-$schedCode = Get-CodeNoComments (Get-Content (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw)
+$schedCode = Get-CodeNoComments (Get-Content (Join-Path $root 'src\Wuu.Scheduler.psm1') -Raw)
 Assert-True ($schedCode -match 'Update-WuuOperationState\s+-Row\s+\$item\s+-ClearPendingOp') `
     '7. the scheduler clears the slot through the mutation funnel (-ClearPendingOp), not by assigning the property'
 Assert-True (-not ($schedCode -match '\$item\.PendingOp\s*=\s*\$null')) `

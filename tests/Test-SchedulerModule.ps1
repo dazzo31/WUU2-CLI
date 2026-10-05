@@ -42,9 +42,10 @@ Import-Module (Join-Path $root 'src\Wuu.Logging.psm1') -Force -ErrorAction Stop
 Import-Module (Join-Path $root 'src\Wuu.Scheduler.psm1') -Force -ErrorAction Stop
 
 '=== 1. the module exists, loads, and exports its surface ==='
-foreach ($fn in 'Get-WuuWorkerLogAppender', 'Add-WuuWorkerHelper', 'Test-WuuWorkerHelperSurface', 'Test-WuuWorkerVariableDefined', 'Test-WuuWorkerVariableState') {
+foreach ($fn in 'Get-WuuWorkerLogAppender', 'Add-WuuWorkerHelper', 'Test-WuuWorkerHelperSurface', 'Test-WuuWorkerVariableDefined', 'Test-WuuWorkerVariableState', 'Start-PendingUpdateCheck', 'Initialize-WuuSchedulerContext') {
     Assert-True ($null -ne (Get-Command $fn -ErrorAction SilentlyContinue)) "$fn is resolvable"
 }
+Assert-Equal (Get-Command Start-PendingUpdateCheck).ModuleName 'Wuu.Scheduler' 'Start-PendingUpdateCheck is exported from Wuu.Scheduler'
 # The appender belongs to LOGGING, not to the scheduler: Write-WuuLogEntry delegates to it, and three
 # suites import Wuu.Logging on its own. Putting it in Wuu.Scheduler made logging depend on the scheduler,
 # which broke those imports - a backwards dependency this suite was right to expose.

@@ -13,12 +13,17 @@
 #     discards newlines (it rebuilds from token content joined by spaces), so a `.*?\n\}` body
 #     pattern can never match there. A window after the function name is simpler and has no
 #     escaping traps.
-$wupdRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
-foreach ($fn in @('Start-PendingUpdateCheck', 'Test-PhaseCompletion')) {
-    $idx = $wupdRaw.IndexOf("function $fn")
-    if ($idx -lt 0) { Fail "could not locate function $fn in Wuu.WindowsUpdate.psm1" }
+$wupdRaw  = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.WindowsUpdate.psm1') -Raw
+$schedRaw = Get-Content -LiteralPath (Join-Path $root 'src\Wuu.Scheduler.psm1') -Raw
+foreach ($target in @(
+    @{ Name = 'Start-PendingUpdateCheck'; File = 'Wuu.Scheduler.psm1';     Text = $schedRaw },
+    @{ Name = 'Test-PhaseCompletion';     File = 'Wuu.WindowsUpdate.psm1'; Text = $wupdRaw }
+)) {
+    $fn = $target.Name; $file = $target.File; $raw = $target.Text
+    $idx = $raw.IndexOf("function $fn")
+    if ($idx -lt 0) { Fail "could not locate function $fn in $file" }
     else {
-        $window = $wupdRaw.Substring($idx, [Math]::Min(4000, $wupdRaw.Length - $idx))
+        $window = $raw.Substring($idx, [Math]::Min(4000, $raw.Length - $idx))
         if ($window -notmatch 'Get-WuuComputerRow') {
             Fail "$fn does not read the state store (Get-WuuComputerRow) - the queue/phase gate would be empty"
         }
@@ -151,7 +156,7 @@ if (-not $failed) { Pass 'one operation per computer is enforced at the submissi
 # (v) The scheduler must not treat Pending as "busy". Its input queue IS the Pending rows, so doing
 #     so would make it skip every row it was handed, for ever - a deadlock that still passes a
 #     naive "does it read the store" check. The -IgnorePending switch is what prevents it.
-$schedBody = Get-WuuFunctionBody $wupdRaw 'Start-PendingUpdateCheck'
+$schedBody = Get-WuuFunctionBody $schedRaw 'Start-PendingUpdateCheck'
 if (-not $schedBody) { Fail 'could not locate Start-PendingUpdateCheck' }
 else {
     if ($schedBody -match 'Test-WuuComputerBusy' -and $schedBody -notmatch 'IgnorePending') {
