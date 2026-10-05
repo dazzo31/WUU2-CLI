@@ -692,21 +692,25 @@ $removeEntry = {
             # IDENTITY, which two of the four former copies did not do.
             $detachOpId = ''
             if ($Computer.PSObject.Properties['OperationId']) { $detachOpId = [string]$Computer.OperationId }
+            # CORE-RUNSPACE-DISPOSE-01: cache the runspace reference BEFORE ClearOperation, because
+            # the funnel sets $Row.Runspace = $null. The following `if ($Computer.Runspace)` was dead
+            # code - it always saw $null - so the original runspace was never Closed/Disposed.
+            $rsToClose = if ($Computer.PSObject.Properties['Runspace']) { $Computer.Runspace } else { $null }
             $null = Update-WuuOperationState -Row $Computer -OperationId $detachOpId -ClearOperation
             
-            # Close and dispose the runspace
-            if ($Computer.Runspace) {
+            # Close and dispose the cached runspace (the row's reference is already cleared).
+            if ($rsToClose) {
                 try {
-                    $Computer.Runspace.Close()
+                    $rsToClose.Close()
                 } catch {
                     Write-WarningLog "Failed to close runspace for $($Computer.Computer): $($_.Exception.Message)"
                 }
                 try {
-                    $Computer.Runspace.Dispose()
+                    $rsToClose.Dispose()
                 } catch {
                     Write-WarningLog "Failed to dispose runspace for $($Computer.Computer): $($_.Exception.Message)"
                 }
-                $Computer.Runspace = $null
+                $rsToClose = $null
             }
             
             # Remove from updates hash
