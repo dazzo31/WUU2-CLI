@@ -567,6 +567,209 @@ function Write-WuuProgressTicker {
 
 #endregion Progress ticker
 
+#region Line-Oriented Charts
+
+function Format-WuuHorizontalBar {
+    <#
+    .SYNOPSIS Formats a single native, line-oriented horizontal ASCII bar.
+    .DESCRIPTION
+    Pure string formatter. Returns a line with:
+      <Label padded> <Value>/<Total> [<Bar>] <Percent>%
+    Design invariants:
+      - Line-oriented only: no cursor repositioning, no ANSI codes, pure ASCII defaults.
+      - Exact counts are ALWAYS preserved and never truncated.
+      - Zero total renders as "0/0 [--------------------] N/A" without division by zero.
+      - Value > Total clamps the visual bar to 100% but prints the exact Value/Total count.
+      - Non-zero Value (< Total) renders at least 1 fill character if BarWidth > 0.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][int]$Value,
+        [Parameter(Mandatory)][int]$Total,
+        [int]$BarWidth = 20,
+        [char]$FillChar = '=',
+        [char]$EmptyChar = '-',
+        [int]$LabelWidth = 14,
+        [int]$CountWidth = 8,
+        [switch]$ShowPercent = $true
+    )
+
+    if ($Total -lt 0) { $Total = 0 }
+    if ($Value -lt 0) { $Value = 0 }
+    if ($BarWidth -lt 0) { $BarWidth = 0 }
+
+    $countStr = "{0}/{1}" -f $Value, $Total
+    $paddedLabel = if ($LabelWidth -gt 0) { "{0,-$LabelWidth}" -f $Label } else { $Label }
+    $paddedCount = if ($CountWidth -gt 0) { "{0,$CountWidth}" -f $countStr } else { $countStr }
+
+    if ($Total -eq 0) {
+        $emptyBar = if ($BarWidth -gt 0) { "[{0}]" -f (([string]$EmptyChar) * $BarWidth) } else { "" }
+        $pctStr = if ($ShowPercent) { " N/A" } else { "" }
+        return ("{0} {1} {2}{3}" -f $paddedLabel, $paddedCount, $emptyBar, $pctStr).TrimEnd()
+    }
+
+    $ratio = [double]$Value / [double]$Total
+    if ($ratio -gt 1.0) { $ratio = 1.0 }
+    if ($ratio -lt 0.0) { $ratio = 0.0 }
+
+    $fillCount = [int][math]::Floor($ratio * $BarWidth)
+    if ($Value -gt 0 -and $fillCount -eq 0 -and $BarWidth -gt 0) {
+        $fillCount = 1
+    }
+    if ($Value -ge $Total -and $BarWidth -gt 0) {
+        $fillCount = $BarWidth
+    }
+    $emptyCount = $BarWidth - $fillCount
+    if ($emptyCount -lt 0) { $emptyCount = 0 }
+
+    $barStr = if ($BarWidth -gt 0) {
+        "[{0}{1}]" -f (([string]$FillChar) * $fillCount), (([string]$EmptyChar) * $emptyCount)
+    } else { "" }
+
+    $pctVal = [math]::Round(($ratio * 100), 1)
+    $pctStr = if ($ShowPercent) { " {0,5:F1}%" -f $pctVal } else { "" }
+
+    return ("{0} {1} {2}{3}" -f $paddedLabel, $paddedCount, $barStr, $pctStr).TrimEnd()
+}
+
+function Format-WuuPhaseDistribution {
+    <#
+    .SYNOPSIS Formats a phase rollout status distribution chart.
+    .DESCRIPTION
+    Labels successful, failed, timed out, running, queued, and unknown separately.
+    Returns an array of chart row objects, or plain text lines when -AsString is specified.
+    #>
+    param(
+        [int]$Succeeded = 0,
+        [int]$Failed = 0,
+        [int]$TimedOut = 0,
+        [int]$Running = 0,
+        [int]$Queued = 0,
+        [int]$Unknown = 0,
+        [int]$Total = -1,
+        [int]$BarWidth = 20,
+        [switch]$AsString
+    )
+
+    $calculatedTotal = $Succeeded + $Failed + $TimedOut + $Running + $Queued + $Unknown
+    $effectiveTotal = if ($Total -ge 0) { $Total } else { $calculatedTotal }
+    if ($effectiveTotal -gt $calculatedTotal -and $Unknown -eq 0) {
+        $Unknown = $effectiveTotal - $calculatedTotal
+    }
+
+    $categories = @(
+        @{ Label = 'Succeeded'; Role = 'Success';   Value = $Succeeded }
+        @{ Label = 'Failed';    Role = 'Failure';   Value = $Failed }
+        @{ Label = 'TimedOut';  Role = 'Attention'; Value = $TimedOut }
+        @{ Label = 'Running';   Role = 'Progress';  Value = $Running }
+        @{ Label = 'Queued';    Role = 'Muted';     Value = $Queued }
+        @{ Label = 'Unknown';   Role = 'Default';   Value = $Unknown }
+    )
+
+    $rows = @()
+    foreach ($c in $categories) {
+        $line = Format-WuuHorizontalBar -Label $c.Label -Value $c.Value -Total $effectiveTotal -BarWidth $BarWidth -LabelWidth 12 -CountWidth 7
+        $rows += [pscustomobject]@{
+            Label = $c.Label
+            Role  = $c.Role
+            Value = $c.Value
+            Total = $effectiveTotal
+            Line  = $line
+        }
+    }
+
+    if ($AsString) {
+        return (($rows | ForEach-Object { $_.Line }) -join "`r`n")
+    }
+    return $rows
+}
+
+function Get-WuuFleetDistributionCounts {
+    <#
+    .SYNOPSIS Computes fleet distribution counts from the state store rows.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Store
+    )
+    $rows = @()
+    try { $rows = @(Get-WuuComputerRow -Store $Store) } catch { $rows = @() }
+    $counts = @{
+        Succeeded = 0
+        Failed    = 0
+        TimedOut  = 0
+        Running   = 0
+        Queued    = 0
+        Unknown   = 0
+        Total     = $rows.Count
+    }
+    foreach ($r in $rows) {
+        if ($null -eq $r) { continue }
+        $opState = if ($r.PSObject.Properties['OpState']) { [string]$r.OpState } else { '' }
+        $state = if ($r.PSObject.Properties['State']) { [string]$r.State } else { '' }
+        $instErr = if ($r.PSObject.Properties['InstallErrors']) { [int]$r.InstallErrors } else { 0 }
+
+        if ($instErr -gt 0 -or $state -eq 'Error') {
+            $counts.Failed++
+        } elseif ($state -eq 'Timeout') {
+            $counts.TimedOut++
+        } elseif ($opState -ceq 'Running') {
+            $counts.Running++
+        } elseif ($state -eq 'Complete') {
+            $counts.Succeeded++
+        } elseif ($opState -ceq 'Queued' -or $state -eq 'Queued' -or ($r.PSObject.Properties['Pending'] -and [bool]$r.Pending)) {
+            $counts.Queued++
+        } else {
+            $counts.Unknown++
+        }
+    }
+    return $counts
+}
+
+function Format-WuuFleetDistribution {
+    <#
+    .SYNOPSIS Formats the fleet status distribution chart directly from the state store.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Store,
+        [int]$BarWidth = 20,
+        [switch]$AsString
+    )
+    $counts = Get-WuuFleetDistributionCounts -Store $Store
+    return Format-WuuPhaseDistribution `
+        -Succeeded $counts.Succeeded `
+        -Failed $counts.Failed `
+        -TimedOut $counts.TimedOut `
+        -Running $counts.Running `
+        -Queued $counts.Queued `
+        -Unknown $counts.Unknown `
+        -Total $counts.Total `
+        -BarWidth $BarWidth `
+        -AsString:$AsString
+}
+
+function Write-WuuHorizontalChart {
+    <#
+    .SYNOPSIS Writes a chart to host output with role-based theme colors and NoColor safety.
+    #>
+    param(
+        [Parameter(Mandatory)][object[]]$ChartRows,
+        [string]$Indent = '   '
+    )
+    foreach ($r in $ChartRows) {
+        $line = if ($r.PSObject.Properties['Line']) { [string]$r.Line } else { [string]$r }
+        $role = if ($r.PSObject.Properties['Role']) { [string]$r.Role } else { 'Default' }
+        $col = Get-WuuThemeColor -Role $role
+        $text = $Indent + $line
+        if ($col) {
+            Write-Host $text -ForegroundColor $col
+        } else {
+            Write-Host $text
+        }
+    }
+}
+
+#endregion Line-Oriented Charts
+
 Export-ModuleMember -Function @(
     'Initialize-WuuPresentation'
     'Initialize-WuuBackgroundProcessing'
@@ -584,4 +787,9 @@ Export-ModuleMember -Function @(
     'Get-WuuTheme'
     'Set-WuuTheme'
     'Get-WuuThemeColor'
+    'Format-WuuHorizontalBar'
+    'Format-WuuPhaseDistribution'
+    'Get-WuuFleetDistributionCounts'
+    'Format-WuuFleetDistribution'
+    'Write-WuuHorizontalChart'
 )

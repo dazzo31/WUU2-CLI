@@ -323,6 +323,26 @@ function Write-WuuStatusLine {
     }
 }
 
+function Write-WuuFleetDistributionChart {
+    <# Writes the on-demand fleet distribution chart with theme colors. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Store,
+        [int]$BarWidth = 20
+    )
+    $allRows = @(Get-WuuComputerRow -Store $Store)
+    if ($allRows.Count -eq 0) {
+        $mColor = Get-WuuThemeColor -Role 'Muted'
+        if ($mColor) { Write-Host '  (no computers in the list)' -ForegroundColor $mColor } else { Write-Host '  (no computers in the list)' }
+        return
+    }
+    $hColor = Get-WuuThemeColor -Role 'Header'
+    Write-Host ''
+    if ($hColor) { Write-Host '  FLEET STATUS DISTRIBUTION' -ForegroundColor $hColor } else { Write-Host '  FLEET STATUS DISTRIBUTION' }
+    $chartRows = Format-WuuFleetDistribution -Store $Store -BarWidth $BarWidth
+    Write-WuuHorizontalChart -ChartRows $chartRows -Indent '    '
+    Write-Host ''
+}
+
 #endregion Rendering
 
 #region Menu
@@ -751,6 +771,7 @@ Export-ModuleMember -Function @(
     'Get-WuuFilteredRows'
     'Write-WuuStatusTable'
     'Write-WuuStatusLine'
+    'Write-WuuFleetDistributionChart'
     'Get-WuuMenuActions'
     'Write-WuuMenu'
     'Start-WuuConsoleLoop'

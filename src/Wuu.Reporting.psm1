@@ -596,6 +596,25 @@ function Format-WuuReportTable {
     }
     if ($null -ne $s.AvgDurationSeconds) { &$writeReportLine ("     Avg duration       : {0}s" -f $s.AvgDurationSeconds) 'Muted' }
 
+    if ($s.TotalRuns -gt 0) {
+        Write-Host ''
+        &$writeReportLine '   RUN OUTCOME DISTRIBUTION' 'Header'
+        $barSucceeded = Format-WuuHorizontalBar -Label 'Succeeded' -Value $s.SuccessfulRuns -Total $s.TotalRuns -BarWidth 20 -LabelWidth 12 -CountWidth 7
+        &$writeReportLine ("     " + $barSucceeded) $(if ($s.SuccessfulRuns -gt 0) { 'Success' } else { 'Muted' })
+        $barFailed = Format-WuuHorizontalBar -Label 'Failed' -Value $s.FailedRuns -Total $s.TotalRuns -BarWidth 20 -LabelWidth 12 -CountWidth 7
+        &$writeReportLine ("     " + $barFailed) $(if ($s.FailedRuns -gt 0) { 'Failure' } else { 'Muted' })
+        $barDenied = Format-WuuHorizontalBar -Label 'Refused' -Value $s.DeniedRuns -Total $s.TotalRuns -BarWidth 20 -LabelWidth 12 -CountWidth 7
+        &$writeReportLine ("     " + $barDenied) $(if ($s.DeniedRuns -gt 0) { 'Attention' } else { 'Muted' })
+        if ($s.StartedRuns -gt 0) {
+            $barStarted = Format-WuuHorizontalBar -Label 'Interrupted' -Value $s.StartedRuns -Total $s.TotalRuns -BarWidth 20 -LabelWidth 12 -CountWidth 7
+            &$writeReportLine ("     " + $barStarted) 'Attention'
+        }
+        if ($s.UnknownRuns -gt 0) {
+            $barUnknown = Format-WuuHorizontalBar -Label 'Unknown' -Value $s.UnknownRuns -Total $s.TotalRuns -BarWidth 20 -LabelWidth 12 -CountWidth 7
+            &$writeReportLine ("     " + $barUnknown) 'Muted'
+        }
+    }
+
     Write-Host ''
     &$writeReportLine '   NOTE: rates above are per RUN. The audit trail records a batch outcome and its target' 'Muted'
     &$writeReportLine '         list, not a per-machine result, so per-machine success cannot be derived from it.' 'Muted'
@@ -632,6 +651,18 @@ function Format-WuuReportTable {
     if ($Report.ErrorBreakdown.Count -gt 0) {
         Write-Host ''
         &$writeReportLine ("   TOP CAUSES OF UNSETTLED RUNS (top {0})" -f $Top) 'Attention'
+        $totalErrors = 0
+        foreach ($e in @($Report.ErrorBreakdown)) { $totalErrors += [int]$e.Count }
+        if ($totalErrors -gt 0) {
+            foreach ($e in @($Report.ErrorBreakdown | Select-Object -First $Top)) {
+                $errLabel = if ($e.Error.Length -gt 28) { $e.Error.Substring(0, 25) + '...' } else { $e.Error }
+                $causeBar = Format-WuuHorizontalBar -Label $errLabel -Value $e.Count -Total $totalErrors -BarWidth 16 -LabelWidth 28 -CountWidth 6
+                $causeRole = if ($e.IsRefusal) { 'Muted' } else { 'Attention' }
+                &$writeReportLine ("     " + $causeBar) $causeRole
+            }
+            Write-Host ''
+            &$writeReportLine '   CAUSE DETAILS' 'Header'
+        }
         foreach ($e in @($Report.ErrorBreakdown | Select-Object -First $Top)) {
             $tag = if ($e.IsRefusal) { ' [refused]' } else { ' [failed] ' }
             $causeRole = if ($e.IsRefusal) { 'Muted' } else { 'Attention' }
