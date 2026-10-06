@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .DESCRIPTION
 Guided interactive workflow for WUU2-CLI.
@@ -946,29 +946,62 @@ function New-WuuPreflightContext {
             [bool](Test-Connection -Count 1 -ComputerName $Name -Quiet -ErrorAction SilentlyContinue)
         }
         Credentials = { param($Name)
+            $cred = $null
+            try {
+                $cred = Get-RemoteCredentials -ComputerName $Name -Operation 'pre-flight credential probe'
+            } catch {
+                return 'failed'
+            }
+            $timeout = if (Test-Path 'variable:global:CimTimeoutSeconds') { $global:CimTimeoutSeconds } else { 10 }
             $r = Invoke-CimWithTimeout -ComputerName $Name -ClassName 'Win32_ComputerSystem' `
-                -TimeoutSeconds $global:CimTimeoutSeconds -Operation 'pre-flight credential probe'
+                -TimeoutSeconds $timeout -Credential $cred -Operation 'pre-flight credential probe'
             if ($r -and $r.Success) { 'valid' } else { 'failed' }
         }
         Service = { param($Name)
+            $timeout = if (Test-Path 'variable:global:ServiceTimeoutSeconds') { $global:ServiceTimeoutSeconds } else { 10 }
             $s = Invoke-ServiceWithTimeout -ComputerName $Name -ServiceName 'wuauserv' -Action Check `
-                -TimeoutSeconds $global:ServiceTimeoutSeconds
+                -TimeoutSeconds $timeout
             if ($s -and $s.Success -and $s.Status) { [string]$s.Status } else { 'unknown' }
         }
         OS = { param($Name)
+            $cred = $null
+            try {
+                $cred = Get-RemoteCredentials -ComputerName $Name -Operation 'pre-flight OS probe'
+            } catch {
+                return ''
+            }
+            $timeout = if (Test-Path 'variable:global:CimTimeoutSeconds') { $global:CimTimeoutSeconds } else { 10 }
             $r = Invoke-CimWithTimeout -ComputerName $Name -ClassName 'Win32_OperatingSystem' `
-                -TimeoutSeconds $global:CimTimeoutSeconds -Operation 'pre-flight OS probe'
+                -TimeoutSeconds $timeout -Credential $cred -Operation 'pre-flight OS probe'
             if ($r -and $r.Success -and $r.Result) {
                 $os = @($r.Result)[0]
-                '{0} (build {1})' -f $os.Caption, $os.BuildNumber
+                $caption = $null
+                $build = $null
+                if ($os) {
+                    if ($os -is [System.Collections.IDictionary]) {
+                        if ($os.Contains('Caption')) { $caption = $os['Caption'] }
+                        if ($os.Contains('BuildNumber')) { $build = $os['BuildNumber'] }
+                    } else {
+                        if ($os.PSObject.Properties['Caption']) { $caption = $os.Caption }
+                        if ($os.PSObject.Properties['BuildNumber']) { $build = $os.BuildNumber }
+                    }
+                }
+                if ($caption -and $build) {
+                    '{0} (build {1})' -f $caption, $build
+                } elseif ($caption) {
+                    [string]$caption
+                } elseif ($build) {
+                    'build {0}' -f $build
+                } else { '' }
             } else { '' }
         }
         Reboot = { param($Name)
+            $timeout = if (Test-Path 'variable:global:RebootProbeTimeoutSeconds') { $global:RebootProbeTimeoutSeconds } else { 10 }
             $r = Invoke-WithPoolTimeout -ScriptBlock {
                 param($c)
                 try { [bool]([activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.SystemInfo', $c))).RebootRequired }
                 catch { $false }
-            } -ArgumentList $Name -TimeoutSeconds $global:RebootProbeTimeoutSeconds -OperationName 'pre-flight reboot probe'
+            } -ArgumentList $Name -TimeoutSeconds $timeout -OperationName 'pre-flight reboot probe'
             if ($r -and $r.Success) { [bool]$r.Result } else { $false }
         }
     }

@@ -657,6 +657,42 @@ elseif ($pfNo.Available -ne 3) { Fail "with no probes every computer should be a
 else { Pass 'pre-flight with no probes reports "cannot tell" rather than offline' }
 
 # ---------------------------------------------------------------------------------------
+# 13b. Pre-flight live probes: credential resolution & safe OS unwrapping (C4)
+# ---------------------------------------------------------------------------------------
+$liveProbes = New-WuuPreflightContext
+
+# 1. Credentials probe with default identity on localhost reports 'valid'
+$resDefCred = & $liveProbes.Credentials 'localhost'
+if ($resDefCred -ne 'valid') { Fail "pre-flight live Credentials probe on localhost should be 'valid', got '$resDefCred'" }
+else { Pass 'pre-flight live Credentials probe reports valid for working default identity' }
+
+# 2. Credentials probe when custom credentials fail verification must report 'failed' (no silent success or fallback)
+$global:UseCustomCredentials = $true
+$badSec = ConvertTo-SecureString 'invalid-pw-nav-test' -AsPlainText -Force
+$global:CustomCredentials = New-Object System.Management.Automation.PSCredential('CONTOSO\nonexistent-nav-user', $badSec)
+$global:CredentialCache = @{}
+
+$resCustomFail = & $liveProbes.Credentials 'localhost'
+if ($resCustomFail -ne 'failed') { Fail "pre-flight live Credentials probe should report 'failed' on unusable custom credentials, got '$resCustomFail'" }
+else { Pass 'pre-flight live Credentials probe reports failed when configured custom credentials cannot authenticate' }
+
+# 3. OS probe when custom credentials fail verification must return '' without throwing or emitting " (build )"
+$resOsFail = & $liveProbes.OS 'localhost'
+if ($resOsFail -ne '') { Fail "pre-flight live OS probe should return '' on unusable custom credentials, got '$resOsFail'" }
+else { Pass 'pre-flight live OS probe returns empty string on credential failure (no " (build )")' }
+
+# Reset custom credentials
+$global:UseCustomCredentials = $false
+$global:CustomCredentials = $null
+$global:CredentialCache = @{}
+
+# 4. OS probe on localhost with valid credentials returns real OS data with build
+$resLiveOs = & $liveProbes.OS 'localhost'
+if ($resLiveOs -notmatch 'build \d+') { Fail "pre-flight live OS probe on localhost should include build number, got '$resLiveOs'" }
+else { Pass "pre-flight live OS probe formats valid OS data: '$resLiveOs'" }
+try { Close-WuuWorkerPool } catch { }
+
+# ---------------------------------------------------------------------------------------
 # 14. Operation plan (spec 12): the plan must state the lifecycle, not imply it
 # ---------------------------------------------------------------------------------------
 $planSet = New-WuuComputerSet -Store (New-WuuStateStore)
