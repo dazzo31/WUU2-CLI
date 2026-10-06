@@ -1,4 +1,4 @@
-﻿param(
+param(
     # Nested Join-Path keeps Windows PowerShell 5.1 compatibility (3-arg Join-Path is PS7+)
     [string]$OutputDirectory = (Join-Path (Join-Path $PSScriptRoot "..") "dist"),
     [string]$ZipName = ("WUU2_{0}.zip" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
@@ -19,7 +19,6 @@ New-Item -ItemType Directory -Path $staging -Force | Out-Null
 # credentials inside a release zip. It was never present in CI, where the name simply matched nothing.
 $include = @(
     "WUU.ps1",
-    "Exempt.txt",
     "README.md",
     "LICENSE",
     "NOTICE",
@@ -54,7 +53,7 @@ $scriptsDst = Join-Path $staging "Scripts"
 if (Test-Path $scriptsSrc) {
     Copy-Item -Path $scriptsSrc -Destination $scriptsDst -Recurse -Force
 
-    # Don’t include the packager itself inside the zip (optional, avoids nesting tooling)
+    # Don't include the packager itself inside the zip (optional, avoids nesting tooling)
     $selfInZip = Join-Path $scriptsDst "Package-WUU2.ps1"
     if (Test-Path $selfInZip) { Remove-Item $selfInZip -Force }
 

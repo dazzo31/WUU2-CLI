@@ -81,7 +81,7 @@ There are no copyleft restrictions (such as GPL), proprietary software component
 | Component / Subsystem | Ancestral Origin | Status in WUU2-CLI | Transformation Details |
 | :--- | :--- | :--- | :--- |
 | **Runspace collections** (`$jobs`, `$jobCleanup`, `$updatesHash`) | PoshPAIG (2014) | Refactored | Migrated from free-floating script variables into structured modules (`Wuu.Scheduler`, `Wuu.WindowsUpdate`). Dead `$uiHash` injection removed. |
-| **Exemption filter** (`Exempt.txt`) | PoshPAIG (2014) | Retained | Preserved for host exclusion list loading. |
+| **Exemption filter** (`Exempt.txt`) | PoshPAIG (2014) | **Retired** | Silent drop mechanism and placeholder file completely retired (`WUU-OBS-02`); exclusion belongs in explicit policy rather than a silent local file check. |
 | **Elevation check** | PoshPAIG (2014) | Hardened | Enforces non-interactive fail-fast paths without blocking on interactive prompts in CI/headless mode. |
 | **PsExec remote execution** | PoshPAIG (2014) / WUU (2016) | **Replaced** | Completely replaced by temporary SYSTEM scheduled tasks registered over WMI/DCOM. |
 | **WUA COM query engine** (`Microsoft.Update.Session`) | WUU (2016) | Evolved | Direct descendant of Tyler Siegrist's WUA COM search logic; now wrapped in hard timeout budgets and floor protections. |
