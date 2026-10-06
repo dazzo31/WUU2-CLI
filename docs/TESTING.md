@@ -47,7 +47,28 @@ it is counted as protection.
 
 ## 2. Running the tests
 
-**There is no aggregate runner.** Each suite is executed individually. To run everything applicable:
+### Aggregate test runner
+
+The repository provides an aggregate test runner (`Scripts\Invoke-TestSuites.ps1`) that executes
+every runnable suite in its own process, captures exit codes accurately, applies a per-suite timeout
+(default 300s, preventing hung suites like `Test-DragResize` from stalling CI), classifies `SKIP`
+separately from `PASS`, and returns non-zero if any suite fails:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Scripts\Invoke-TestSuites.ps1
+```
+
+> Do not document or invoke a `Run-AllTests.ps1` — no such file exists. Use `Scripts\Invoke-TestSuites.ps1`.
+
+### Running individual suites
+
+To run a single suite:
+
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\Test-ComputerBusy.ps1
+```
+
+Or run suites via a manual loop:
 
 ```powershell
 Get-ChildItem .\tests\Test-*.ps1 |
@@ -55,28 +76,21 @@ Get-ChildItem .\tests\Test-*.ps1 |
     ForEach-Object { powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File $_.FullName }
 ```
 
-To run one suite:
-
-```powershell
-powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\Test-ComputerBusy.ps1
-```
-
-**Baseline:** 30 test files; 2 excluded because they are GUI-edition leftovers; **28 runnable**;
-**27 pass / 1 skip / 0 fail**.
-
-> Do not document or invoke a `Run-AllTests.ps1` — no such file exists. An earlier revision of this
-> document named one; the reference was wrong for exactly one revision and was corrected here.
+**Baseline:** 61 test files; 2 excluded because they are GUI-edition leftovers (`Test-ColumnResize.ps1` and `Test-DragResize.ps1`); **59 runnable**;
+**58 pass / 1 skip / 0 fail** (plus 5 developer tools in `tests\` that are not test suites).
 
 ### Two stale GUI suites
 
 `tests\Test-ColumnResize.ps1` and `tests\Test-DragResize.ps1` exercise WPF column drag-resize, which
 does not exist in the console edition. ColumnResize **fails** on missing WPF assemblies; DragResize
-**hangs** (blocking dispatcher pump). Both are excluded from the loop above and both should be deleted.
+**hangs** (blocking dispatcher pump). Both are excluded by `Scripts\Invoke-TestSuites.ps1` and the
+manual loop above, and both are scheduled for retirement.
 
 ### Timeout the loop
 
-Wrap a per-suite timeout with straggler cleanup around the loop. One hung suite must not stall a full
-run — this is not hypothetical; DragResize hangs indefinitely.
+When running outside `Scripts\Invoke-TestSuites.ps1`, wrap a per-suite timeout with straggler cleanup
+around any custom loop. One hung suite must not stall a full run — this is not hypothetical;
+`Test-DragResize` hangs indefinitely.
 
 ## 3. The validator
 
