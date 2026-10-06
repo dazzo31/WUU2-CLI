@@ -30,7 +30,7 @@ function Initialize-WuuConfiguration {
 # record) read the same value; the release gate checks it against the git tag at HEAD. A prerelease string
 # marks every audit record as pre-release evidence - never reuse it for a final release.
 # Release notes: docs/RELEASE_NOTES_<version>.md. Invariant status: .github/copilot-instructions.md Appendix A.
-$global:WuuVersion = 'v1.5.0-rc.2-cli'
+$global:WuuVersion = 'v1.5.0-rc.3-cli'
 
 # SS18: PROVENANCE, immediately after the literal so the resolved value cannot be overwritten by it.
 #

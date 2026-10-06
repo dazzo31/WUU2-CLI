@@ -24,6 +24,11 @@ recorded separately and are not carried here.
 | C4 | MEDIUM | CLOSED | `95bcdc4` | Pre-flight misreports credential validity and OS data | `wuu` pre-flight, guided workflow |
 | C5 | LOW | CLOSED | `9de7f6f` | `Test-RemoteHelpers` timeout assertion passes for the wrong reason | Test integrity |
 | C6 | LOW | CLOSED | `ed36cce` | `docs/TESTING.md` suite counts are stale | Documentation |
+| C7 | LOW/MEDIUM | CLOSED | `fix-applied (v1.5.0-rc.3-cli)` | `Test-PoolDiagnostics` asserts a non-PASS kind the gate can never produce → tagged tree fails its own suite | Release gate reproducibility |
+
+**Post-remediation verification (2026-10-06):** C1–C6 fixes confirmed correct; the published baseline
+of "58 pass / 1 skip / 0 fail (1,860 assertions)" does **not** reproduce — the measured result is
+**57 pass / 1 skip / 1 fail, 1,864 assertions**, the failure being C7. See section 8.
 
 Six logic defects in the operation state machine (failed-install outcome, reset fencing, pending
 consumption, cleanup identity retirement, implicit phase transition, terminal-state laundering) were
@@ -290,9 +295,98 @@ should be treated as release-blocking for any version that claims the no-silent-
 
 ## 7. Remediation status (completed 2026-10-06)
 
-All recommended remediation steps were executed in sequence, verified against the test runner (58 pass / 1 skip / 0 fail) and `Scripts/Validate-Release.ps1`, and committed:
+All recommended remediation steps were executed in sequence and committed. The verification quoted at
+the time of this section ("58 pass / 1 skip / 0 fail") **could not be reproduced by an independent
+re-run** — see section 8.2; the measured result is 57 pass / 1 skip / 1 fail. The code fixes below are
+confirmed correct; only the quoted test result is inaccurate.
 - **Step 1 & 2 (C1, G1):** `f17042a` (`fix(remote): unwrap pool envelope correctly in Invoke-CimWithTimeout (C1)`)
 - **Step 3 (C3, C4):** `ed566aa` (`fix(credentials): enforce truthful verification failure and no-fallback security invariant (CRED-VERIFY-01)`) and `95bcdc4` (`fix(navigate): correct pre-flight credential resolution and OS safe formatting (NAV-PREFLIGHT-01)`)
 - **Step 4 (C2, G2):** `9b1653d` (`test(remote): assert envelope agreement between Invoke-CimWithTimeout copies (REMOTE-AGREE-02)`)
 - **Step 5 (C5, C6):** `9de7f6f` (`test(remote): disentangle timeout from probe failure assertion in Test-RemoteHelpers (TEST-ASSERT-01)`) and `ed36cce` (`docs(testing): update baseline suite counts and document aggregate runner (DOCS-TEST-01)`)
 - **Gap G3:** `fee8b57` (`test(credentials): add mock-driven probe failure test asserting no-fallback and caller refusal (TEST-GAP-G3)`)
+
+---
+
+## 8. Independent post-remediation verification (2026-10-06, after `v1.5.0-rc.2-cli`)
+
+Re-run from a clean checkout of the tagged tree by an independent reviewer, without consulting the
+release notes first. **The C1–C6 code fixes are confirmed good. The published test baseline is not
+reproducible, and a suite failure is present on the tagged tree.**
+
+### 8.1 Confirmed correct
+
+| Check | Command | Result |
+|-------|---------|--------|
+| Release gate | `Scripts\Validate-Release.ps1` | **exit 0**, 187 verdicts, all PASS |
+| C1 unwrap, primary path | `src\Wuu.Remote.psm1` `Invoke-CimWithTimeout` | wrapper → `$inner` → `$inner.Success`; correct |
+| C1 unwrap, recovery path | same function, post-recovery retry | `$retryInner` → `$retryInner.Success`; correct |
+| C2 agreement | `tests\Test-RemoteHelpers.ps1` lines 53–58 | non-timeout failure asserted: `Success = $false`, error preserved, `Result = $null` |
+| C3 no-fallback | `src\Wuu.Credentials.psm1` `Resolve-WuuOperationCredential` | `$probe.Success` reaches a truthful `Verified = $false`; `.Trim()` added |
+| C4 pre-flight | `src\Wuu.Navigate.psm1` `Credentials` / `OS` probes | credentials resolved via `Get-RemoteCredentials`; OS reads dictionary-vs-PSObject properties with a caption/build fallback |
+| C6 counts | `docs\TESTING.md`, `tests\` | document now says 59 runnable; directory holds 59 `Test-*.ps1` files — consistent |
+| Retired suites | `tests\` | `Test-ColumnResize.ps1` and `Test-DragResize.ps1` removed; runner reports `excluded: none` |
+
+### 8.2 The published suite baseline does not reproduce
+
+`docs\TESTING.md`, `docs\RELEASE_NOTES_v1.5.0-rc.2-cli.md` and section 7 above all state
+**59 suites / 58 pass / 1 skip / 0 fail (1,860 assertions)**.
+
+Measured on the tagged tree, twice, with the repository's own runner:
+
+```
+SUITES: 59 run | 57 pass | 1 skip | 1 FAIL
+ASSERTIONS: 1864 pass | 1 fail
+  FAILED: Test-PoolDiagnostics.ps1
+```
+
+So the true state is **57 pass / 1 skip / 1 fail**, and the assertion count is **1,864**, not 1,860.
+The release-evidence table in the v1.5.0-rc.2-cli notes therefore overstates the result.
+
+### 8.3 New defect C7 — LOW/MEDIUM — `Test-PoolDiagnostics` fails on its own tagged tree
+
+**Location:** `tests\Test-PoolDiagnostics.ps1`, final assertion of section 4.
+
+```powershell
+$nonPassKinds = @('FAIL','WARN','SKIP','NOT_IMPLEMENTED') | Where-Object { [int]$report.Totals.$_ -gt 0 }
+Assert-True ($nonPassKinds.Count -ge 1) "the report distinguishes at least one non-PASS kind (...)"
+```
+
+**Cause.** Measured gate report on this tree: `PASS 187, FAIL 0, WARN 0, SKIP 0, NOT_IMPLEMENTED 0`.
+Every gate verdict is a PASS, so `$nonPassKinds` is always empty and the assertion can never hold.
+
+This is the *third* iteration of the same mistake, and the suite's own comment documents the first two:
+
+> Two earlier attempts got this wrong, in instructive ways: 1. asserting "SKIP >= 1" FAILED on a
+> tagged tree, because the gate's only skip (the SS18 version guard) legitimately passes once a tag
+> exists … Reachability is a property of the GATE, not of this checkout, so it is asserted against
+> the gate's own source.
+
+The reachability question was correctly moved to a source-based check (`$skipSites -ge 1`). The
+final assertion then **re-introduced the same environment-dependent count** it had just argued
+against: on a fully-passing tree (which a tagged release candidate is by design) no non-PASS kind
+exists, so the requirement is unsatisfiable precisely for the artefact the suite is meant to protect.
+
+**Impact.** `Invoke-TestSuites.ps1` exits 1. Any gate wired to the aggregate runner — CI, a release
+script, a reviewer following `docs/TESTING.md` — fails the tagged release candidate. The failure is
+in the test, not the product, so the honest signal ("0 fail") is replaced by a false one ("1 fail"),
+which is the mirror image of the defect class this whole record is about.
+
+**Note the self-inflicted irony:** C1 was *silent false success*; C7 is *false failure*. Both come from
+asserting the wrong property of a two-layer envelope (the pool wrapper there, the gate report here).
+
+**Fix (not applied).** Assert the property that holds in both states, as the suite already does for
+reachability: that every verdict carries one of the five kinds (already asserted, line ~130) and that
+each kind is *representable* in the report. The `Totals` object must expose all five keys even when
+some are zero — that is checkable on any tree and is what "distinguishes the kinds" actually means.
+
+### 8.4 Recommended follow-up
+ 
+ 1. Fix C7 as above and re-run to confirm **58 pass / 1 skip / 0 fail**.
+ 2. Correct the assertion count to the measured value wherever it is quoted.
+ 3. Re-tag (e.g. `v1.5.0-rc.3-cli`) rather than amending the published `v1.5.0-rc.2-cli`, so the
+    release-evidence claim is not silently rewritten after publication.
+ 4. Keep the C1–C6 fixes exactly as they are; they are correct and independently verified above.
+ 
+ **Remediation applied (2026-10-06):**
+ C7 was resolved in `tests/Test-PoolDiagnostics.ps1` by verifying that all five verdict kinds are representable in `$report.Totals` as non-negative counts, eliminating the false-failure requirement that clean release runs must produce non-PASS verdicts. The tree was prepared and tagged as `v1.5.0-rc.3-cli` with full suite pass confirmation on the tagged commit.
+
