@@ -23,7 +23,9 @@
       4. the load path actually consults it;
       5. the propagation matrix: which credential reaches each remote call, for custom-on/local,
          custom-on/remote and custom-off, and that the download/install task path - the ones that
-         actually change a remote machine - is given a credential in every remote case.
+         actually change a remote machine - is given a credential in every remote case;
+      6. live and mocked probe failures (C3 / G3): unverified custom credential reports
+         Verified = false, preserves probe error text, enforces no-fallback, and throws on use.
 #>
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -335,6 +337,67 @@ if ($threwGetRemote -and $getRemoteMsg -match 'cannot be used') {
     Ok 'end-to-end: Get-RemoteCredentials throws on unverified custom credential'
 } else {
     Bad "end-to-end: Get-RemoteCredentials failed to throw: msg='$getRemoteMsg'"
+}
+
+# (h) Mocked probe failure test (G3 / C3)
+# Exercises Resolve-WuuOperationCredential and Get-RemoteCredentials end-to-end with a mock
+# Invoke-CimWithTimeout that explicitly returns a non-timeout probe failure (e.g. E_ACCESSDENIED),
+# proving that the failure hashtable is preserved, Verified is set to $false, no fallback is attempted,
+# and Get-RemoteCredentials refuses the unverified identity with a fatal throw.
+$credMod = Get-Module Wuu.Credentials
+& $credMod {
+    function script:Invoke-CimWithTimeout {
+        param([string]$ComputerName, [string]$ClassName, [string]$Operation, $Credential, [int]$TimeoutSeconds, $ComputerRow)
+        return @{ Success = $false; Error = '0x80070005 (E_ACCESSDENIED)'; Result = $null }
+    }
+}
+
+try {
+    $global:UseCustomCredentials = $true
+    $mockSec = ConvertTo-SecureString 'mock-pass' -AsPlainText -Force
+    $global:CustomCredentials = New-Object System.Management.Automation.PSCredential('CONTOSO\mock-admin', $mockSec)
+    $global:CredentialCache = @{}
+
+    $mockResolved = Resolve-WuuOperationCredential -ComputerName 'SRV-MOCK-PROBE' -Verify -TimeoutSeconds 5
+    if ($mockResolved.Verified -eq $false) {
+        Ok 'mock G3: mocked probe failure reports Verified = false'
+    } else {
+        Bad "mock G3: mocked probe failure reported Verified = $($mockResolved.Verified)"
+    }
+    if ($mockResolved.Error -eq '0x80070005 (E_ACCESSDENIED)') {
+        Ok 'mock G3: mocked probe failure preserves exact error text'
+    } else {
+        Bad "mock G3: error text mismatch: '$($mockResolved.Error)'"
+    }
+    if ($mockResolved.Reason -match 'no fallback attempted') {
+        Ok "mock G3: reason contains 'no fallback attempted' clause ($($mockResolved.Reason))"
+    } else {
+        Bad "mock G3: reason missing no-fallback clause: '$($mockResolved.Reason)'"
+    }
+    if ($mockResolved.Mode -eq 'Custom' -and $mockResolved.Credential.UserName -eq 'CONTOSO\mock-admin') {
+        Ok 'mock G3: credential mode remains Custom and identity is preserved'
+    } else {
+        Bad "mock G3: credential mode or identity changed: Mode='$($mockResolved.Mode)'"
+    }
+
+    $mockThrew = $false
+    $mockThrewMsg = ''
+    try {
+        $null = Get-RemoteCredentials -ComputerName 'SRV-MOCK-PROBE' -Operation 'install'
+    } catch {
+        $mockThrew = $true
+        $mockThrewMsg = $_.Exception.Message
+    }
+    if ($mockThrew -and $mockThrewMsg -match 'cannot be used.*0x80070005') {
+        Ok 'mock G3: Get-RemoteCredentials throws on mocked verification failure and preserves error'
+    } else {
+        Bad "mock G3: Get-RemoteCredentials failed to throw expected message: '$mockThrewMsg'"
+    }
+} finally {
+    & $credMod { Remove-Item function:Invoke-CimWithTimeout -ErrorAction SilentlyContinue }
+    $global:UseCustomCredentials = $false
+    $global:CustomCredentials = $null
+    $global:CredentialCache = @{}
 }
 
 # Clean up test credential state
