@@ -1,0 +1,75 @@
+name: Feature request
+description: Suggest an improvement or a new capability for WUU2-CLI
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before requesting, please skim the invariants in `.github/copilot-instructions.md` and
+        `docs/ARCHITECTURE.md`. WUU2-CLI targets PowerShell 5.1, adds no external dependencies, and is
+        console-only (no WPF/XAML). Requests that would break those constraints cannot be accepted as-is.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and the documentation for this.
+          required: true
+        - label: This request is compatible with PowerShell 5.1 and adds no external dependency.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the operational problem, not only the solution you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including any existing verb, menu path or documented workaround.
+    validations:
+      required: false
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface would this affect?
+      options:
+        - CLI verb / command
+        - Interactive menu / guided workflow
+        - Reporting / audit
+        - State, scheduler or timeout behaviour
+        - Documentation only
+        - Other / not sure
+    validations:
+      required: true
+  - type: checkboxes
+    id: contracts
+    attributes:
+      label: Contracts this touches
+      description: Tick anything this change would affect, so the invariants can be reviewed up front.
+      options:
+        - label: Exit codes
+          required: false
+        - label: Audit trail / fail-closed behaviour
+          required: false
+        - label: State machine / terminal states
+          required: false
+        - label: Operation identity / concurrency / timeouts
+          required: false
+        - label: None of the above / not sure
+          required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+    validations:
+      required: false

@@ -1,0 +1,97 @@
+name: Bug report
+description: Report a defect in WUU2-CLI (console edition)
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do **not** include credentials, private keys, host inventories,
+        or unredacted audit logs. For security issues, use private reporting instead — see SUPPORT.md.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I am running the latest release (`v1.5.0-rc.1-cli` or newer).
+          required: true
+        - label: I ran WUU2-CLI elevated, with `-STA`.
+          required: true
+        - label: I searched existing issues for a duplicate.
+          required: true
+        - label: My report contains no credentials, tokens, or unredacted audit content.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: WUU2-CLI version
+      description: "From the banner, or `src/Wuu.Configuration.psm1` (`$global:WuuVersion`)."
+      placeholder: "v1.5.0-rc.1-cli"
+    validations:
+      required: true
+  - type: dropdown
+    id: psversion
+    attributes:
+      label: PowerShell host
+      options:
+        - Windows PowerShell 5.1
+        - PowerShell 7 (best-effort / remote worker paths)
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version (host and, if relevant, target)
+      placeholder: "Server 2022 21H2 (host); Server 2019 (target)"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command or menu path
+      description: Include flags such as `-Computer`, `-All`, `-Reason`, `-Json`, `-WhatIf`, `-Async`.
+      render: powershell
+      placeholder: '.\WUU.ps1 install -Computer SRV01 -Reason "CHG-1041 security patches"'
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected to happen
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+      description: Include the exit code if you have it (see docs/EXIT_CODES.md).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output (redacted)
+      description: |
+        Debug logging is off by default; set `WUU_DEBUG=1` to enable it for a run.
+        Redact credentials, host names and audit content.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: audit
+    attributes:
+      label: Audit trail
+      options:
+        - label: I ran `wuu audit verify` and want to note its result (describe it above if it failed).
+          required: false

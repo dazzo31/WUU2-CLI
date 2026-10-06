@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/dazzo31/WUU2-CLI/security/advisories/new
+    about: Please report security issues privately, not as public issues. See SECURITY.md.
+  - name: Support and documentation
+    url: https://github.com/dazzo31/WUU2-CLI/blob/master/SUPPORT.md
+    about: Where to read first, and a few quick self-checks, before opening an issue.
+  - name: Contributing guide
+    url: https://github.com/dazzo31/WUU2-CLI/blob/master/CONTRIBUTING.md
+    about: How to build, test (release gate + suite runner) and submit a change.
