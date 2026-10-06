@@ -292,6 +292,57 @@ foreach ($pair in @(@{ Name = 'Wuu.Core'; Text = $coreRaw }, @{ Name = 'Wuu.Wind
 }
 if (-not $failed) { Ok 'no log or audit call interpolates a password-shaped expression' }
 
+# (g) End-to-end credential verification probe failure (C3 / G3)
+# Exercises Resolve-WuuOperationCredential and Get-RemoteCredentials against a real failing
+# probe through the exported Invoke-CimWithTimeout (without mocking), verifying that
+# verification failure is truthfully reported and silent fallback is impossible.
+$global:UseCustomCredentials = $true
+$badSec = ConvertTo-SecureString 'invalid-password-test' -AsPlainText -Force
+$global:CustomCredentials = New-Object System.Management.Automation.PSCredential('CONTOSO\nonexistent-user', $badSec)
+$global:CredentialCache = @{}
+
+$resFail = Resolve-WuuOperationCredential -ComputerName localhost -Verify -TimeoutSeconds 5
+if ($resFail.Verified -eq $false) {
+    Ok 'end-to-end: rejected credential reports Verified = false through exported Invoke-CimWithTimeout'
+} else {
+    Bad "end-to-end: rejected credential reported Verified = $($resFail.Verified)"
+}
+if ($resFail.Mode -eq 'Custom' -and $resFail.Credential.UserName -eq 'CONTOSO\nonexistent-user') {
+    Ok 'end-to-end: Mode remains Custom and identity is preserved (no fallback)'
+} else {
+    Bad "end-to-end: Mode or identity altered: Mode='$($resFail.Mode)'"
+}
+if ($resFail.Reason -match 'no fallback attempted') {
+    Ok "end-to-end: Reason explicitly records no fallback attempted: '$($resFail.Reason)'"
+} else {
+    Bad "end-to-end: Reason missing no-fallback clause: '$($resFail.Reason)'"
+}
+if ($resFail.Error -ne '') {
+    Ok "end-to-end: Error captured from probe failure: '$($resFail.Error)'"
+} else {
+    Bad 'end-to-end: Error was empty despite probe failure'
+}
+
+$threwGetRemote = $false
+$getRemoteMsg = ''
+try {
+    $null = Get-RemoteCredentials -ComputerName localhost -Operation 'test-op'
+} catch {
+    $threwGetRemote = $true
+    $getRemoteMsg = $_.Exception.Message
+}
+if ($threwGetRemote -and $getRemoteMsg -match 'cannot be used') {
+    Ok 'end-to-end: Get-RemoteCredentials throws on unverified custom credential'
+} else {
+    Bad "end-to-end: Get-RemoteCredentials failed to throw: msg='$getRemoteMsg'"
+}
+
+# Clean up test credential state
+$global:UseCustomCredentials = $false
+$global:CustomCredentials = $null
+$global:CredentialCache = @{}
+try { Close-WuuWorkerPool } catch { }
+
 Write-Host ''
 if ($fail -eq 0) {
     Write-Host 'Test-CredentialPropagation.ps1: ALL PASS' -ForegroundColor Green

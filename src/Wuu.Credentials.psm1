@@ -162,14 +162,14 @@ function Resolve-WuuOperationCredential {
                 $verified = $true
             } else {
                 $verified = $false
-                $errorText = if ($probe -and $probe.Error) { [string]$probe.Error } else { 'the credential probe did not succeed' }
+                $errorText = if ($probe -and $probe.Error) { ([string]$probe.Error).Trim() } else { 'the credential probe did not succeed' }
                 # DELIBERATE: no fallback attempt happens here, and none is offered. The caller gets
                 # the identity it asked for plus the reason it cannot be used, and decides.
                 $reason = "the $($mode.ToLower()) credential could not be verified: $errorText (no fallback attempted)"
             }
         } catch {
             $verified = $false
-            $errorText = $_.Exception.Message
+            $errorText = ([string]$_.Exception.Message).Trim()
             $reason = "the $($mode.ToLower()) credential probe failed: $errorText (no fallback attempted)"
         }
     }
