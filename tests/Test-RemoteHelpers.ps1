@@ -7,8 +7,9 @@ Mirrors the app's import topology. Verifies against localhost:
   1. Invoke-CimWithTimeout returns real CIM data (Win32_ComputerSystem)
   2. Invoke-ServiceWithTimeout checks wuauserv status
   3. Test-SystemDependencies probes localhost successfully
-  4. Hard timeout path still fires (unreachable IP with short timeout)
-  5. Pool reuse across helpers (sequential calls share one pool)
+  4. Hard timeout path fires on unreachable host (timeout error, Result null)
+  5. Non-timeout probe failure reports Success = $false, preserves error, Result null (C1/C5/G1)
+  6. Pool reuse across helpers (sequential calls share one pool)
 Exit code 0 = all pass, 1 = failure.
 #>
 param([string]$RepoRoot = (Split-Path $PSScriptRoot -Parent))
@@ -42,14 +43,20 @@ Assert-True ($svc.Success) "Service helper checks wuauserv (status: $($svc.Statu
 $deps = Test-SystemDependencies -ComputerName localhost
 Assert-True ($deps['RPC']) 'dependency probe reports RPC reachable on localhost'
 
-# 4. Hard timeout still fires (192.0.2.1 is TEST-NET, guaranteed non-routable)
+# 4. Hard timeout path (192.0.2.1 is TEST-NET, guaranteed non-routable)
+# Disentangled from probe failure (C5): assert timeout failure, timeout message, and Result null separately.
 $timeoutTest = Invoke-CimWithTimeout -ComputerName '192.0.2.1' -TimeoutSeconds 3
-Assert-True ((-not $timeoutTest.Success) -and ($timeoutTest.Error -like '*timed out*')) "hard timeout fires on unreachable host ($($timeoutTest.Error))"
+Assert-True (-not $timeoutTest.Success) 'hard timeout reports Success = $false'
+Assert-True ($timeoutTest.Error -like '*timed out*') "hard timeout error identifies timeout ($($timeoutTest.Error))"
+Assert-True ($null -eq $timeoutTest.Result) 'hard timeout leaves Result null'
 
-# 5. Non-timeout probe failure (C1 / G1): invalid class reports Success = $false with error
+# 5. Non-timeout probe failure (C1 / C5 / G1): invalid class reports Success = $false with error
+# Exercises the inner failure unwrap path that timeout tests cannot reach.
 $badClass = Invoke-CimWithTimeout -ComputerName localhost -ClassName 'NoSuchClass_RemoteHelpersTest' -TimeoutSeconds 10
-Assert-True ((-not $badClass.Success) -and ($badClass.Error -like '*Invalid class*')) "non-timeout failure on invalid class reports Success = `$false with error ($($badClass.Error))"
-Assert-True ($null -eq $badClass.Result) 'non-timeout failure leaves Result null'
+Assert-True (-not $badClass.Success) 'non-timeout probe failure reports Success = $false (not masked by pool success)'
+Assert-True ($badClass.Error -like '*Invalid class*') "non-timeout probe failure preserves error text ($($badClass.Error))"
+Assert-True ($null -eq $badClass.Result) 'non-timeout probe failure leaves Result null (does not leak inner hashtable)'
+Assert-True ($badClass -is [System.Collections.IDictionary]) 'helper returns standard result dictionary on probe failure'
 
 # 6. Pool reuse - all helpers share the single module pool
 $pool1 = Get-WuuWorkerPool
