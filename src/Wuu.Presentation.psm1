@@ -594,35 +594,35 @@ function Format-WuuHorizontalBar {
         [switch]$ShowPercent = $true
     )
 
-    if ($Total -lt 0) { $Total = 0 }
-    if ($Value -lt 0) { $Value = 0 }
-    if ($BarWidth -lt 0) { $BarWidth = 0 }
+    $val = if ($Value -lt 0) { 0 } else { $Value }
+    $tot = if ($Total -lt 0) { 0 } else { $Total }
+    $bw = if ($BarWidth -lt 0) { 0 } else { $BarWidth }
 
-    $countStr = "{0}/{1}" -f $Value, $Total
+    $countStr = "{0}/{1}" -f $val, $tot
     $paddedLabel = if ($LabelWidth -gt 0) { "{0,-$LabelWidth}" -f $Label } else { $Label }
     $paddedCount = if ($CountWidth -gt 0) { "{0,$CountWidth}" -f $countStr } else { $countStr }
 
-    if ($Total -eq 0) {
-        $emptyBar = if ($BarWidth -gt 0) { "[{0}]" -f (([string]$EmptyChar) * $BarWidth) } else { "" }
+    if ($tot -eq 0) {
+        $emptyBar = if ($bw -gt 0) { "[{0}]" -f (([string]$EmptyChar) * $bw) } else { "" }
         $pctStr = if ($ShowPercent) { " N/A" } else { "" }
         return ("{0} {1} {2}{3}" -f $paddedLabel, $paddedCount, $emptyBar, $pctStr).TrimEnd()
     }
 
-    $ratio = [double]$Value / [double]$Total
+    $ratio = [double]$val / [double]$tot
     if ($ratio -gt 1.0) { $ratio = 1.0 }
     if ($ratio -lt 0.0) { $ratio = 0.0 }
 
-    $fillCount = [int][math]::Floor($ratio * $BarWidth)
-    if ($Value -gt 0 -and $fillCount -eq 0 -and $BarWidth -gt 0) {
+    $fillCount = [int][math]::Floor($ratio * $bw)
+    if ($val -gt 0 -and $fillCount -eq 0 -and $bw -gt 0) {
         $fillCount = 1
     }
-    if ($Value -ge $Total -and $BarWidth -gt 0) {
-        $fillCount = $BarWidth
+    if ($val -ge $tot -and $bw -gt 0) {
+        $fillCount = $bw
     }
-    $emptyCount = $BarWidth - $fillCount
+    $emptyCount = $bw - $fillCount
     if ($emptyCount -lt 0) { $emptyCount = 0 }
 
-    $barStr = if ($BarWidth -gt 0) {
+    $barStr = if ($bw -gt 0) {
         "[{0}{1}]" -f (([string]$FillChar) * $fillCount), (([string]$EmptyChar) * $emptyCount)
     } else { "" }
 
@@ -653,8 +653,9 @@ function Format-WuuPhaseDistribution {
 
     $calculatedTotal = $Succeeded + $Failed + $TimedOut + $Running + $Queued + $Unknown
     $effectiveTotal = if ($Total -ge 0) { $Total } else { $calculatedTotal }
-    if ($effectiveTotal -gt $calculatedTotal -and $Unknown -eq 0) {
-        $Unknown = $effectiveTotal - $calculatedTotal
+    $effectiveUnknown = $Unknown
+    if ($effectiveTotal -gt $calculatedTotal -and $effectiveUnknown -eq 0) {
+        $effectiveUnknown = $effectiveTotal - $calculatedTotal
     }
 
     $categories = @(
@@ -663,7 +664,7 @@ function Format-WuuPhaseDistribution {
         @{ Label = 'TimedOut';  Role = 'Attention'; Value = $TimedOut }
         @{ Label = 'Running';   Role = 'Progress';  Value = $Running }
         @{ Label = 'Queued';    Role = 'Muted';     Value = $Queued }
-        @{ Label = 'Unknown';   Role = 'Default';   Value = $Unknown }
+        @{ Label = 'Unknown';   Role = 'Default';   Value = $effectiveUnknown }
     )
 
     $rows = @()
