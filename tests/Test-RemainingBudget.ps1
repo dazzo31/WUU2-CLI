@@ -387,6 +387,146 @@ $inlineBlock
     Assert-True ($distinct.Count -ge 3) "the cases produce at least three DIFFERENT results ($($distinct.Count)) - so agreement is meaningful"
 }
 
+'=== 12. Invoke-CimWithTimeout copies agree on envelope handling (C2 / G2) ==='
+# Two copies of Invoke-CimWithTimeout exist:
+#   - exported module-level copy in src\Wuu.Remote.psm1 (used by Credentials and Navigate)
+#   - inlined copy in src\Wuu.Core.psm1 (inside $GetUpdates payload scriptblock)
+# In defect C2, the module-level copy diverged and misread the pool envelope, treating
+# $cimResult.Success as operation success and masking failed probes (defect C1).
+# The inlined copy unwrapped $inner = $cimResult.Result and checked $inner.Success.
+# This section asserts both statically (AST) and dynamically (in a runspace) that both
+# copies agree on envelope unwrapping, closing gap G2.
+
+$remoteText = [System.IO.File]::ReadAllText((Join-Path $root 'src\Wuu.Remote.psm1'))
+$remoteAst = [System.Management.Automation.Language.Parser]::ParseInput($remoteText, [ref]$null, [ref]$null)
+$coreAst = [System.Management.Automation.Language.Parser]::ParseInput($coreText, [ref]$null, [ref]$null)
+
+$coreFnAst = @($coreAst.FindAll({ param($x) ($x -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($x.Name -eq 'Invoke-CimWithTimeout') }, $true))
+$remoteFnAst = @($remoteAst.FindAll({ param($x) ($x -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($x.Name -eq 'Invoke-CimWithTimeout') }, $true))
+
+Assert-True ($coreFnAst.Count -eq 1) 'found exactly 1 inlined Invoke-CimWithTimeout in Wuu.Core'
+Assert-True ($remoteFnAst.Count -eq 1) 'found exactly 1 exported Invoke-CimWithTimeout in Wuu.Remote'
+
+$cimCopies = @(
+    @{ Name = 'Wuu.Core (inlined)'; Fn = $coreFnAst[0] },
+    @{ Name = 'Wuu.Remote (exported)'; Fn = $remoteFnAst[0] }
+)
+
+foreach ($copy in $cimCopies) {
+    $fn = $copy.Fn
+    $lbl = $copy.Name
+
+    # 1. Both unwrap wrapper result: $inner = $cimResult.Result
+    $innerAssign = @($fn.FindAll({
+        param($x) ($x -is [System.Management.Automation.Language.AssignmentStatementAst]) -and
+                  ($x.Left.Extent.Text -eq '$inner') -and
+                  ($x.Right.Extent.Text -match '\$cimResult\.Result\b')
+    }, $true))
+    Assert-True ($innerAssign.Count -gt 0) "$lbl unwraps pool wrapper envelope into `$inner"
+
+    # 2. Both guard success on $inner.Success: if ($inner -and $inner.Success)
+    $innerSuccessIf = @($fn.FindAll({
+        param($x) ($x -is [System.Management.Automation.Language.IfStatementAst]) -and
+                  ($x.Clauses[0].Item1.Extent.Text -match '\$inner\s+-and\s+\$inner\.Success')
+    }, $true))
+    Assert-True ($innerSuccessIf.Count -gt 0) "$lbl guards operation success with `$inner.Success"
+
+    # 3. Neither bypasses inner envelope by directly returning $cimResult.Result as Success=$true
+    $bypassReturns = @($fn.FindAll({
+        param($x) ($x -is [System.Management.Automation.Language.HashtableAst]) -and
+                  ($x.Extent.Text -match 'Success\s*=\s*\$true') -and
+                  ($x.Extent.Text -match 'Result\s*=\s*\$cimResult\.Result\b')
+    }, $true))
+    Assert-True ($bypassReturns.Count -eq 0) "$lbl does NOT bypass inner envelope by returning `$cimResult.Result as Success = `$true"
+
+    # 4. Both extract error text from $inner.Error on probe failure
+    $innerErrorMatches = @($fn.FindAll({
+        param($x) ($x -is [System.Management.Automation.Language.MemberExpressionAst]) -and
+                  ($x.Extent.Text -match '\$inner\.Error\b')
+    }, $true))
+    Assert-True ($innerErrorMatches.Count -gt 0) "$lbl extracts error text from `$inner.Error on probe failure"
+
+    # 5. Both extract error text from $cimResult.Error on pool wrapper failure
+    $poolErrorMatches = @($fn.FindAll({
+        param($x) ($x -is [System.Management.Automation.Language.MemberExpressionAst]) -and
+                  ($x.Extent.Text -match '\$cimResult\.Error\b')
+    }, $true))
+    Assert-True ($poolErrorMatches.Count -gt 0) "$lbl extracts error text from `$cimResult.Error on wrapper failure"
+}
+
+# 6. Post-recovery retry in Wuu.Remote also unwraps $retryResult
+$retryInnerAssign = @($remoteFnAst[0].FindAll({
+    param($x) ($x -is [System.Management.Automation.Language.AssignmentStatementAst]) -and
+              ($x.Left.Extent.Text -eq '$retryInner') -and
+              ($x.Right.Extent.Text -match '\$retryResult\.Result\b')
+}, $true))
+Assert-True ($retryInnerAssign.Count -gt 0) 'Wuu.Remote post-recovery retry unwraps $retryResult.Result into $retryInner'
+
+$retryInnerSuccessIf = @($remoteFnAst[0].FindAll({
+    param($x) ($x -is [System.Management.Automation.Language.IfStatementAst]) -and
+              ($x.Clauses[0].Item1.Extent.Text -match '\$retryInner\s+-and\s+\$retryInner\.Success')
+}, $true))
+Assert-True ($retryInnerSuccessIf.Count -gt 0) 'Wuu.Remote post-recovery retry guards success with $retryInner.Success'
+
+# 7. Dynamic execution test of inlined helper in an isolated runspace with mock pool outcomes
+$inlinedFnText = $coreFnAst[0].Extent.Text
+$issEnvelope = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$issEnvelope.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+$rsEnvelope = [runspacefactory]::CreateRunspace($issEnvelope)
+$rsEnvelope.ApartmentState = 'STA'
+$rsEnvelope.Open()
+
+$psEnv = [PowerShell]::Create()
+$psEnv.Runspace = $rsEnvelope
+[void]$psEnv.AddScript(@"
+$inlinedFnText
+
+`$global:MockPoolOutcome = `$null
+`$global:InvokePooledScript = {
+    param(`$Pool, `$ScriptBlock, `$ArgumentList, `$TimeoutSeconds, `$OperationName)
+    return `$global:MockPoolOutcome
+}
+`$global:WuuWorkerPool = @{}
+"@)
+$null = $psEnv.Invoke()
+
+# Test 7a: Failed probe inside successful wrapper envelope (the C1 bug) returns Success = $false with error
+$psEnv.Commands.Clear()
+[void]$psEnv.AddScript(@"
+`$global:MockPoolOutcome = @{ Success = `$true; Result = @{ Success = `$false; Error = 'CIM access denied (0x80070005)' } }
+`$r = Invoke-CimWithTimeout -ComputerName 'SRV01'
+[pscustomobject]@{ Success = `$r.Success; Error = `$r.Error; HasResult = (`$null -ne `$r.Result) }
+"@)
+$envOut1 = @($psEnv.Invoke())[0]
+Assert-False $envOut1.Success 'inlined copy reports Success = $false when inner probe failed (not masked by pool success)'
+Assert-Equal $envOut1.Error 'CIM access denied (0x80070005)' 'inlined copy preserves inner error message'
+Assert-False $envOut1.HasResult 'inlined copy does not return failed inner hashtable in Result'
+
+# Test 7b: Succeeded probe returns Success = $true with result data
+$psEnv.Commands.Clear()
+[void]$psEnv.AddScript(@"
+`$global:MockPoolOutcome = @{ Success = `$true; Result = @{ Success = `$true; Result = 'Win32_ComputerSystem_Data' } }
+`$r = Invoke-CimWithTimeout -ComputerName 'SRV01'
+[pscustomobject]@{ Success = `$r.Success; Result = `$r.Result }
+"@)
+$envOut2 = @($psEnv.Invoke())[0]
+Assert-True $envOut2.Success 'inlined copy reports Success = $true when inner probe succeeded'
+Assert-Equal $envOut2.Result 'Win32_ComputerSystem_Data' 'inlined copy unwraps inner Result data'
+
+# Test 7c: Wrapper timeout returns Success = $false with wrapper error
+$psEnv.Commands.Clear()
+[void]$psEnv.AddScript(@"
+`$global:MockPoolOutcome = @{ Success = `$false; Result = `$null; Error = 'CIM operation timed out after 5 seconds' }
+`$r = Invoke-CimWithTimeout -ComputerName 'SRV01'
+[pscustomobject]@{ Success = `$r.Success; Error = `$r.Error }
+"@)
+$envOut3 = @($psEnv.Invoke())[0]
+Assert-False $envOut3.Success 'inlined copy reports Success = $false on wrapper timeout'
+Assert-Equal $envOut3.Error 'CIM operation timed out after 5 seconds' 'inlined copy preserves wrapper timeout error'
+
+$psEnv.Dispose()
+$rsEnvelope.Close(); $rsEnvelope.Dispose()
+
 ''
 if ($failures.Count -eq 0) {
     Write-Host "ALL PASSED" -ForegroundColor Green
