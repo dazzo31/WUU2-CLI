@@ -204,30 +204,23 @@ test is about encoding.
 
 ---
 
-# Part B — Tests needed for the TARGET invariants
+# Part B — Target invariants and enforcement suites
 
-These do not exist. Their absence is why the corresponding invariant is TARGET rather than ENFORCED.
+All five target invariants defined for the operation state machine are now implemented and enforced by dedicated regression suites and release validator gates:
 
-| Target invariant | Test to write | Why it cannot pass today |
-| --- | --- | --- |
-| 8.4 terminal states are terminal | every transition out of `Complete`/`Failed`/`TimedOut`/`Cancelled`/`Refused` is rejected | no transition guard exists, and four of those names are not `State` values |
+| Invariant | Suite | Assertions | Validator Gate |
+| --- | --- | --- | --- |
+| 8.2 operation identity, 8.3 stale-worker rejection | `tests\Test-OperationIdentity.ps1` | 64 | SS3 |
+| 8.4 terminal states are terminal | `tests\Test-TerminalStates.ps1` | 65 | P1 / SS4 |
+| 8.6 absolute concurrency cap | `tests\Test-ConcurrencyCap.ps1` | 20 | SS4 |
+| 8.7 pending-request policy | `tests\Test-PendingPolicy.ps1` | 106 | SS7 |
 
-**8.2, 8.3, 8.6 and 8.7 are no longer on this list** — they are implemented and enforced:
-
-| Invariant | Suite | Assertions |
-| --- | --- | --- |
-| 8.2 operation identity, 8.3 stale-worker rejection | `tests\Test-OperationIdentity.ps1` | 61 |
-| 8.6 absolute concurrency cap | `tests\Test-ConcurrencyCap.ps1` | 20 |
-| 8.7 pending-request policy | `tests\Test-PendingPolicy.ps1` | 42 |
-
-Each has a validator gate alongside it ((ah), (ai), (aj)). The identity and pending suites use a
-**differential**: they extract each shipped guard condition from source and drive it on a truth table
-against the function it must mirror, so an inlined copy that drifts fails. The cap suite drives the
-**real submission point** — the path the cap was missing on — rather than the scheduler.
-`tests\Test-OperationIdentity.ps1` (61 assertions) proves operation identity exists and that a proven
-stale writer is refused. Its core is a differential that extracts each of the six shipped guard
-conditions from source and drives it on a truth table, so an inlined copy that drifts from the module
-function fails.
+Each has a validator gate alongside it. The identity, pending, and terminal suites use
+differentials: they extract each shipped guard condition and state declaration from source by AST
+and drive them on truth tables against the functions they mirror, so an inlined copy that drifts fails.
+The cap suite drives the **real submission point** — the path the cap was missing on — rather than the scheduler.
+`tests\Test-TerminalStates.ps1` (65 assertions) proves that every transition out of a terminal state is refused,
+that terminal outcomes cannot be laundered, and that settled rows accept only newly attributed operations.
 
 Rules for these tests:
 
@@ -237,11 +230,8 @@ Rules for these tests:
 * fail if the mechanism is absent — do not skip when the feature is missing, because that would
   reproduce the "green suite implies enforcement" problem this section exists to prevent.
 
-## Sequencing
+## Implementation complete
 
-Phase 2 introduced the operation identity, so the release/write rules now have something to compare.
-The admission cap (Phase 3) and the pending-work policy (Phase 4) are independent and can land first.
-Terminal-state protection (Phase 6) still needs the operation **record** (§7 of the state machine),
-not merely the identity.
+All hardening phases (Phase 2 operation identity, Phase 3 admission cap, Phase 4 pending policy, and Phase 6 terminal-state protection) were completed during the v1.5.0 cycle.
 
-See `docs/DEVELOPMENT.md` for the phase boundaries.
+See `docs/DEVELOPMENT.md` for historical phase boundaries and `RELEASE_NOTES_v1.5.0-rc.1-cli.md` for the implementation record.
