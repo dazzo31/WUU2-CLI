@@ -295,3 +295,4 @@ All recommended remediation steps were executed in sequence, verified against th
 - **Step 3 (C3, C4):** `ed566aa` (`fix(credentials): enforce truthful verification failure and no-fallback security invariant (CRED-VERIFY-01)`) and `95bcdc4` (`fix(navigate): correct pre-flight credential resolution and OS safe formatting (NAV-PREFLIGHT-01)`)
 - **Step 4 (C2, G2):** `9b1653d` (`test(remote): assert envelope agreement between Invoke-CimWithTimeout copies (REMOTE-AGREE-02)`)
 - **Step 5 (C5, C6):** `9de7f6f` (`test(remote): disentangle timeout from probe failure assertion in Test-RemoteHelpers (TEST-ASSERT-01)`) and `ed36cce` (`docs(testing): update baseline suite counts and document aggregate runner (DOCS-TEST-01)`)
+- **Gap G3:** `fee8b57` (`test(credentials): add mock-driven probe failure test asserting no-fallback and caller refusal (TEST-GAP-G3)`)
