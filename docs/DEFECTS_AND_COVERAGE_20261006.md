@@ -24,11 +24,12 @@ recorded separately and are not carried here.
 | C4 | MEDIUM | CLOSED | `95bcdc4` | Pre-flight misreports credential validity and OS data | `wuu` pre-flight, guided workflow |
 | C5 | LOW | CLOSED | `9de7f6f` | `Test-RemoteHelpers` timeout assertion passes for the wrong reason | Test integrity |
 | C6 | LOW | CLOSED | `ed36cce` | `docs/TESTING.md` suite counts are stale | Documentation |
-| C7 | LOW/MEDIUM | CLOSED | `fix-applied (v1.5.0-rc.3-cli)` | `Test-PoolDiagnostics` asserts a non-PASS kind the gate can never produce → tagged tree fails its own suite | Release gate reproducibility |
+| C7 | LOW/MEDIUM | **CLOSED** | `a3bd38b` (`v1.5.0-rc.3-cli`) | `Test-PoolDiagnostics` asserts a non-PASS kind the gate can never produce → tagged tree fails its own suite | Release gate reproducibility |
 
-**Post-remediation verification (2026-10-06):** C1–C6 fixes confirmed correct; the published baseline
-of "58 pass / 1 skip / 0 fail (1,860 assertions)" does **not** reproduce — the measured result is
-**57 pass / 1 skip / 1 fail, 1,864 assertions**, the failure being C7. See section 8.
+**Post-remediation verification (2026-10-06):** C1–C6 fixes confirmed correct; the rc.2 baseline of
+"58 pass / 1 skip / 0 fail (1,860 assertions)" did **not** reproduce — the measured result was
+**57 pass / 1 skip / 1 fail, 1,864 assertions**, the failure being C7. All seven defects are now
+closed and re-verified on `v1.5.0-rc.3-cli` (**58 pass / 1 skip / 0 fail, 1,868 assertions**). See §8.
 
 Six logic defects in the operation state machine (failed-install outcome, reset fencing, pending
 consumption, cleanup identity retirement, implicit phase transition, terminal-state laundering) were
@@ -344,6 +345,9 @@ The release-evidence table in the v1.5.0-rc.2-cli notes therefore overstates the
 
 ### 8.3 New defect C7 — LOW/MEDIUM — `Test-PoolDiagnostics` fails on its own tagged tree
 
+> **RESOLVED** in `v1.5.0-rc.3-cli` — verified at §8.5. Retained here as the record of the defect as
+> found, not as an open item.
+
 **Location:** `tests\Test-PoolDiagnostics.ps1`, final assertion of section 4.
 
 ```powershell
@@ -390,3 +394,28 @@ some are zero — that is checkable on any tree and is what "distinguishes the k
  **Remediation applied (2026-10-06):**
  C7 was resolved in `tests/Test-PoolDiagnostics.ps1` by verifying that all five verdict kinds are representable in `$report.Totals` as non-negative counts, eliminating the false-failure requirement that clean release runs must produce non-PASS verdicts. The tree was prepared and tagged as `v1.5.0-rc.3-cli` with full suite pass confirmation on the tagged commit.
 
+### 8.5 Independent verification of `v1.5.0-rc.3-cli` (2026-10-06)
+
+Re-run on the tagged commit `a3bd38b` (`v1.5.0-rc.3-cli`), clean working tree, by the same reviewer
+that raised C7 and using the repository's own commands.
+
+| Check | Claimed | Measured |
+|-------|---------|----------|
+| C7 resolution | resolved | **confirmed** — `Test-PoolDiagnostics` now PASS (51 assertions, up from 47) |
+| Full suite | 58 PASS / 1 SKIP / 0 FAIL | **confirmed** — 59 run, 58 pass, 1 skip, 0 fail, **exit 0** |
+| Assertion count | 1,868 | **confirmed** — 1,868 pass, 0 fail |
+| Release gate | PASS | **confirmed** — exit 0, "All validation checks passed" |
+| Version literal | `v1.5.0-rc.3-cli` | **confirmed** — `src\Wuu.Configuration.psm1` line 33 |
+| Release notes | present | **confirmed** — `docs\RELEASE_NOTES_v1.5.0-rc.3-cli.md` |
+
+The C7 replacement asserts the right property: each of the four non-PASS kinds is present in
+`$report.Totals` as a non-negative count, alongside the existing AST reachability check
+(`$skipSites -ge 1`). That is satisfiable on a fully-passing tree, and still fails if the gate stops
+tracking a kind — which is what "distinguishes the kinds" actually means. This is the third and
+correct formulation of the check, and the reasoning is now recorded in-source so a fourth attempt is
+unlikely.
+
+**State: C1–C7 all closed and independently verified.** The `v1.5.0-rc.3-cli` release-evidence table
+reproduces as published, unlike rc.2's. The §8.4 follow-ups are satisfied except item 3's inverse:
+rc.2's notes were left as published history rather than edited, which is the correct choice, and the
+new claim lives in a new tag.
