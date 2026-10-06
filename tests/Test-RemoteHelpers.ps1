@@ -46,7 +46,12 @@ Assert-True ($deps['RPC']) 'dependency probe reports RPC reachable on localhost'
 $timeoutTest = Invoke-CimWithTimeout -ComputerName '192.0.2.1' -TimeoutSeconds 3
 Assert-True ((-not $timeoutTest.Success) -and ($timeoutTest.Error -like '*timed out*')) "hard timeout fires on unreachable host ($($timeoutTest.Error))"
 
-# 5. Pool reuse - all helpers share the single module pool
+# 5. Non-timeout probe failure (C1 / G1): invalid class reports Success = $false with error
+$badClass = Invoke-CimWithTimeout -ComputerName localhost -ClassName 'NoSuchClass_RemoteHelpersTest' -TimeoutSeconds 10
+Assert-True ((-not $badClass.Success) -and ($badClass.Error -like '*Invalid class*')) "non-timeout failure on invalid class reports Success = `$false with error ($($badClass.Error))"
+Assert-True ($null -eq $badClass.Result) 'non-timeout failure leaves Result null'
+
+# 6. Pool reuse - all helpers share the single module pool
 $pool1 = Get-WuuWorkerPool
 $null = Invoke-CimWithTimeout -ComputerName localhost -ClassName Win32_OperatingSystem -TimeoutSeconds 15
 $null = Invoke-ServiceWithTimeout -ComputerName localhost -ServiceName wuauserv -Action Check -TimeoutSeconds 15

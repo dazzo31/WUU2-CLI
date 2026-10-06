@@ -122,47 +122,60 @@ function Invoke-CimWithTimeout {
         } -ArgumentList @($ComputerName, $ClassName, $Credential) -TimeoutSeconds $TimeoutSeconds -OperationName $Operation
         
         if ($cimResult.Success) {
-            return @{ Success = $true; Result = $cimResult.Result }
+            $inner = $cimResult.Result
+            if ($inner -and $inner.Success) {
+                return @{ Success = $true; Result = $inner.Result }
+            }
+            $errorMsg = if ($inner -and $inner.Error) { $inner.Error } else { 'Unknown error' }
         } else {
-            # Recovery hook for RPC-class errors (0x800706ba, 0x800706be)
             $errorMsg = $cimResult.Error
-            $hresult = $null
-            if ($errorMsg -match '0x([0-9A-Fa-f]{8})') {
-                try { $hresult = [Convert]::ToInt32($matches[1], 16) } catch { }
-            }
-            if ($hresult -eq 0x800706ba -or $hresult -eq 0x800706be) {
-                try {
-                    $recoverySucceeded = Invoke-AutoRecovery -ComputerName $ComputerName -ErrorCode $errorMsg -ErrorAction SilentlyContinue
-                    if ($recoverySucceeded) {
-                        Start-Sleep -Seconds 2   # brief pause before retry
-                        # Retry once after recovery
-                        $retryResult = Invoke-WithPoolTimeout -ScriptBlock {
-                            param([string]$ComputerName, [string]$ClassName, [pscredential]$Cred)
-                            $cimSession = $null
-                            try {
-                                $sessionArgs = @{ ComputerName = $ComputerName; SessionOption = (New-CimSessionOption -Protocol DCOM) }
-                                if ($Cred) { $sessionArgs['Credential'] = $Cred }
-                                $cimSession = New-CimSession @sessionArgs -ErrorAction Stop
-                                $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
-                                return @{ Success = $true; Result = $result }
-                            } catch {
-                                return @{ Success = $false; Error = $_.Exception.Message }
-                            } finally {
-                                if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
-                            }
-                        } -ArgumentList @($ComputerName, $ClassName, $Credential) -TimeoutSeconds $TimeoutSeconds -OperationName "$Operation (post-recovery retry)"
-
-                        if ($retryResult.Success) {
-                            return @{ Success = $true; Result = $retryResult.Result; RecoveredAfterRpcError = $true }
-                        }
-                        # Fall through to failure if retry also failed
-                    }
-                } catch {
-                    # Recovery itself failed - fall through to original error
-                }
-            }
-            return @{ Success = $false; Error = $errorMsg }
         }
+
+        # Recovery hook for RPC-class errors (0x800706ba, 0x800706be)
+        $hresult = $null
+        if ($errorMsg -match '0x([0-9A-Fa-f]{8})') {
+            try { $hresult = [Convert]::ToInt32($matches[1], 16) } catch { }
+        }
+        if ($hresult -eq 0x800706ba -or $hresult -eq 0x800706be) {
+            try {
+                $recoverySucceeded = Invoke-AutoRecovery -ComputerName $ComputerName -ErrorCode $errorMsg -ErrorAction SilentlyContinue
+                if ($recoverySucceeded) {
+                    Start-Sleep -Seconds 2   # brief pause before retry
+                    # Retry once after recovery
+                    $retryResult = Invoke-WithPoolTimeout -ScriptBlock {
+                        param([string]$ComputerName, [string]$ClassName, [pscredential]$Cred)
+                        $cimSession = $null
+                        try {
+                            $sessionArgs = @{ ComputerName = $ComputerName; SessionOption = (New-CimSessionOption -Protocol DCOM) }
+                            if ($Cred) { $sessionArgs['Credential'] = $Cred }
+                            $cimSession = New-CimSession @sessionArgs -ErrorAction Stop
+                            $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
+                            return @{ Success = $true; Result = $result }
+                        } catch {
+                            return @{ Success = $false; Error = $_.Exception.Message }
+                        } finally {
+                            if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
+                        }
+                    } -ArgumentList @($ComputerName, $ClassName, $Credential) -TimeoutSeconds $TimeoutSeconds -OperationName "$Operation (post-recovery retry)"
+
+                    if ($retryResult.Success) {
+                        $retryInner = $retryResult.Result
+                        if ($retryInner -and $retryInner.Success) {
+                            return @{ Success = $true; Result = $retryInner.Result; RecoveredAfterRpcError = $true }
+                        }
+                        if ($retryInner -and $retryInner.Error) {
+                            $errorMsg = $retryInner.Error
+                        }
+                    } elseif ($retryResult.Error) {
+                        $errorMsg = $retryResult.Error
+                    }
+                    # Fall through to failure if retry also failed
+                }
+            } catch {
+                # Recovery itself failed - fall through to original error
+            }
+        }
+        return @{ Success = $false; Error = $errorMsg }
     } catch {
         return @{ Success = $false; Error = $_.Exception.Message }
     }
