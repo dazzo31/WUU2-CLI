@@ -35,8 +35,7 @@ removing the bound.
 One or more suite filenames or paths to run instead of the whole set. Useful locally.
 
 .PARAMETER IncludeExcluded
-Include the GUI-edition leftovers that are excluded by default (Test-ColumnResize, Test-DragResize).
-They are NOT part of the CLI validation path; DragResize hangs on a blocking dispatcher pump.
+Include any explicitly excluded test suites.
 
 .PARAMETER Json
 Emit a machine-readable summary as the last line, for CI to parse.
@@ -63,7 +62,7 @@ $root = Split-Path $PSScriptRoot -Parent
 
 # Suites that are NOT part of the CLI validation path. Named explicitly (rather than a pattern) so
 # that adding a suite cannot silently exclude it, and so removing one is a visible diff.
-$excludedSuites = @('Test-ColumnResize.ps1', 'Test-DragResize.ps1')
+$excludedSuites = @()
 
 if ($Suite.Count -gt 0) {
     $suites = @()
@@ -91,7 +90,7 @@ function Write-Line([string]$Text, $Color) {
 }
 
 Write-Line ''
-Write-Line ("Running {0} suite(s), {1}s per suite (excluded: {2})" -f $suites.Count, $TimeoutSeconds, $(if ($IncludeExcluded) { 'none' } else { $excludedSuites -join ', ' })) -Color Cyan
+Write-Line ("Running {0} suite(s), {1}s per suite (excluded: {2})" -f $suites.Count, $TimeoutSeconds, $(if ($IncludeExcluded -or $excludedSuites.Count -eq 0) { 'none' } else { $excludedSuites -join ', ' })) -Color Cyan
 Write-Line ('-' * 96)
 
 $results = @()

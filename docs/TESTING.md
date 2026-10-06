@@ -72,25 +72,20 @@ Or run suites via a manual loop:
 
 ```powershell
 Get-ChildItem .\tests\Test-*.ps1 |
-    Where-Object { $_.Name -notin @('Test-ColumnResize.ps1','Test-DragResize.ps1') } |
     ForEach-Object { powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File $_.FullName }
 ```
 
-**Baseline:** 61 test files; 2 excluded because they are GUI-edition leftovers (`Test-ColumnResize.ps1` and `Test-DragResize.ps1`); **59 runnable**;
+**Baseline:** 59 test files; **59 runnable**;
 **58 pass / 1 skip / 0 fail** (plus 5 developer tools in `tests\` that are not test suites).
 
-### Two stale GUI suites
+### Retired GUI suites
 
-`tests\Test-ColumnResize.ps1` and `tests\Test-DragResize.ps1` exercise WPF column drag-resize, which
-does not exist in the console edition. ColumnResize **fails** on missing WPF assemblies; DragResize
-**hangs** (blocking dispatcher pump). Both are excluded by `Scripts\Invoke-TestSuites.ps1` and the
-manual loop above, and both are scheduled for retirement.
+`Test-ColumnResize.ps1` and `Test-DragResize.ps1` (WPF GUI leftovers that targeted `WUU.xaml` and failed or hung under the console edition) were retired and removed.
 
 ### Timeout the loop
 
 When running outside `Scripts\Invoke-TestSuites.ps1`, wrap a per-suite timeout with straggler cleanup
-around any custom loop. One hung suite must not stall a full run — this is not hypothetical;
-`Test-DragResize` hangs indefinitely.
+around any custom loop.
 
 ## 3. The validator
 
