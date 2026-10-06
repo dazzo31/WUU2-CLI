@@ -503,7 +503,18 @@ function New-ComputerRunspace {
             }
             
             try {
-                switch ($ErrorCode) {
+                $code = $ErrorCode
+                if ($ErrorCode -match '0x([0-9A-Fa-f]{8})') {
+                    $code = $matches[1].ToLowerInvariant()
+                } elseif ($ErrorCode -match '([0-9A-Fa-f]{8})') {
+                    $code = $matches[1].ToLowerInvariant()
+                } elseif ($ErrorCode -match 'RPC server is unavailable') {
+                    $code = '800706ba'
+                } elseif ($ErrorCode -match 'RPC.*?failed') {
+                    $code = '800706be'
+                }
+
+                switch ($code) {
                     '800706ba' { # RPC server unavailable
                         # Try to restart RPC service using Invoke-Command
                         if ($ComputerName -eq 'localhost' -or $ComputerName -eq $env:COMPUTERNAME) {

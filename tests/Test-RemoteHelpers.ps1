@@ -28,6 +28,7 @@ function Assert-True([bool]$Condition, [string]$Name) {
 # Import in app order: Logging first (log functions), then Remote (uses pool),
 # then Workers (pool provider) - Workers must precede any module calling it.
 Import-Module (Join-Path $RepoRoot "src\Wuu.Logging.psm1") -Global -ErrorAction Stop
+Import-Module (Join-Path $RepoRoot "src\Wuu.Models.psm1") -Global -ErrorAction Stop
 Import-Module (Join-Path $RepoRoot "src\Wuu.Workers.psm1") -Global -ErrorAction Stop
 Import-Module (Join-Path $RepoRoot "src\Wuu.Remote.psm1") -Global -ErrorAction Stop
 
@@ -64,6 +65,19 @@ $null = Invoke-CimWithTimeout -ComputerName localhost -ClassName Win32_Operating
 $null = Invoke-ServiceWithTimeout -ComputerName localhost -ServiceName wuauserv -Action Check -TimeoutSeconds 15
 $pool2 = Get-WuuWorkerPool
 Assert-True ($pool1.InstanceId -eq $pool2.InstanceId) 'pool is reused across helpers (single instance)'
+
+# 7. Auto-recovery helper resolution and behavior (C8)
+$autoRecoveryCmd = Get-Command -Module Wuu.Remote -Name Invoke-AutoRecovery -ErrorAction SilentlyContinue
+Assert-True ($null -ne $autoRecoveryCmd) 'Invoke-AutoRecovery is exported by Wuu.Remote'
+
+$nonFixable = Invoke-AutoRecovery -ComputerName localhost -ErrorCode '80070005'
+Assert-True (-not $nonFixable) 'Invoke-AutoRecovery returns false for non-autofixable error (80070005 Access Denied)'
+
+$unknownErr = Invoke-AutoRecovery -ComputerName localhost -ErrorCode 'completely unknown error'
+Assert-True (-not $unknownErr) 'Invoke-AutoRecovery returns false for unknown error'
+
+$rpcRecovery = Invoke-AutoRecovery -ComputerName localhost -ErrorCode '800706be'
+Assert-True ($rpcRecovery) 'Invoke-AutoRecovery succeeds on RPC failed condition (800706be)'
 
 Close-WuuWorkerPool
 if ($failures.Count -eq 0) {

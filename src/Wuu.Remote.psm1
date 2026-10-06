@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .DESCRIPTION
 Bounded remote WMI/CIM and service operations with hard timeouts.
@@ -115,7 +115,19 @@ function Invoke-CimWithTimeout {
                 $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
                 return @{ Success = $true; Result = $result }
             } catch {
-                return @{ Success = $false; Error = $_.Exception.Message }
+                $errId = if ($_.FullyQualifiedErrorId) { [string]$_.FullyQualifiedErrorId } else { '' }
+                $hres = $null
+                if ($errId -match '0x([0-9A-Fa-f]{8})') {
+                    try { $hres = [Convert]::ToInt32($matches[1], 16) } catch { }
+                } elseif ($_.Exception -and $_.Exception.HResult -and $_.Exception.HResult -ne -2146233088) {
+                    $hres = [int]$_.Exception.HResult
+                }
+                return @{
+                    Success  = $false
+                    Error    = $_.Exception.Message
+                    HResult  = $hres
+                    ErrorId  = $errId
+                }
             } finally {
                 if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
             }
@@ -133,14 +145,26 @@ function Invoke-CimWithTimeout {
 
         # Recovery hook for RPC-class errors (0x800706ba, 0x800706be)
         $hresult = $null
-        if ($errorMsg -match '0x([0-9A-Fa-f]{8})') {
+        if ($inner -and $inner.PSObject.Properties['HResult'] -and $inner.HResult) {
+            $hresult = [int]$inner.HResult
+        }
+        if (-not $hresult -and $inner -and $inner.PSObject.Properties['ErrorId'] -and $inner.ErrorId -match '0x([0-9A-Fa-f]{8})') {
             try { $hresult = [Convert]::ToInt32($matches[1], 16) } catch { }
         }
+        if (-not $hresult -and $errorMsg -match '0x([0-9A-Fa-f]{8})') {
+            try { $hresult = [Convert]::ToInt32($matches[1], 16) } catch { }
+        }
+        if (-not $hresult) {
+            if ($errorMsg -match 'RPC server is unavailable') { $hresult = 0x800706ba }
+            elseif ($errorMsg -match 'RPC.*?failed') { $hresult = 0x800706be }
+        }
+
         if ($hresult -eq 0x800706ba -or $hresult -eq 0x800706be) {
             try {
-                $recoverySucceeded = Invoke-AutoRecovery -ComputerName $ComputerName -ErrorCode $errorMsg -ErrorAction SilentlyContinue
+                $errCode = if ($hresult -eq 0x800706ba) { '800706ba' } else { '800706be' }
+                $recoverySucceeded = Invoke-AutoRecovery -ComputerName $ComputerName -ErrorCode $errCode -ErrorAction SilentlyContinue
                 if ($recoverySucceeded) {
-                    Start-Sleep -Seconds 2   # brief pause before retry
+                    Start-Sleep -Seconds 1   # brief pause before retry
                     # Retry once after recovery
                     $retryResult = Invoke-WithPoolTimeout -ScriptBlock {
                         param([string]$ComputerName, [string]$ClassName, [pscredential]$Cred)
@@ -501,5 +525,81 @@ function Invoke-WuuRemoteTask {
     }
 }
 
-Export-ModuleMember -Function @('Invoke-CimWithTimeout', 'Invoke-ServiceWithTimeout', 'Test-SystemDependencies', 'Invoke-WithTimeout', 'Invoke-WuuRemoteTask', 'Test-WuuManagementEndpoint')
+function Invoke-AutoRecovery {
+    <#
+    .SYNOPSIS
+    Attempts automatic recovery for known RPC/service failures.
+    .DESCRIPTION
+    Restarts RPC and RemoteRegistry services on the target computer if the error
+    matches a known auto-recoverable RPC condition (0x800706BA or 0x800706BE).
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ComputerName,
+        [Parameter(Mandatory = $true)]
+        [string]$ErrorCode
+    )
+
+    $code = $ErrorCode
+    if ($ErrorCode -match '0x([0-9A-Fa-f]{8})') {
+        $code = $matches[1].ToLowerInvariant()
+    } elseif ($ErrorCode -match '([0-9A-Fa-f]{8})') {
+        $code = $matches[1].ToLowerInvariant()
+    } elseif ($ErrorCode -match 'RPC server is unavailable') {
+        $code = '800706ba'
+    } elseif ($ErrorCode -match 'RPC.*?failed') {
+        $code = '800706be'
+    }
+
+    $errorInfo = $null
+    try {
+        if (Get-Command Get-WuuErrorSuggestions -ErrorAction SilentlyContinue) {
+            $errorInfo = Get-WuuErrorSuggestions -ErrorMessage $code
+        } elseif (Get-Command Get-ErrorSuggestions -ErrorAction SilentlyContinue) {
+            $errorInfo = Get-ErrorSuggestions -ErrorMessage $code
+        }
+    } catch {
+        # Best-effort error suggestion lookup; falls back to default auto-fix table below
+    }
+
+    if (-not $errorInfo) {
+        if ($code -eq '800706ba' -or $code -eq '800706be') {
+            $errorInfo = @{ AutoFix = $true }
+        }
+    }
+
+    if (-not $errorInfo -or -not $errorInfo.AutoFix) {
+        return $false
+    }
+
+    try {
+        switch ($code) {
+            '800706ba' { # RPC server unavailable
+                if ($ComputerName -eq 'localhost' -or $ComputerName -eq $env:COMPUTERNAME -or $ComputerName -eq '127.0.0.1') {
+                    Get-Service -Name 'RpcSs' -ErrorAction Stop | Restart-Service -ErrorAction Stop
+                    Start-Sleep -Seconds 2
+                    Get-Service -Name 'RemoteRegistry' -ErrorAction Stop | Start-Service -ErrorAction Stop
+                } else {
+                    Invoke-Command -ComputerName $ComputerName -ScriptBlock {
+                        Get-Service -Name 'RpcSs' -ErrorAction Stop | Restart-Service -ErrorAction Stop
+                        Start-Sleep -Seconds 2
+                        Get-Service -Name 'RemoteRegistry' -ErrorAction Stop | Start-Service -ErrorAction Stop
+                    } -ErrorAction Stop
+                }
+                return $true
+            }
+            '800706be' { # RPC failed
+                Start-Sleep -Seconds 5
+                return $true
+            }
+            default {
+                return $false
+            }
+        }
+    } catch {
+        return $false
+    }
+}
+
+Export-ModuleMember -Function @('Invoke-CimWithTimeout', 'Invoke-ServiceWithTimeout', 'Test-SystemDependencies', 'Invoke-WithTimeout', 'Invoke-WuuRemoteTask', 'Test-WuuManagementEndpoint', 'Invoke-AutoRecovery')
 

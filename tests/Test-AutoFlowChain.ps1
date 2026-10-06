@@ -128,9 +128,9 @@ function Invoke-OpChain {
     $match = ($got.Count -eq $Expected.Count)
     if ($match) { for ($i = 0; $i -lt $Expected.Count; $i++) { if ($got[$i] -ne $Expected[$i]) { $match = $false } } }
     if ($match) {
-        Write-Host ("PASS [{0}]: chain executed -> {1}; PendingOp cleared={2}; Pending={3}" -f $PendingOp, ($got -join ' | '), $item.PendingOp, $item.Pending) -ForegroundColor Green
+        Write-Host ("PASS: [{0}] chain executed -> {1}; PendingOp cleared={2}; Pending={3}" -f $PendingOp, ($got -join ' | '), $item.PendingOp, $item.Pending) -ForegroundColor Green
     } else {
-        Write-Host ("FAIL [{0}]: expected [{1}] got [{2}]" -f $PendingOp, ($Expected -join ', '), ($got -join ', ')) -ForegroundColor Red
+        Write-Host ("FAIL: [{0}] expected [{1}] got [{2}]" -f $PendingOp, ($Expected -join ', '), ($got -join ', ')) -ForegroundColor Red
         $script:fail = $true
     }
 }

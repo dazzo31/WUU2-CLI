@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .DESCRIPTION
 Application core: startup, environment validation, event wiring, and the GUI loop.
@@ -479,6 +479,10 @@ function Get-ErrorSuggestions {
 function Invoke-AutoRecovery {
     param([string]$ComputerName, [string]$ErrorCode)
     
+    if (Get-Command -Module 'Wuu.Remote' -Name 'Invoke-AutoRecovery' -ErrorAction SilentlyContinue) {
+        return Wuu.Remote\Invoke-AutoRecovery -ComputerName $ComputerName -ErrorCode $ErrorCode
+    }
+
     $errorInfo = Get-ErrorSuggestions -ErrorMessage $ErrorCode
     
     if (-not $errorInfo.AutoFix) {
@@ -486,7 +490,18 @@ function Invoke-AutoRecovery {
     }
     
     try {
-        switch ($ErrorCode) {
+        $code = $ErrorCode
+        if ($ErrorCode -match '0x([0-9A-Fa-f]{8})') {
+            $code = $matches[1].ToLowerInvariant()
+        } elseif ($ErrorCode -match '([0-9A-Fa-f]{8})') {
+            $code = $matches[1].ToLowerInvariant()
+        } elseif ($ErrorCode -match 'RPC server is unavailable') {
+            $code = '800706ba'
+        } elseif ($ErrorCode -match 'RPC.*?failed') {
+            $code = '800706be'
+        }
+
+        switch ($code) {
             '800706ba' { # RPC server unavailable
                 # Try to restart RPC service using Invoke-Command
                 if ($ComputerName -eq 'localhost' -or $ComputerName -eq $env:COMPUTERNAME) {
@@ -1863,7 +1878,7 @@ $InstallUpdates = {
     }
 }
 
-# Note: the old $RemoveEntry block was removed here â€” PowerShell variable names are
+# Note: the old $RemoveEntry block was removed here -- PowerShell variable names are
 # case-insensitive, so it silently shadowed the proper $removeEntry cleanup (defined
 # earlier) and leaked an open runspace on every computer removal.
 

@@ -118,4 +118,21 @@ function New-WuuErrorSuggestions {
     })
 }
 
-Export-ModuleMember -Function @('New-WuuState','New-WuuErrorSuggestions')
+function Get-WuuErrorSuggestions {
+    param([string]$ErrorMessage)
+
+    $suggestions = New-WuuErrorSuggestions
+    foreach ($errorCode in $suggestions.Keys) {
+        if ($ErrorMessage -match $errorCode) {
+            return $suggestions[$errorCode]
+        }
+    }
+
+    return @{
+        Description = 'Unknown error'
+        Suggestions = @('Check Windows Event Logs for more details', 'Verify network connectivity', 'Try the operation again')
+        AutoFix = $false
+    }
+}
+
+Export-ModuleMember -Function @('New-WuuState','New-WuuErrorSuggestions','Get-WuuErrorSuggestions')

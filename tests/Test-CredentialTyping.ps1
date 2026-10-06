@@ -43,15 +43,15 @@ function Invoke-WithPoolTimeout {
 
 # --- Test A: $null credential (default credentials) ------------------------------------------
 $rA = Invoke-CimWithTimeout -ComputerName 'WUU-NOTREAL-000000' -ClassName 'Win32_ComputerSystem' -TimeoutSeconds 10
-if (-not $rA.Success -and $rA.Error -notmatch 'parameter name|cannot convert') { Write-Host 'PASS A: null credential binds and flows (fails on DNS, as expected)'; $pass++ }
-else { Write-Host "FAIL A: null credential - $($rA.Error)"; $fail++ }
+if (-not $rA.Success -and $rA.Error -notmatch 'parameter name|cannot convert') { Write-Host 'PASS: A - null credential binds and flows (fails on DNS, as expected)'; $pass++ }
+else { Write-Host "FAIL: A - null credential - $($rA.Error)"; $fail++ }
 
 # --- Test B: a real PSCredential is accepted and crosses the boundary ------------------------
 $secPass = ConvertTo-SecureString 'ThisIsNotARealPassword123!' -AsPlainText -Force
 $cred = New-Object System.Management.Automation.PSCredential('.\WUU_test_user', $secPass)
 $rB = Invoke-CimWithTimeout -ComputerName 'WUU-NOTREAL-000000' -ClassName 'Win32_ComputerSystem' -TimeoutSeconds 10 -Credential $cred
-if (-not $rB.Success -and $rB.Error -notmatch 'parameter name|cannot convert') { Write-Host 'PASS B: PSCredential accepted and passed into the call (fails on DNS, as expected)'; $pass++ }
-else { Write-Host "FAIL B: PSCredential - $($rB.Error)"; $fail++ }
+if (-not $rB.Success -and $rB.Error -notmatch 'parameter name|cannot convert') { Write-Host 'PASS: B - PSCredential accepted and passed into the call (fails on DNS, as expected)'; $pass++ }
+else { Write-Host "FAIL: B - PSCredential - $($rB.Error)"; $fail++ }
 
 # --- Test C: a plain STRING must NOT silently become a credential ----------------------------
 # Asserted STATICALLY, against the parameter's declared type - and that is deliberate.
@@ -69,27 +69,27 @@ $typedAsCredential = $false
 $plainStringRisk = $false
 $p = $fn.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Credential' }
 if (-not $p) {
-    Write-Host 'FAIL C: Invoke-CimWithTimeout has no -Credential parameter at all'; $fail++
+    Write-Host 'FAIL: C - Invoke-CimWithTimeout has no -Credential parameter at all'; $fail++
 } else {
     $typeText = $p.StaticType.FullName
     if ($typeText -eq 'System.Management.Automation.PSCredential') { $typedAsCredential = $true }
     # [object] or [string] would let a plain string reach the session as a credential.
     if ($typeText -in @('System.Object', 'System.String')) { $plainStringRisk = $true }
     if ($plainStringRisk) {
-        Write-Host ("FAIL C: -Credential is typed [{0}] - a plain string could be used as a credential" -f $typeText); $fail++
+        Write-Host ("FAIL: C - -Credential is typed [{0}] - a plain string could be used as a credential" -f $typeText); $fail++
     } elseif ($typedAsCredential) {
-        Write-Host 'PASS C: -Credential is typed [PSCredential] (a plain string cannot be silently used)'; $pass++
+        Write-Host 'PASS: C - -Credential is typed [PSCredential] (a plain string cannot be silently used)'; $pass++
     } else {
-        Write-Host ("PASS C: -Credential is typed [{0}], not [object]/[string]" -f $typeText); $pass++
+        Write-Host ("PASS: C - -Credential is typed [{0}], not [object]/[string]" -f $typeText); $pass++
     }
 }
 
 # ...and the DCOM path must actually pass that typed value to the session, not a copy that could be
 # coerced. Checked in the source so it holds even if the parameter type is preserved by accident.
 if ($fn.Extent.Text -match 'New-CimSession' -and $fn.Extent.Text -match "sessionArgs\['Credential'\]") {
-    Write-Host 'PASS C2: the typed credential is what reaches New-CimSession (no untyped copy)'; $pass++
+    Write-Host 'PASS: C2 - the typed credential is what reaches New-CimSession (no untyped copy)'; $pass++
 } else {
-    Write-Host 'FAIL C2: the credential is not demonstrably the typed value passed to New-CimSession'; $fail++
+    Write-Host 'FAIL: C2 - the credential is not demonstrably the typed value passed to New-CimSession'; $fail++
 }
 
 Write-Host ""
