@@ -1,4 +1,7 @@
-﻿# WUU2-CLI
+# WUU2-CLI
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa?style=flat&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/dazzo31)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-dazzo31-orange?style=flat&logo=buymeacoffee&logoColor=white)](https://buymeacoffee.com/dazzo31)
 
 **Windows Update Utility — console edition.** Check, download, install and reboot Windows Updates
 across a fleet of remote machines from a terminal, with a hash-chained **audit trail** built for
@@ -564,6 +567,15 @@ Stated plainly, because they are real:
   than WUU when a Malicious Software Removal Tool release is pending.
 - **Retry logic is patient.** 5-second backoffs and bounded timeouts mean an unreachable host takes
   longer to report than a naive fast-fail.
+
+---
+
+## Support & Sponsorship
+
+If WUU2-CLI has saved your fleet time, simplified change windows, or helped automate patch management, consider supporting ongoing development:
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor%20on%20GitHub-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/dazzo31)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/dazzo31)
 
 ---
 
